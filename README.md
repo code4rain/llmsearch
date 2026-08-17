@@ -22,6 +22,16 @@
    배치(기본 200통)로 진행되며 중단해도 다음 동기화가 이어서 처리한다 (backlog 표시)
 - WSL/테스트 환경에서는 Outlook 소스 동기화 시 안내 오류가 로그에 남고 다른 소스는 정상 동작
 
+## Confluence / Jira 연동 (M3)
+1. `config.yaml`의 `atlassian:` base URL 2종 설정, `.env`에 인증(PAT 권장 — DC 7.9+; 안 되면 사번/비밀번호, 최후엔 브라우저 쿠키)
+2. 소스 탭 하단 폼에 Confluence 페이지 URL(하위 트리 포함 수집) 또는 Jira 이슈 URL 등록
+3. confluence / jira 동기화 — 미러는 `data_dir/confluence/`, `data_dir/jira/`에 Markdown으로 저장됨
+- 인증 진단은 첫 동기화 때 PAT→Basic→쿠키 순서로 자동 시도, 실패 시 로그 탭에 안내
+- **제약**: 자격증명은 서비스별로 분리되지 않고 하나의 세트를 Confluence/Jira 둘 다에 함께 쓴다.
+  따라서 그 자격증명 세트가 **두 서버 모두에 유효**해야 한다. Confluence+Jira를 함께 등록해
+  쓸 때는 Basic(사내 AD 계정) 모드를 권장한다 — DC의 PAT·세션쿠키는 인스턴스별로 발급되어
+  한쪽에서 발급받은 값이 다른 쪽에서 통하지 않을 수 있다.
+
 ## 개발
 - 테스트: `pytest` (WSL에서 실행 가능, API 키 불필요)
 - 인덱스는 소모품: 스키마 변경·손상 시 `index.db` 삭제 후 재동기화

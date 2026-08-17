@@ -34,6 +34,12 @@
 <div id="sources" class="tab">
   <table id="srcTable"><thead><tr><th>소스</th><th>문서 수</th><th>마지막 동기화</th><th></th></tr></thead>
   <tbody></tbody></table>
+  <h3>Confluence / Jira URL 등록</h3>
+  <form onsubmit="registerUrl(event)">
+    <input id="atlUrl" placeholder="https://wiki.../pageId=123 또는 .../browse/PROJ-1" style="width:70%">
+    <button>등록</button>
+  </form>
+  <ul id="atlList"></ul>
 </div>
 
 <div id="log" class="tab"><pre id="logBody"></pre></div>
@@ -43,7 +49,7 @@ const history = [];
 function show(id) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  if (id === 'sources') loadSources();
+  if (id === 'sources') { loadSources(); loadRegistrations(); }
   if (id === 'log') loadLog();
 }
 function esc(s) {
@@ -65,6 +71,28 @@ async function openItem(p) {
   const r = await (await fetch('/api/open', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url_or_path: p})})).json();
   if (!r.ok) alert(r.error);
+}
+async function loadRegistrations() {
+  const regs = await (await fetch('/api/atlassian/registrations')).json();
+  document.getElementById('atlList').innerHTML = regs.map(r =>
+    `<li>${esc(r.kind === 'jira_issue' ? r.key : 'page ' + r.page_id)} — ` +
+    `<code>${esc(r.url)}</code> ` +
+    `<button onclick="removeReg(this.dataset.u)" data-u="${esc(r.url)}">삭제</button></li>`).join('');
+}
+async function registerUrl(e) {
+  e.preventDefault();
+  const url = document.getElementById('atlUrl').value.trim();
+  if (!url) return;
+  const r = await fetch('/api/atlassian/register', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url})});
+  if (!r.ok) alert((await r.json()).detail || '등록 실패');
+  document.getElementById('atlUrl').value = '';
+  loadRegistrations();
+}
+async function removeReg(u) {
+  await fetch('/api/atlassian/registrations', {method: 'DELETE',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: u})});
+  loadRegistrations();
 }
 async function loadLog() {
   const data = await (await fetch('/api/log')).json();
