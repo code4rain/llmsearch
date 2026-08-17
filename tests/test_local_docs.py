@@ -290,3 +290,91 @@ def test_extract_text_real_smoke(tmp_path: Path):
     f.write_text("스모크 텍스트", encoding="utf-8")
     from llmsearch.connectors.local_docs import extract_text
     assert "스모크" in extract_text(f)
+
+
+def test_vision_augments_short_pptx_text(tmp_path, monkeypatch):
+    """이미지 위주 PPT: 추출 텍스트가 짧으면 렌더+비전 설명을 덧붙여 정상 인덱싱한다."""
+    from llmsearch.connectors import local_docs
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    ppt = src / "image_deck.pptx"
+    ppt.write_bytes(b"fake")
+    # 72자 — garbled 임계(MIN_TEXT_LEN=50)는 확실히 넘고 비전 임계(200)는 확실히 못 미침
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "표지 제목 텍스트 " * 8)
+    renderer = FakeSlideRenderer(images={"image_deck.pptx": [b"p1", b"p2"]})
+
+    r = local_docs.sync_local_docs(
+        folders=[src], excludes=[], overrides=[], summarizer=FakeSummarizer(),
+        summaries_dir=tmp_path / "sum", projects=[], areas=[], glossary="", class_rules="",
+        state={}, prior_map={}, renderer=renderer,
+    )
+    assert len(r.documents) == 1
+    d = r.documents[0]
+    assert d.content_indexed is True
+    assert "슬라이드 2장 비전 설명" in d.text  # FakeSummarizer.describe_images 결과가 요약 입력에 반영
+    assert renderer.calls  # 렌더러가 실제로 호출됨
+
+
+def test_vision_skipped_when_text_long_enough(tmp_path, monkeypatch):
+    from llmsearch.connectors import local_docs
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "text_deck.pptx").write_bytes(b"fake")
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "충분히 긴 본문 " * 50)
+    renderer = FakeSlideRenderer(images={"text_deck.pptx": [b"p1"]})
+
+    r = local_docs.sync_local_docs(
+        folders=[src], excludes=[], overrides=[], summarizer=FakeSummarizer(),
+        summaries_dir=tmp_path / "sum", projects=[], areas=[], glossary="", class_rules="",
+        state={}, prior_map={}, renderer=renderer,
+    )
+    assert r.documents[0].content_indexed is True
+    assert renderer.calls == []  # 임계치 이상이면 렌더링 자체를 안 함
+
+
+def test_vision_failure_falls_back_to_existing_path(tmp_path, monkeypatch):
+    """렌더러가 죽어도 기존 경로(짧은 텍스트 → DRM 폴백)로 강등되고 동기화는 계속된다."""
+    from llmsearch.connectors import local_docs
+    from llmsearch.summarize import FakeSummarizer
+
+    class BoomRenderer:
+        def render(self, path, max_slides=10):
+            raise RuntimeError("COM dead")
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "broken.pptx").write_bytes(b"fake")
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "짧음")
+
+    r = local_docs.sync_local_docs(
+        folders=[src], excludes=[], overrides=[], summarizer=FakeSummarizer(),
+        summaries_dir=tmp_path / "sum", projects=[], areas=[], glossary="", class_rules="",
+        state={}, prior_map={}, renderer=BoomRenderer(),
+    )
+    assert len(r.documents) == 1
+    assert r.documents[0].content_indexed is False  # 기존 DRM 폴백 경로
+
+
+def test_vision_not_used_for_non_pptx(tmp_path, monkeypatch):
+    from llmsearch.connectors import local_docs
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    (src / "short.docx").write_bytes(b"fake")
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "짧음")
+    renderer = FakeSlideRenderer(images={"short.docx": [b"p1"]})
+
+    local_docs.sync_local_docs(
+        folders=[src], excludes=[], overrides=[], summarizer=FakeSummarizer(),
+        summaries_dir=tmp_path / "sum", projects=[], areas=[], glossary="", class_rules="",
+        state={}, prior_map={}, renderer=renderer,
+    )
+    assert renderer.calls == []
