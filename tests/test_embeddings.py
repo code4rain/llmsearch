@@ -1,4 +1,20 @@
-from llmsearch.embeddings import FakeEmbeddings
+import math
+
+from llmsearch.embeddings import FakeEmbeddings, _l2_normalize
+
+
+def test_l2_normalize_unit_norm():
+    vec = [3.0, 4.0]  # 3-4-5 triangle
+    normalized = _l2_normalize(vec)
+    assert len(normalized) == 2
+    norm = math.sqrt(sum(v * v for v in normalized))
+    assert abs(norm - 1.0) < 1e-9  # unit norm
+
+
+def test_l2_normalize_zero_vector():
+    vec = [0.0, 0.0, 0.0]
+    normalized = _l2_normalize(vec)
+    assert normalized == [0.0, 0.0, 0.0]  # 0-vector stays 0
 
 
 def test_fake_embeddings_deterministic():

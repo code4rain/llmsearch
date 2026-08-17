@@ -2,6 +2,8 @@ from __future__ import annotations
 
 
 def chunk_text(text: str, max_chars: int = 800) -> list[str]:
+	if max_chars <= 0:
+		raise ValueError("max_chars must be positive")
 	text = text.strip()
 	if not text:
 		return []

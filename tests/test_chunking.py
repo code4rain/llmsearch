@@ -1,3 +1,5 @@
+import pytest
+
 from llmsearch.chunking import chunk_text
 
 
@@ -21,3 +23,10 @@ def test_long_paragraph_hard_split():
 
 def test_empty():
     assert chunk_text("") == []
+
+
+def test_max_chars_must_be_positive():
+    with pytest.raises(ValueError):
+        chunk_text("text", max_chars=0)
+    with pytest.raises(ValueError):
+        chunk_text("text", max_chars=-1)

@@ -6,6 +6,12 @@ import os
 from typing import Protocol
 
 
+def _l2_normalize(vec: list[float]) -> list[float]:
+	"""L2-normalize a vector to unit norm."""
+	norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+	return [v / norm for v in vec]
+
+
 class EmbeddingProvider(Protocol):
 	def embed(self, texts: list[str]) -> list[list[float]]: ...
 
@@ -21,8 +27,7 @@ class FakeEmbeddings:
 		for token in text.lower().split():
 			h = int.from_bytes(hashlib.md5(token.encode()).digest()[:4], "big")
 			vec[h % self.dim] += 1.0
-		norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-		return [v / norm for v in vec]
+		return _l2_normalize(vec)
 
 	def embed(self, texts: list[str]) -> list[list[float]]:
 		return [self._one(t) for t in texts]
@@ -49,5 +54,5 @@ class GeminiEmbeddings:
 				contents=batch,
 				config=types.EmbedContentConfig(output_dimensionality=self.dim),
 			)
-			out.extend([list(e.values) for e in resp.embeddings])
+			out.extend([_l2_normalize(list(e.values)) for e in resp.embeddings])
 		return out
