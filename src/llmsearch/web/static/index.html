@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>llmsearch</title>
+<style>
+  body { font-family: sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  nav button { margin-right: .5rem; padding: .4rem .8rem; cursor: pointer; }
+  .tab { display: none; } .tab.active { display: block; }
+  #messages { border: 1px solid #ccc; min-height: 300px; padding: 1rem; margin: 1rem 0;
+              white-space: pre-wrap; overflow-y: auto; max-height: 60vh; }
+  .msg-q { font-weight: bold; margin-top: 1rem; }
+  .src { background: #f4f4f4; border-radius: 6px; padding: .5rem; margin: .3rem 0; font-size: .9rem; }
+  #question { width: 80%; padding: .5rem; } table { border-collapse: collapse; }
+  td, th { border: 1px solid #ccc; padding: .4rem .8rem; }
+</style>
+</head>
+<body>
+<h1>llmsearch</h1>
+<nav>
+  <button onclick="show('chat')">채팅</button>
+  <button onclick="show('sources')">소스</button>
+  <button onclick="show('log')">로그</button>
+</nav>
+
+<div id="chat" class="tab active">
+  <div id="messages"></div>
+  <form onsubmit="ask(event)">
+    <input id="question" placeholder="질문을 입력하세요" autocomplete="off">
+    <button>검색</button>
+  </form>
+</div>
+
+<div id="sources" class="tab">
+  <table id="srcTable"><thead><tr><th>소스</th><th>문서 수</th><th>마지막 동기화</th><th></th></tr></thead>
+  <tbody></tbody></table>
+</div>
+
+<div id="log" class="tab"><pre id="logBody"></pre></div>
+
+<script>
+const history = [];
+function show(id) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  if (id === 'sources') loadSources();
+  if (id === 'log') loadLog();
+}
+async function loadSources() {
+  const data = await (await fetch('/api/sources')).json();
+  document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
+    `<tr><td>${s.source}</td><td>${s.doc_count}</td><td>${s.last_sync ?? '-'}` +
+    `${s.last_error ? ' ⚠️' : ''}</td>` +
+    `<td><button onclick="syncNow('${s.source}')">동기화</button></td></tr>`).join('');
+}
+async function syncNow(source) {
+  await fetch('/api/sync/' + source, {method: 'POST'});
+  loadSources();
+}
+async function loadLog() {
+  const data = await (await fetch('/api/log')).json();
+  document.getElementById('logBody').textContent = JSON.stringify(data, null, 2);
+}
+async function ask(e) {
+  e.preventDefault();
+  const q = document.getElementById('question').value.trim();
+  if (!q) return;
+  document.getElementById('question').value = '';
+  const box = document.getElementById('messages');
+  box.innerHTML += `<div class="msg-q">Q. ${q}</div><div class="msg-a"></div>`;
+  const answerDiv = box.lastElementChild;
+  const resp = await fetch('/api/chat', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({question: q, history}),
+  });
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', answerText = '';
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, {stream: true});
+    let idx;
+    while ((idx = buf.indexOf('\n\n')) >= 0) {
+      const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      const ev = (block.match(/^event: (.+)$/m) || [])[1];
+      const data = (block.match(/^data: (.+)$/m) || [])[1];
+      if (ev === 'text') { answerText += JSON.parse(data); answerDiv.textContent = answerText; }
+      else if (ev === 'error') { answerDiv.textContent += '\n⚠️ ' + JSON.parse(data); }
+      else if (ev === 'sources') {
+        for (const h of JSON.parse(data)) {
+          const lock = h.content_indexed ? '' : ' 🔒';
+          answerDiv.insertAdjacentHTML('beforeend',
+            `<div class="src">📄 ${h.title}${lock} <small>(${h.source_type} · ${h.updated_at})</small><br>` +
+            `<code>${h.url_or_path}</code></div>`);
+        }
+      }
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+  history.push({role: 'user', content: q}, {role: 'assistant', content: answerText});
+}
+</script>
+</body>
+</html>
