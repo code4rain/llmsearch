@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import db, indexer, search
 from ..config import Config
@@ -52,6 +53,7 @@ def run_sync(state: dict, source: str) -> dict:
                     indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
             indexer.set_sync_state(conn, source, result.state)
         except Exception as exc:
+            conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
             entry["ok"] = False
             entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
         state["log"].insert(0, entry)
@@ -76,12 +78,17 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         )
 
     conn = db.open_db(config.db_path)
-    state = {"config": config, "conn": conn, "embedder": embedder,
+    # 쓰기는 conn(run_sync 전용), 읽기는 read_conn — 동기화 쓰기 트랜잭션 중에도
+    # /api/chat, /api/sources 같은 읽기 요청이 같은 커넥션을 공유하지 않게 분리한다.
+    read_conn = db.open_db(config.db_path)
+    state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
              "sync_lock": threading.Lock()}
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
+    # Host 헤더 검증 — 로컬 전용 앱이 임의 Host로 오는 DNS 리바인딩류 요청을 받지 않게 함
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost"])
 
     async def scheduler_loop():
         while True:
@@ -102,7 +109,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def sources():
         out = []
         for source in SOURCES:
-            row = conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
+            row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
             last = next((e for e in state["log"] if e["source"] == source), None)
             out.append({"source": source, "doc_count": row[0],
                         "last_sync": last["at"] if last else None,
@@ -125,7 +132,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         history = payload.get("history", [])
 
         def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
-            return search.search(conn, embedder, query, source_filter=source_filter,
+            return search.search(read_conn, embedder, query, source_filter=source_filter,
                                  date_from=date_from, date_to=date_to, sender=sender)
 
         def event_stream():
