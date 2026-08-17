@@ -36,12 +36,23 @@ class HttpAtlassianClient:
         return resp.json()
 
     def check_auth(self) -> bool:
-        """Jira가 설정돼 있으면 myself, 아니면 Confluence space 목록으로 진단 (한쪽만 설정 가능)."""
+        """설정된 서비스(Confluence/Jira) 전부를 프로브해 전부 성공해야 인증 유효로 본다.
+
+        base URL이 하나만 설정돼 있으면 그 서비스만 프로브한다. 두 base가 모두 설정된
+        경우 하나만 프로브하면(예: jira만) confluence 쪽 인증이 이미 만료됐어도 True를
+        반환하는 2-서버 부정합이 생긴다 — 단일 자격증명이 두 서버 모두에 유효해야
+        한다는 전제이므로(README 참고) 둘 다 확인해야 한다.
+        """
         try:
+            if self.confluence_base:
+                resp = self._http.get(f"{self.confluence_base}/rest/api/space", params={"limit": 1})
+                if resp.status_code != 200:
+                    return False
             if self.jira_base:
-                return self._http.get(f"{self.jira_base}/rest/api/2/myself").status_code == 200
-            resp = self._http.get(f"{self.confluence_base}/rest/api/space", params={"limit": 1})
-            return resp.status_code == 200
+                resp = self._http.get(f"{self.jira_base}/rest/api/2/myself")
+                if resp.status_code != 200:
+                    return False
+            return True
         except httpx.HTTPError:
             return False
 

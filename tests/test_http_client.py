@@ -106,6 +106,18 @@ def test_check_auth_confluence_only():
     assert paths == ["/rest/api/space"]
 
 
+def test_check_auth_requires_all_configured_services():
+    """두 base가 모두 설정됐으면 둘 다 프로브해 전부 성공해야 True다 — 한쪽만 만료돼도
+    False (단일 자격증명·단일 프로브의 2-서버 부정합 방지, 스펙 §7.2)."""
+    def handler(request):
+        if "/rest/api/space" in request.url.path:
+            return httpx.Response(401, json={})  # confluence 인증 만료
+        return httpx.Response(200, json={"name": "kim"})  # jira는 여전히 유효
+
+    c = make_client(handler)  # CONF, JIRA 둘 다 설정됨
+    assert c.check_auth() is False
+
+
 def test_auth_headers_basic_and_cookie():
     seen = {}
 
