@@ -118,6 +118,70 @@ def test_category_move_cleans_orphan_copy(tmp_path: Path, patch_extract):
     assert not old_copy.exists()  # 요약본이 이미 없어도 고아 복사본은 정리돼야 함
 
 
+def test_collision_identity_drift_no_orphan(tmp_path: Path, patch_extract):
+    """해시로 구분됐던 요약본이 평문 이름으로 되돌아갈 때 이전 해시본이 고아로 남지 않아야 한다.
+
+    3라운드 재현 (리뷰어 지적 시나리오):
+    1) 동명 파일 두 개 동기화 → A는 평문, B는 해시 이름
+    2) A 원본 삭제 → A의 평문 요약본/복사본 정리(평문 슬롯 해제), B는 변경 없어 그대로 해시 유지
+    3) B의 mtime 갱신 후 재동기화 → 평문 슬롯이 비어 있으므로 B가 평문 이름으로 회귀 →
+       이전 해시 요약본·복사본은 고아로 남지 않고 정리되어야 함
+    """
+    docs1 = tmp_path / "docs1"; docs1.mkdir()
+    docs2 = tmp_path / "docs2"; docs2.mkdir()
+    fa = docs1 / "보고서.pptx"; fa.write_bytes(b"v1-content-A")
+    fb = docs2 / "보고서.pptx"; fb.write_bytes(b"v2-content-B-different-length")
+
+    def sync(state, prior):
+        return local_docs.sync_local_docs(
+            folders=[docs1, docs2], excludes=[], overrides=[],
+            summarizer=FakeSummarizer(), summaries_dir=tmp_path / "summaries",
+            projects=["프로젝트A"], areas=[], glossary="", class_rules="",
+            state=state, prior_map=prior,
+        )
+
+    sid_a = str(fa.resolve()); sid_b = str(fb.resolve())
+
+    # Round 1: A는 평문 이름, B는 충돌로 해시 이름
+    r1 = sync({}, {})
+    by_sid = {d.source_id: d for d in r1.documents}
+    summary_a = Path(by_sid[sid_a].extra["summary_path"])
+    summary_b = Path(by_sid[sid_b].extra["summary_path"])
+    assert summary_a.name == "보고서.pptx.md"
+    assert summary_b.name != "보고서.pptx.md"
+    hashed_summary_b = summary_b
+    hashed_copy_b = hashed_summary_b.parent / hashed_summary_b.name.removesuffix(".md")
+    assert hashed_copy_b.exists()
+
+    # Round 2: A 원본 삭제 → 평문 슬롯 해제. B는 변경 없어 재처리 안 됨(해시 이름 유지)
+    fa.unlink()
+    prior_r2 = {
+        sid_a: ("Projects/프로젝트A", str(summary_a)),
+        sid_b: ("Projects/프로젝트A", str(summary_b)),
+    }
+    r2 = sync(r1.state, prior_r2)
+    assert sid_a in r2.deleted_ids
+    assert not summary_a.exists()
+    assert hashed_summary_b.exists()
+    assert hashed_copy_b.exists()
+
+    # Round 3: B의 mtime 갱신 → 재처리 강제 → 평문 이름으로 회귀해야 함
+    import os, time
+    os.utime(fb, (time.time() + 10, time.time() + 10))
+    prior_r3 = {sid_b: ("Projects/프로젝트A", str(hashed_summary_b))}
+    r3 = sync(r2.state, prior_r3)
+    new_summary_b = Path(r3.documents[0].extra["summary_path"])
+    assert new_summary_b.name == "보고서.pptx.md"  # 평문 이름으로 회귀
+    # 이전 해시 요약본·복사본은 고아로 남으면 안 됨
+    assert not hashed_summary_b.exists()
+    assert not hashed_copy_b.exists()
+    # summaries 아래에는 요약본 1개, 복사본 1개만 남아야 함
+    all_md = list((tmp_path / "summaries").rglob("보고서*.md"))
+    all_copies = list((tmp_path / "summaries").rglob("보고서*.pptx"))
+    assert len(all_md) == 1
+    assert len(all_copies) == 1
+
+
 def test_extract_text_real_smoke(tmp_path: Path):
     """markitdown 실변환 스모크 — 지원 포맷 파일이 없으면 skip."""
     pytest.importorskip("markitdown")

@@ -38,8 +38,9 @@ def _place(summaries_dir: Path, category: str, original: Path, summary_md: str,
            prior: tuple[str, str] | None) -> str:
     """요약 md와 원본 복사본을 카테고리 폴더에 기록.
 
-    - 카테고리 변경 시 이전 요약본·복사본을 이동(삭제 후 재생성)한다. 고아 파일 방지를 위해
-      요약본·복사본의 존재 여부를 각각 독립적으로 확인한다(하나만 남아 있어도 정리됨).
+    - 최종 요약 경로가 이전 요약 경로(prior)와 달라지면(카테고리 변경이든, 동일 폴더 내에서
+      충돌 해시가 붙거나 빠지는 이름 변경이든) 이전 요약본·복사본을 정리한다(이동, 중복 생성 금지).
+      요약본·복사본의 존재 여부는 각각 독립적으로 확인한다(하나만 남아 있어도 정리됨).
     - 동일 카테고리에 동명 파일이 이미 있으면(다른 원본에서 비롯된 것) 원본 절대경로 해시로
       파일명을 구분해 덮어쓰기·중복 생성을 방지한다 (스펙 §7.1 중복 생성 금지·정확한 이동).
     """
@@ -49,16 +50,6 @@ def _place(summaries_dir: Path, category: str, original: Path, summary_md: str,
     candidate_summary = target_dir / (original.name + ".md")
     is_ours = bool(prior) and Path(prior[1]) == candidate_summary
 
-    if prior:
-        old_summary = Path(prior[1])
-        if old_summary.parent != target_dir:
-            # 카테고리 변경: 요약본·복사본을 독립적으로 정리 (하나가 이미 없어도 나머지는 정리)
-            if old_summary.exists():
-                old_summary.unlink()
-            old_copy = old_summary.parent / old_summary.name.removesuffix(".md")
-            if old_copy.exists():
-                old_copy.unlink()
-
     if candidate_summary.exists() and not is_ours:
         # 동명 파일 충돌: 다른 원본이 이미 이 이름을 쓰고 있음 → 해시로 구분
         suffix = "__" + hashlib.sha1(str(original.resolve()).encode()).hexdigest()[:8]
@@ -67,6 +58,16 @@ def _place(summaries_dir: Path, category: str, original: Path, summary_md: str,
     else:
         summary_path = candidate_summary
         copy_name = original.name
+
+    if prior and Path(prior[1]) != summary_path:
+        # 요약 경로가 바뀜(카테고리 이동 또는 동일 폴더 내 충돌 해시 부여/해제) — 이전 파일 정리.
+        # 요약본·복사본 존재 여부를 각각 독립적으로 확인해 고아 방지(하나만 남아 있어도 정리됨).
+        old_summary = Path(prior[1])
+        if old_summary.exists():
+            old_summary.unlink()
+        old_copy = old_summary.parent / old_summary.name.removesuffix(".md")
+        if old_copy.exists():
+            old_copy.unlink()
 
     summary_path.write_text(summary_md, encoding="utf-8")
     copy_path = target_dir / copy_name
