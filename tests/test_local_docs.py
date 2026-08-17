@@ -254,7 +254,7 @@ def test_transient_failure_does_not_delete_previously_synced_file(tmp_path: Path
     assert r3.documents[0].source_id == sid
 
 
-def test_stat_failure_previously_synced_not_deleted(tmp_path: Path, patch_extract, monkeypatch):
+def test_stat_failure_previously_synced_not_deleted(tmp_path: Path, patch_extract):
     """stat() 일시 실패(파일 잠김 등) 시 기수집 파일이 삭제로 오판되면 안 된다."""
     docs = tmp_path / "docs"; docs.mkdir()
     f = docs / "킥오프.pptx"; f.write_bytes(b"v1")
@@ -267,16 +267,19 @@ def test_stat_failure_previously_synced_not_deleted(tmp_path: Path, patch_extrac
         if self.name == "킥오프.pptx":
             raise PermissionError("locked")
         return real_stat(self, **kw)
-    monkeypatch.setattr(Path, "stat", flaky_stat)
-    r2 = run(tmp_path, docs, state=r1.state,
-             prior={sid: (r1.documents[0].extra["para_path"], str(summary))})
-    assert sid not in r2.deleted_ids
-    assert summary.exists()
-    monkeypatch.undo()
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Path, "stat", flaky_stat)
+        r2 = run(tmp_path, docs, state=r1.state,
+                 prior={sid: (r1.documents[0].extra["para_path"], str(summary))})
+        assert sid not in r2.deleted_ids
+        assert summary.exists()
+    # 컨텍스트 종료로 stat만 복원 — patch_extract는 유지
     # 복구 후 재동기화되어야 함 (센티널 시그니처 불일치 → 재처리)
     r3 = run(tmp_path, docs, state=r2.state,
              prior={sid: (r1.documents[0].extra["para_path"], str(summary))})
     assert any(d.source_id == sid for d in r3.documents)
+    assert r3.documents[0].content_indexed is True  # 정상 경로 재처리 검증 (DRM 폴백 아님)
 
 
 def test_extract_text_real_smoke(tmp_path: Path):

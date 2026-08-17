@@ -172,7 +172,7 @@ def sync_local_docs(
                 # 실행에서 deleted로 오판되어 기존 요약본/복사본/색인이 삭제되지 않게
                 # 하고, (2) 실제 시그니처와 항상 달라 다음 동기화에서 재시도되게 한다.
                 logger.exception("local_docs 동기화 실패, 파일 건너뜀: %s", sid)
-                seen[sid] = _RETRY_SENTINEL
+                seen[sid] = list(_RETRY_SENTINEL)
                 continue
 
     deleted = [sid for sid in prev if sid not in seen]
