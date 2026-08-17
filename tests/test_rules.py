@@ -24,6 +24,18 @@ def test_is_excluded_folder():
     assert not is_excluded("/mail/일반/x.msg", None, "일반", ["folder:인사평가"])
 
 
+def test_is_excluded_folder_matches_ancestor_not_just_parent():
+    """folder: 패턴은 직계 부모뿐 아니라 경로상의 모든 구성요소에 매칭돼야 한다."""
+    assert is_excluded("/mail/인사평가/sub/a.md", None, "sub", ["folder:인사평가"])
+    assert not is_excluded("/mail/일반/sub/a.md", None, "sub", ["folder:인사평가"])
+
+
+def test_is_excluded_folder_falls_back_when_no_path():
+    """path가 없으면 전달받은 folder(직계 부모) 인자로 폴백한다."""
+    assert is_excluded(None, None, "인사평가", ["folder:인사평가"])
+    assert not is_excluded(None, None, "sub", ["folder:인사평가"])
+
+
 def test_load_rules_md(tmp_path: Path):
     f = tmp_path / "rules.md"
     f.write_text("## 용어집\nTF-N은 차세대 TF다.\n\n## 답변 규칙\n두괄식으로.\n", encoding="utf-8")

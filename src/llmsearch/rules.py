@@ -13,8 +13,15 @@ def _match_one(rule: str, path: str | None, sender: str | None, folder: str | No
         return fnmatch.fnmatchcase(norm, pattern)
     if kind == "sender" and sender is not None:
         return fnmatch.fnmatch(sender.lower(), pattern.lower())
-    if kind == "folder" and folder is not None:
-        return fnmatch.fnmatchcase(folder, pattern)
+    if kind == "folder":
+        # path가 있으면 경로의 모든 구성요소(폴더) 각각을 검사한다 — 직계 부모 폴더만
+        # 검사하면 `folder:인사평가`가 /mail/인사평가/sub/a.md처럼 조상 폴더에 있는
+        # 파일을 놓친다. path가 없을 때만 전달받은 folder(직계 부모) 인자로 폴백한다.
+        if path is not None:
+            parts = PureWindowsPath(path).parts
+            return any(fnmatch.fnmatchcase(part, pattern) for part in parts)
+        if folder is not None:
+            return fnmatch.fnmatchcase(folder, pattern)
     return False
 
 
