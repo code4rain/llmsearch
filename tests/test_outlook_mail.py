@@ -77,6 +77,36 @@ def test_unavailable_client_raises():
         sync_outlook_mail(c, ["inbox"], 365, [], {}, now=NOW)
 
 
+def test_window_growth_backfills():
+    """since_days를 늘리면(창 확대) 이전에는 창 밖이라 미수집이던 과거 메일이
+    재동기화 시 수집된다(state 재사용, 커서 리셋 백필). 이미 알려진 메일은
+    재수집돼도 재방출되지 않는다(불변 메일 가정)."""
+    old_mail = mail("old", NOW - timedelta(days=15))
+    recent_mail = mail("recent", NOW - timedelta(days=5))
+    c = FakeOutlookClient(mails={"inbox": [old_mail, recent_mail]})
+    r1 = sync_outlook_mail(c, ["inbox"], since_days=10, excludes=[], state={}, now=NOW)
+    assert {d.source_id for d in r1.documents} == {"recent"}  # old는 창 밖(10일)
+
+    r2 = sync_outlook_mail(c, ["inbox"], since_days=30, excludes=[], state=r1.state, now=NOW)
+    ids2 = {d.source_id for d in r2.documents}
+    assert "old" in ids2  # 창 확대로 백필됨
+    assert "recent" not in ids2  # 이미 known — 재방출 없음
+
+
+def test_known_mail_not_reemitted():
+    """커서가 리셋되어 이미 알려진 메일이 재fetch되더라도(예: 창 확대, 혹은 커서
+    유실) known_ids에 있는 entry_id는 documents로 재방출되지 않는다."""
+    m = mail("x", NOW - timedelta(days=1))
+    c = FakeOutlookClient(mails={"inbox": [m]})
+    r1 = sync_outlook_mail(c, ["inbox"], 365, [], {}, now=NOW)
+    assert {d.source_id for d in r1.documents} == {"x"}
+
+    state = r1.state
+    state["cursor"] = {}  # 커서 리셋 상황을 시뮬레이션 — known_ids는 유지
+    r2 = sync_outlook_mail(c, ["inbox"], 365, [], state, now=NOW)
+    assert r2.documents == []
+
+
 def test_same_timestamp_at_batch_boundary_not_lost():
     ts1 = NOW - timedelta(days=1)
     ts2 = ts1 + timedelta(minutes=5)
