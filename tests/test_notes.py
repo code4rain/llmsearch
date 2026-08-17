@@ -68,6 +68,8 @@ def test_unreadable_file_isolation(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(Path, "read_text", mock_read_text)
     Path._original_read_text = original_read_text
 
+    # Bump mtime of unreadable file to force read_text() to be reached
+    os.utime(unreadable, (time.time() + 10, time.time() + 10))
     r2 = sync_notes([tmp_path], [], r1.state)
     assert len(r2.documents) == 0
     assert unreadable_sid in r2.state["files"]
