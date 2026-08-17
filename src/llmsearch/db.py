@@ -14,6 +14,7 @@ except ImportError:
     HAS_SQLITE_VEC = False
 
 SCHEMA_VERSION = 1
+EMBEDDING_DIM = 768
 
 
 class SchemaMismatchError(Exception):
@@ -59,7 +60,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     conn.executescript(_SCHEMA)
     if HAS_SQLITE_VEC:
         conn.execute(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vecs USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[768])"
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vecs USING vec0(chunk_id INTEGER PRIMARY KEY, embedding float[{EMBEDDING_DIM}])"
         )
     else:
         conn.execute(
@@ -82,9 +83,14 @@ def _pack(vector: list[float]) -> bytes:
 
 
 def insert_embedding(conn: sqlite3.Connection, chunk_id: int, vector: list[float]) -> None:
+    if len(vector) != EMBEDDING_DIM:
+        raise ValueError(f"Vector has {len(vector)} dimensions, expected {EMBEDDING_DIM}")
+
     if HAS_SQLITE_VEC:
+        # vec0 doesn't support INSERT OR REPLACE — delete first then insert
+        conn.execute("DELETE FROM chunk_vecs WHERE chunk_id=?", (chunk_id,))
         conn.execute(
-            "INSERT OR REPLACE INTO chunk_vecs(chunk_id, embedding) VALUES (?, ?)",
+            "INSERT INTO chunk_vecs(chunk_id, embedding) VALUES (?, ?)",
             (chunk_id, _pack(vector)),
         )
     else:
