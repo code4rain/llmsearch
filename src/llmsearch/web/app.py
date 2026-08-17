@@ -224,6 +224,20 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             if target.startswith("outlook:"):
                 _get_outlook_client(state).open_item(target.removeprefix("outlook:"))
                 return {"ok": True}
+            if target.startswith("http://") or target.startswith("https://"):
+                # M3부터 confluence/jira 문서의 url_or_path는 http(s) URL — 인덱스에 정확히
+                # 등록된 값인지 검증 후에만 연다(CSRF로 임의 URL을 열게 하는 것 방지).
+                row = read_conn.execute(
+                    "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
+                ).fetchone()
+                if row is None:
+                    return {"ok": False, "error": "인덱스에 등록된 URL만 열 수 있습니다"}
+                import os
+                if hasattr(os, "startfile"):  # Windows 전용 — 기본 브라우저로 연다
+                    import webbrowser
+                    webbrowser.open(target)
+                    return {"ok": True}
+                return {"ok": False, "error": "파일 열기는 Windows에서만 지원됩니다"}
             # 로컬 경로 실행 전 검증: localhost API는 CSRF로 임의 사이트가 두드릴 수 있으므로
             # (M1 XSS와 같은 계열의 위협) 인덱스에 등록된 경로만 연다 — 임의 파일 실행 방지.
             resolved = str(Path(target).resolve())

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -59,6 +60,40 @@ def test_confluence_and_jira_sync(tmp_path: Path):
     # 미러 파일 존재 (스펙 §13 레이아웃)
     assert list((tmp_path / "data" / "confluence").rglob("*.md"))
     assert (tmp_path / "data" / "jira" / "PROJ-1.md").exists()
+
+
+def test_open_registered_http_url(tmp_path: Path, monkeypatch):
+    """M3부터 confluence/jira 문서의 url_or_path는 http(s) URL이다 — 인덱스에 등록된
+    URL이면 webbrowser.open으로 열려야 한다 (M1 로컬 경로 전용 Path().resolve() 금지)."""
+    client = make_client(tmp_path, atlassian=fake_atlassian())
+    client.post("/api/atlassian/register",
+                json={"url": "https://wiki/pages/viewpage.action?pageId=123"})
+    assert client.post("/api/sync/confluence").json()["indexed"] == 1
+
+    # Windows 환경 시뮬레이션(WSL/리눅스 테스트 환경에서 os.startfile 부재 우회)
+    monkeypatch.setattr(os, "startfile", lambda p: None, raising=False)
+    opened = []
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+
+    r = client.post("/api/open", json={"url_or_path": "https://wiki/pages/123"})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert opened == ["https://wiki/pages/123"]
+
+
+def test_open_unregistered_http_url_rejected(tmp_path: Path, monkeypatch):
+    """인덱스에 등록되지 않은 http(s) URL은 거부된다 — CSRF로 임의 URL을 열게 하는 것 방지."""
+    client = make_client(tmp_path, atlassian=fake_atlassian())
+    opened = []
+    import webbrowser
+    monkeypatch.setattr(webbrowser, "open", lambda url: opened.append(url))
+
+    r = client.post("/api/open", json={"url_or_path": "https://evil.example.com/"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "인덱스" in body["error"]
+    assert opened == []
 
 
 def test_auth_failure_isolated(tmp_path: Path, monkeypatch):
