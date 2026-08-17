@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import db, indexer, search
+from ..archive import archive_project
 from ..atlassian.auth import diagnose, resolve_auth_candidates
 from ..atlassian.registry import Registry
 from ..config import Config
@@ -286,6 +287,30 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if not state["registry"].remove(str(payload.get("url", ""))):
             raise HTTPException(404, "등록되지 않은 URL")
         return {"ok": True}
+
+    @app.get("/api/para/projects")
+    def para_projects():
+        """summaries/Projects/ 하위 폴더 목록 — GUI 아카이브 섹션용 (스펙 §7.1 P1)."""
+        projects_dir = config.summaries_dir / "Projects"
+        out = []
+        if projects_dir.is_dir():
+            for p in sorted(d for d in projects_dir.iterdir() if d.is_dir()):
+                row = read_conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE para_path=?", (f"Projects/{p.name}",)
+                ).fetchone()
+                out.append({"name": p.name, "doc_count": row[0]})
+        return out
+
+    @app.post("/api/archive")
+    def archive(payload: dict):
+        name = str(payload.get("project", ""))
+        with state["sync_lock"]:  # 동기화 중 폴더 이동 금지 — 쓰기 직렬화
+            try:
+                return archive_project(conn, config.summaries_dir, name)
+            except KeyError as exc:
+                raise HTTPException(404, exc.args[0])  # str(KeyError)는 따옴표가 붙어 UI에 그대로 노출됨
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
 
     @app.post("/api/open")
     def open_item(payload: dict):

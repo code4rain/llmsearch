@@ -162,3 +162,47 @@ def test_slide_renderer_lazy_is_none_off_windows(tmp_path):
     state = {}
     assert _get_slide_renderer(state) is None
     assert _get_slide_renderer(state) is None  # 캐시 후에도 동일
+
+
+def test_archive_api_moves_project(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app
+
+    cfg = Config(data_dir=tmp_path / "data")
+    proj = cfg.summaries_dir / "Projects" / "알파"
+    proj.mkdir(parents=True)
+    (proj / "요약.md").write_text("# x", encoding="utf-8")
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    # TrustedHostMiddleware가 기본 Host("testserver")를 거부하므로 base_url 필수
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    listed = client.get("/api/para/projects").json()
+    assert listed == [{"name": "알파", "doc_count": 0}]
+
+    r = client.post("/api/archive", json={"project": "알파"})
+    assert r.status_code == 200
+    assert "config.yaml" in r.json()["hint"]
+    assert (cfg.summaries_dir / "Archives" / "알파" / "요약.md").exists()
+    assert client.get("/api/para/projects").json() == []
+
+
+def test_archive_api_unknown_project_404(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app
+
+    app = create_app(Config(data_dir=tmp_path / "data"), embedder=FakeEmbeddings(),
+                     summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")  # TrustedHost 통과
+    assert client.post("/api/archive", json={"project": "없음"}).status_code == 404
+    assert client.post("/api/archive", json={"project": ".."}).status_code == 400
