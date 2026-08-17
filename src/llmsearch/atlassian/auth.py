@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Mapping
 
 from .client import AtlassianClient
@@ -19,10 +19,10 @@ _HELP = (
 @dataclass
 class AtlassianAuth:
     mode: str  # "pat" | "basic" | "cookie"
-    token: str = ""
+    token: str = field(default="", repr=False)
     user: str = ""
-    password: str = ""
-    cookie: str = ""
+    password: str = field(default="", repr=False)
+    cookie: str = field(default="", repr=False)
 
 
 def resolve_auth_candidates(env: Mapping[str, str] | None = None) -> list[AtlassianAuth]:

@@ -54,3 +54,9 @@ def test_diagnose_survives_client_construction_error():
         make_client,
     )
     assert auth.mode == "basic"  # 생성 예외도 다음 후보로 폴백
+
+
+def test_repr_hides_secrets():
+    r = repr(AtlassianAuth(mode="pat", token="SECRET_TOKEN", password="PW", cookie="CK"))
+    assert "SECRET_TOKEN" not in r and "PW" not in r and "CK" not in r
+    assert "pat" in r  # mode는 보임
