@@ -34,3 +34,15 @@ def test_load_rules_md(tmp_path: Path):
 
 def test_load_rules_md_missing(tmp_path: Path):
     assert load_rules_md(tmp_path / "none.md") == {}
+
+
+def test_match_override_windows_path():
+    """Windows 형식 경로(백슬래시)도 POSIX 패턴과 일관되게 매칭되어야 함."""
+    assert match_override(r"C:\docs\2026\경영회의\1월.pptx", None, OVERRIDES) == "Areas/경영지원"
+
+
+def test_match_override_case_sensitive():
+    """경로 매칭은 대소문자를 구분해야 함 (모든 플랫폼에서 일관성)."""
+    overrides = [{"match": "path:**/Reports/**", "target": "Area/Reports"}]
+    assert match_override("/docs/reports/x.pptx", None, overrides) is None  # "reports" != "Reports"
+    assert match_override("/docs/Reports/x.pptx", None, overrides) == "Area/Reports"

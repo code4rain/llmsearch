@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import fnmatch
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PureWindowsPath
 
 
 def _match_one(rule: str, path: str | None, sender: str | None, folder: str | None) -> bool:
     kind, _, pattern = rule.partition(":")
     if kind == "path" and path is not None:
         # 경로 구분자를 통일해 Windows/POSIX 양쪽에서 동일하게 매칭
-        norm = str(PurePosixPath(Path(path).as_posix()))
-        return fnmatch.fnmatch(norm, pattern)
+        # PureWindowsPath로 정규화하면 \ 와 / 를 모두 /로 변환하여 모든 플랫폼에서 일관성 있음
+        norm = PureWindowsPath(path).as_posix()
+        return fnmatch.fnmatchcase(norm, pattern)
     if kind == "sender" and sender is not None:
         return fnmatch.fnmatch(sender.lower(), pattern.lower())
     if kind == "folder" and folder is not None:
-        return fnmatch.fnmatch(folder, pattern)
+        return fnmatch.fnmatchcase(folder, pattern)
     return False
 
 
