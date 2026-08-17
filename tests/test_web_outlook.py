@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -69,12 +70,33 @@ def test_open_outlook_item(tmp_path: Path):
     assert fake.opened == ["m1"]
 
 
-def test_open_local_path_non_windows(tmp_path: Path):
-    """비Windows(WSL 테스트 환경)에서는 파일 열기가 안내 오류로 응답해야 한다."""
-    import sys
+def test_open_unindexed_local_path_rejected(tmp_path: Path):
+    """인덱스에 등록되지 않은 로컬 경로는 어느 플랫폼에서도 열기가 거부된다 — CSRF로
+    임의 사이트가 /api/open을 두드려도 인덱스 밖 파일은 실행될 수 없어야 한다."""
     client = make_client(tmp_path)
     f = tmp_path / "a.md"; f.write_text("x", encoding="utf-8")
     r = client.post("/api/open", json={"url_or_path": str(f)})
     assert r.status_code == 200
-    if sys.platform != "win32":
-        assert r.json()["ok"] is False
+    body = r.json()
+    assert body["ok"] is False
+    assert "인덱스" in body["error"]
+
+
+def test_open_indexed_local_path(tmp_path: Path, monkeypatch):
+    """인덱스에 등록된 경로만 os.startfile로 열린다 — 테스트는 startfile을 fake로 격리해
+    실제 OS 열기 부작용 없이 어느 플랫폼에서나 실행 가능하다."""
+    notes = tmp_path / "notes"; notes.mkdir()
+    note_file = notes / "kick.md"
+    note_file.write_text("# 킥오프\n내용", encoding="utf-8")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    assert client.post("/api/sync/notes").json()["indexed"] == 1
+
+    opened: list[str] = []
+    monkeypatch.setattr(os, "startfile", lambda p: opened.append(p), raising=False)
+
+    r = client.post("/api/open", json={"url_or_path": str(note_file)})
+    assert r.status_code == 200 and r.json()["ok"] is True
+    assert opened == [str(note_file.resolve())]

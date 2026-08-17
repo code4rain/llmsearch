@@ -124,6 +124,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if enable_scheduler:
             state["scheduler"] = asyncio.create_task(scheduler_loop())
 
+    @app.on_event("shutdown")
+    async def _shutdown():
+        worker = state.get("outlook_worker")
+        if worker is not None:
+            try:
+                worker.shutdown()
+            except Exception:
+                pass
+
     @app.get("/")
     def index():
         return FileResponse(STATIC_DIR / "index.html")
@@ -159,9 +168,21 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             if target.startswith("outlook:"):
                 _get_outlook_client(state).open_item(target.removeprefix("outlook:"))
                 return {"ok": True}
+            # 로컬 경로 실행 전 검증: localhost API는 CSRF로 임의 사이트가 두드릴 수 있으므로
+            # (M1 XSS와 같은 계열의 위협) 인덱스에 등록된 경로만 연다 — 임의 파일 실행 방지.
+            resolved = str(Path(target).resolve())
+            row = read_conn.execute(
+                "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (resolved,)
+            ).fetchone()
+            if row is None:  # local_docs/notes는 이미 resolve()된 문자열을 저장하지만 대비 차원의 폴백
+                row = read_conn.execute(
+                    "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
+                ).fetchone()
+            if row is None:
+                return {"ok": False, "error": "인덱스에 등록된 경로만 열 수 있습니다"}
             import os
             if hasattr(os, "startfile"):  # Windows 전용
-                os.startfile(target)  # noqa: S606 — 로컬 개인 도구, 사용자 소유 경로
+                os.startfile(resolved)  # noqa: S606 — 위에서 인덱스 등록 여부를 검증한 경로만 실행
                 return {"ok": True}
             return {"ok": False, "error": "파일 열기는 Windows에서만 지원됩니다"}
         except Exception as exc:
