@@ -1,4 +1,5 @@
 import json
+import threading
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -56,3 +57,25 @@ def test_sync_log(tmp_path: Path):
     client.post("/api/sync/notes")
     log = client.get("/api/log").json()
     assert log and log[0]["source"] == "notes" and log[0]["ok"] is True
+
+
+def test_concurrent_manual_sync_is_serialized(tmp_path: Path):
+    client = make_app(tmp_path)
+    results = [None, None]
+
+    def call(i):
+        results[i] = client.post("/api/sync/notes")
+
+    threads = [threading.Thread(target=call, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(r.status_code == 200 for r in results)
+    log = client.get("/api/log").json()
+    assert len(log) == 2
+    assert all(e["source"] == "notes" and e["ok"] is True for e in log)
+    r = client.get("/api/sources")
+    notes_status = next(s for s in r.json() if s["source"] == "notes")
+    assert notes_status["doc_count"] == 1

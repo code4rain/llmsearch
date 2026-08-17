@@ -46,12 +46,15 @@ function show(id) {
   if (id === 'sources') loadSources();
   if (id === 'log') loadLog();
 }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 async function loadSources() {
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
-    `<tr><td>${s.source}</td><td>${s.doc_count}</td><td>${s.last_sync ?? '-'}` +
+    `<tr><td>${esc(s.source)}</td><td>${esc(s.doc_count)}</td><td>${esc(s.last_sync ?? '-')}` +
     `${s.last_error ? ' ⚠️' : ''}</td>` +
-    `<td><button onclick="syncNow('${s.source}')">동기화</button></td></tr>`).join('');
+    `<td><button onclick="syncNow('${esc(s.source)}')">동기화</button></td></tr>`).join('');
 }
 async function syncNow(source) {
   await fetch('/api/sync/' + source, {method: 'POST'});
@@ -67,8 +70,13 @@ async function ask(e) {
   if (!q) return;
   document.getElementById('question').value = '';
   const box = document.getElementById('messages');
-  box.innerHTML += `<div class="msg-q">Q. ${q}</div><div class="msg-a"></div>`;
-  const answerDiv = box.lastElementChild;
+  const qDiv = document.createElement('div');
+  qDiv.className = 'msg-q';
+  qDiv.textContent = 'Q. ' + q;
+  box.appendChild(qDiv);
+  const answerDiv = document.createElement('div');
+  answerDiv.className = 'msg-a';
+  box.appendChild(answerDiv);
   const resp = await fetch('/api/chat', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({question: q, history}),
@@ -91,8 +99,8 @@ async function ask(e) {
         for (const h of JSON.parse(data)) {
           const lock = h.content_indexed ? '' : ' 🔒';
           answerDiv.insertAdjacentHTML('beforeend',
-            `<div class="src">📄 ${h.title}${lock} <small>(${h.source_type} · ${h.updated_at})</small><br>` +
-            `<code>${h.url_or_path}</code></div>`);
+            `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
+            `<code>${esc(h.url_or_path)}</code></div>`);
         }
       }
       box.scrollTop = box.scrollHeight;

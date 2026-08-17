@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import traceback
 from dataclasses import asdict
 from datetime import datetime
@@ -26,34 +27,35 @@ def run_sync(state: dict, source: str) -> dict:
     conn = state["conn"]
     entry = {"source": source, "at": datetime.now().isoformat(), "ok": True, "indexed": 0,
              "deleted": 0, "error": None}
-    try:
-        prev = indexer.get_sync_state(conn, source)
-        rules_md = load_rules_md(cfg.rules_md_path)
-        if source == "notes":
-            result = sync_notes(cfg.notes_folders, cfg.exclude, prev)
-        else:  # local_docs
-            prior_map = {
-                sid: pm for sid in list(prev.get("files", {}))
-                if (pm := indexer.get_para_map(conn, sid))
-            }
-            result = sync_local_docs(
-                folders=cfg.watch_folders, excludes=cfg.exclude, overrides=cfg.para_overrides,
-                summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
-                projects=cfg.projects, areas=cfg.areas,
-                glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
-                state=prev, prior_map=prior_map,
-            )
-        entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
-        entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
-        for doc in result.documents:
-            if "summary_path" in doc.extra:
-                indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
-        indexer.set_sync_state(conn, source, result.state)
-    except Exception as exc:
-        entry["ok"] = False
-        entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
-    state["log"].insert(0, entry)
-    del state["log"][200:]
+    with state["sync_lock"]:  # 단일 sqlite3.Connection 공유 쓰기 직렬화 (스펙 §5 P0)
+        try:
+            prev = indexer.get_sync_state(conn, source)
+            rules_md = load_rules_md(cfg.rules_md_path)
+            if source == "notes":
+                result = sync_notes(cfg.notes_folders, cfg.exclude, prev)
+            else:  # local_docs
+                prior_map = {
+                    sid: pm for sid in list(prev.get("files", {}))
+                    if (pm := indexer.get_para_map(conn, sid))
+                }
+                result = sync_local_docs(
+                    folders=cfg.watch_folders, excludes=cfg.exclude, overrides=cfg.para_overrides,
+                    summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
+                    projects=cfg.projects, areas=cfg.areas,
+                    glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
+                    state=prev, prior_map=prior_map,
+                )
+            entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
+            entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
+            for doc in result.documents:
+                if "summary_path" in doc.extra:
+                    indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
+            indexer.set_sync_state(conn, source, result.state)
+        except Exception as exc:
+            entry["ok"] = False
+            entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
+        state["log"].insert(0, entry)
+        del state["log"][200:]
     return entry
 
 
@@ -75,7 +77,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     conn = db.open_db(config.db_path)
     state = {"config": config, "conn": conn, "embedder": embedder,
-             "summarizer": summarizer, "answerer": answerer, "log": []}
+             "summarizer": summarizer, "answerer": answerer, "log": [],
+             "sync_lock": threading.Lock()}
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
