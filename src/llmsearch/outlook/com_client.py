@@ -13,6 +13,7 @@ from .com_worker import ComWorker
 _FOLDER_IDS = {"inbox": 6, "sent": 5}  # OlDefaultFolders 상수
 _CALENDAR_ID = 9
 _RESTRICT_FMT = "%m/%d/%Y %I:%M %p"  # Outlook Restrict가 요구하는 미국식 포맷
+_RESTRICT_SLACK = timedelta(minutes=1)  # Restrict 분 단위 절사 보정
 
 
 def _filter_mail(mails: list[dict], since: datetime, until: datetime | None = None) -> list[dict]:
@@ -94,11 +95,12 @@ class ComOutlookClient:
                   limit: int | None = None) -> list[dict]:
         items = self._folder(folder).Items
         items.Sort("[ReceivedTime]", False)  # 오름차순
-        # Widen Restrict window by 1 minute to account for minute truncation
-        since_widened = since - timedelta(minutes=1)
+        # Widen Restrict window by slack to account for minute truncation
+        since_widened = since - _RESTRICT_SLACK
         query = f"[ReceivedTime] > '{since_widened.strftime(_RESTRICT_FMT)}'"
         if until is not None:
-            query += f" AND [ReceivedTime] <= '{until.strftime(_RESTRICT_FMT)}'"
+            until_widened = until + _RESTRICT_SLACK
+            query += f" AND [ReceivedTime] <= '{until_widened.strftime(_RESTRICT_FMT)}'"
         restricted = items.Restrict(query)
         mails: list[dict] = []
         for item in restricted:
@@ -114,11 +116,20 @@ class ComOutlookClient:
     def list_mail_ids(self, folder: str, since: datetime) -> set[str]:
         items = self._folder(folder).Items
         items.Sort("[ReceivedTime]", False)
-        # Widen Restrict window by 1 minute to account for minute truncation
-        since_widened = since - timedelta(minutes=1)
+        # Widen Restrict window by slack to account for minute truncation
+        since_widened = since - _RESTRICT_SLACK
         restricted = items.Restrict(f"[ReceivedTime] > '{since_widened.strftime(_RESTRICT_FMT)}'")
-        mails = [self._mail_dict(item, folder) for item in restricted
-                 if getattr(item, "Class", None) == 43]
+        # Build lean dicts with only fields needed for filtering (no expensive COM reads)
+        mails = []
+        for item in restricted:
+            if getattr(item, "Class", None) != 43:
+                continue
+            received = item.ReceivedTime
+            mails.append({
+                "entry_id": item.EntryID,
+                "received_at": datetime(received.year, received.month, received.day,
+                                       received.hour, received.minute, received.second),
+            })
         # Apply exact filter
         filtered = _filter_mail(mails, since)
         return {mail["entry_id"] for mail in filtered}
@@ -130,9 +141,9 @@ class ComOutlookClient:
         items = self._ns.GetDefaultFolder(_CALENDAR_ID).Items
         items.Sort("[Start]")            # IncludeRecurrences 전에 Sort 필수 (Outlook 규약)
         items.IncludeRecurrences = True  # 반복 일정 전개 — Restrict로 기간 한정 (스펙 §7.5)
-        # Widen window by 1 minute to account for minute truncation in Restrict
-        window_start_widened = window_start - timedelta(minutes=1)
-        window_end_widened = window_end + timedelta(minutes=1)
+        # Widen window by slack to account for minute truncation in Restrict
+        window_start_widened = window_start - _RESTRICT_SLACK
+        window_end_widened = window_end + _RESTRICT_SLACK
         # Overlap semantics: start <= window_end AND end >= window_start
         query = (f"[Start] <= '{window_end_widened.strftime(_RESTRICT_FMT)}'"
                  f" AND [End] >= '{window_start_widened.strftime(_RESTRICT_FMT)}'")
