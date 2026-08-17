@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 MAX_SUMMARY_INPUT_CHARS = 30000
 
@@ -107,6 +110,8 @@ class Summarizer(Protocol):
 
     def describe_filename(self, filename: str) -> str: ...
 
+    def describe_images(self, title: str, images: list[bytes]) -> str: ...
+
 
 class FakeSummarizer:
     """결정적 요약·분류 — 테스트용. 제목/본문에 프로젝트·영역명이 있으면 그리로 분류."""
@@ -128,6 +133,9 @@ class FakeSummarizer:
     def describe_filename(self, filename: str) -> str:
         stem = filename.rsplit(".", 1)[0].replace("_", " ").replace("-", " ")
         return f"파일명 기반 추정: {stem} 관련 문서 (내용 미인덱싱)"
+
+    def describe_images(self, title: str, images: list[bytes]) -> str:
+        return f"슬라이드 {len(images)}장 비전 설명: {title}"
 
 
 _SUMMARY_PROMPT = """당신은 사내 문서 요약가다. 아래 문서를 검색에 최적화된 Markdown으로 요약하라.
@@ -196,3 +204,19 @@ class GeminiSummarizer:
             "검색 키워드가 될 고유명사를 보존하라.\n파일명: " + filename
         )
         return self._generate(prompt)
+
+    def describe_images(self, title: str, images: list[bytes]) -> str:
+        from google.genai import types  # 지연 import
+
+        parts = [types.Part.from_bytes(data=img, mime_type="image/png") for img in images]
+        prompt = (
+            f"다음은 사내 발표자료 '{title}'의 슬라이드 이미지다. 각 슬라이드의 핵심 내용을 "
+            "검색 가능한 텍스트로 설명하라. 수치·날짜·고유명사(사람/프로젝트명)를 보존하고, "
+            "슬라이드별 불릿 1~3개로 요약하라."
+        )
+        try:
+            resp = self.client.models.generate_content(model=self.model, contents=parts + [prompt])
+            return resp.text or ""
+        except Exception:
+            logger.warning("비전 설명 생성 실패 (이미지 %d장): %s", len(images), title, exc_info=True)
+            return ""

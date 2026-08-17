@@ -40,6 +40,8 @@
     <button>등록</button>
   </form>
   <ul id="atlList"></ul>
+  <h3>프로젝트 아카이브</h3>
+  <ul id="projList"></ul>
 </div>
 
 <div id="log" class="tab"><pre id="logBody"></pre></div>
@@ -49,7 +51,7 @@ const history = [];
 function show(id) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
-  if (id === 'sources') { loadSources(); loadRegistrations(); }
+  if (id === 'sources') { loadSources(); loadRegistrations(); loadProjects(); }
   if (id === 'log') loadLog();
 }
 function esc(s) {
@@ -93,6 +95,21 @@ async function removeReg(u) {
   await fetch('/api/atlassian/registrations', {method: 'DELETE',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url: u})});
   loadRegistrations();
+}
+async function loadProjects() {
+  const ps = await (await fetch('/api/para/projects')).json();
+  document.getElementById('projList').innerHTML = ps.map(p =>
+    `<li>${esc(p.name)} (${esc(p.doc_count)}건) ` +
+    `<button onclick="archiveProject(this.dataset.n)" data-n="${esc(p.name)}">완료 처리</button></li>`).join('');
+}
+async function archiveProject(name) {
+  if (!confirm(`'${name}' 프로젝트를 Archives로 이동할까요? 검색 순위가 하향됩니다.`)) return;
+  const r = await fetch('/api/archive', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project: name})});
+  let data = {};
+  try { data = await r.json(); } catch { data = {detail: '서버 내부 오류 — 로그를 확인하세요'}; }
+  alert(r.ok ? (data.hint || '완료') : (data.detail || '실패'));
+  loadProjects(); loadSources();
 }
 async function loadLog() {
   const data = await (await fetch('/api/log')).json();

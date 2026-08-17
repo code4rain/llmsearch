@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import db, indexer, search
+from ..archive import archive_project
 from ..atlassian.auth import diagnose, resolve_auth_candidates
 from ..atlassian.registry import Registry
 from ..config import Config
@@ -29,8 +30,8 @@ from ..rules import load_rules_md
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
 _AUTH_EXPIRED_MSG = (
-    "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_PAT/USER/PASSWORD/COOKIE)을 "
-    "갱신한 뒤 다시 동기화하세요."
+    "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
+    "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
 )
 _logger = logging.getLogger(__name__)
 
@@ -41,35 +42,64 @@ def _get_outlook_client(state):
         from ..outlook.com_client import ThreadedOutlookClient
         from ..outlook.com_worker import ComWorker
 
-        worker = ComWorker()
-        state["outlook_worker"] = worker
+        worker = state.get("outlook_worker")
+        if worker is None:
+            worker = ComWorker()
+            state["outlook_worker"] = worker
         state["outlook_client"] = ThreadedOutlookClient(worker)
     return state["outlook_client"]
 
 
-def _get_atlassian_client(state):
-    """3단 폴백 자동 진단으로 클라이언트 지연 생성 (스펙 §7.2 P0). 진단 결과는 세션 캐시.
+def _get_slide_renderer(state):
+    """Windows에서만 PowerPoint COM 렌더러를 지연 생성 — 그 외 환경은 None(비전 보완 생략).
 
-    자격증명(.env) 부재는 diagnose()가 안내 메시지와 함께 RuntimeError로 알린다.
-    base URL 미설정은 자격증명이 있을 때만 별도로 더 구체적인 안내를 준다 — 그래야
-    두 조건이 동시에 비어 있는 흔한 케이스(로컬 개발/테스트)에서도 자격증명 안내가
-    먼저 보인다.
+    ComWorker는 Outlook 클라이언트와 공유한다(STA 스레드 1개로 직렬화). 아직 없으면
+    여기서 만들어 state["outlook_worker"]에 둔다 — 이후 _get_outlook_client도 재사용.
     """
-    if state.get("atlassian_client") is None:
+    if "slide_renderer" not in state:
+        import os
+
+        if hasattr(os, "startfile"):
+            from ..outlook.com_worker import ComWorker
+            from ..render import PowerPointRenderer
+
+            worker = state.get("outlook_worker")
+            if worker is None:
+                worker = ComWorker()
+                state["outlook_worker"] = worker
+            state["slide_renderer"] = PowerPointRenderer(worker)
+        else:
+            state["slide_renderer"] = None
+    return state["slide_renderer"]
+
+
+def _get_atlassian_client(state, service: str):
+    """서비스별 3단 폴백 진단으로 클라이언트 지연 생성 (스펙 §7.2 P0). 서비스별 세션 캐시.
+
+    Confluence/Jira는 자격증명(PAT·쿠키)이 인스턴스별일 수 있어 클라이언트를 서비스별로
+    분리한다 — 진단·401 리셋도 서비스 단위로 독립이다. 자격증명 부재는 diagnose()가
+    안내 메시지와 함께 RuntimeError로 알리고, base URL 미설정은 자격증명이 있을 때만
+    더 구체적으로 안내한다 (둘 다 빈 로컬 개발 환경에서 자격증명 안내가 먼저 보이도록).
+    """
+    key = f"{service}_client"
+    if state.get(key) is None:
         cfg = state["config"]
-        candidates = resolve_auth_candidates()
-        if candidates and not cfg.confluence_base_url and not cfg.jira_base_url:
+        base = cfg.confluence_base_url if service == "confluence" else cfg.jira_base_url
+        candidates = resolve_auth_candidates(service=service)
+        if candidates and not base:
             raise RuntimeError(
-                "config.yaml의 atlassian.confluence_base_url / jira_base_url을 설정하세요"
+                f"config.yaml의 atlassian.{service}_base_url을 설정하세요"
             )
         from ..atlassian.http_client import HttpAtlassianClient
 
         def factory(auth):
-            return HttpAtlassianClient(cfg.confluence_base_url, cfg.jira_base_url, auth)
+            if service == "confluence":
+                return HttpAtlassianClient(base, "", auth)
+            return HttpAtlassianClient("", base, auth)
 
         client, _auth = diagnose(candidates, factory)
-        state["atlassian_client"] = client
-    return state["atlassian_client"]
+        state[key] = client
+    return state[key]
 
 
 def _scheduled_sources(state: dict) -> list[str]:
@@ -113,6 +143,7 @@ def run_sync(state: dict, source: str) -> dict:
                     projects=cfg.projects, areas=cfg.areas,
                     glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
                     state=prev, prior_map=prior_map,
+                    renderer=_get_slide_renderer(state),
                 )
             elif source == "outlook_mail":
                 client = _get_outlook_client(state)
@@ -124,11 +155,11 @@ def run_sync(state: dict, source: str) -> dict:
                 client = _get_outlook_client(state)
                 result = sync_outlook_cal(client, cfg.cal_past_days, cfg.cal_future_days, prev)
             elif source == "confluence":
-                client = _get_atlassian_client(state)
+                client = _get_atlassian_client(state, "confluence")
                 result = sync_confluence(client, state["registry"].confluence_page_ids(),
                                          prev, cfg.data_dir / "confluence")
             else:  # jira
-                client = _get_atlassian_client(state)
+                client = _get_atlassian_client(state, "jira")
                 result = sync_jira(client, state["registry"].jira_keys(),
                                    prev, cfg.data_dir / "jira")
             entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
@@ -140,12 +171,12 @@ def run_sync(state: dict, source: str) -> dict:
         except httpx.HTTPStatusError as exc:
             conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
             entry["ok"] = False
-            if exc.response.status_code == 401:
-                # 캐시된 클라이언트를 리셋 — 다음 confluence/jira 동기화 때 diagnose()가
-                # 자연히 다시 돌아 재로그인을 시도한다 (스펙 §7.2 P0, 앱 재시작 없이 복구).
-                state["atlassian_client"] = None
+            if exc.response.status_code == 401 and source in ("confluence", "jira"):
+                # 실패한 서비스의 클라이언트만 리셋 — 다음 동기화 때 diagnose()가 다시 돈다
+                # (스펙 §7.2 P0, 앱 재시작 없이 복구). 다른 서비스 세션은 그대로 유지.
+                state[f"{source}_client"] = None
                 entry["error"] = _AUTH_EXPIRED_MSG
-                _logger.warning("Atlassian 401 — 클라이언트 캐시 리셋: %s", _AUTH_EXPIRED_MSG)
+                _logger.warning("Atlassian 401 — %s 클라이언트 캐시 리셋: %s", source, _AUTH_EXPIRED_MSG)
             else:
                 entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
         except Exception as exc:
@@ -158,7 +189,8 @@ def run_sync(state: dict, source: str) -> dict:
 
 
 def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
-               outlook_client=None, atlassian_client=None, enable_scheduler: bool = True) -> FastAPI:
+               outlook_client=None, atlassian_client=None, slide_renderer=None,
+               enable_scheduler: bool = True) -> FastAPI:
     if embedder is None:
         from ..embeddings import GeminiEmbeddings
         embedder = GeminiEmbeddings(model=config.embed_model)
@@ -180,8 +212,11 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
-             "atlassian_client": atlassian_client,
+             "confluence_client": atlassian_client,
+             "jira_client": atlassian_client,
              "registry": Registry(config.data_dir / "atlassian.json")}
+    if slide_renderer is not None:
+        state["slide_renderer"] = slide_renderer
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -252,6 +287,30 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if not state["registry"].remove(str(payload.get("url", ""))):
             raise HTTPException(404, "등록되지 않은 URL")
         return {"ok": True}
+
+    @app.get("/api/para/projects")
+    def para_projects():
+        """summaries/Projects/ 하위 폴더 목록 — GUI 아카이브 섹션용 (스펙 §7.1 P1)."""
+        projects_dir = config.summaries_dir / "Projects"
+        out = []
+        if projects_dir.is_dir():
+            for p in sorted(d for d in projects_dir.iterdir() if d.is_dir()):
+                row = read_conn.execute(
+                    "SELECT COUNT(*) FROM documents WHERE para_path=?", (f"Projects/{p.name}",)
+                ).fetchone()
+                out.append({"name": p.name, "doc_count": row[0]})
+        return out
+
+    @app.post("/api/archive")
+    def archive(payload: dict):
+        name = str(payload.get("project", ""))
+        with state["sync_lock"]:  # 동기화 중 폴더 이동 금지 — 쓰기 직렬화
+            try:
+                return archive_project(conn, config.summaries_dir, name)
+            except KeyError as exc:
+                raise HTTPException(404, exc.args[0])  # str(KeyError)는 따옴표가 붙어 UI에 그대로 노출됨
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
 
     @app.post("/api/open")
     def open_item(payload: dict):

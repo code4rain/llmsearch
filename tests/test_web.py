@@ -121,3 +121,88 @@ def test_concurrent_manual_sync_is_serialized(tmp_path: Path):
     r = client.get("/api/sources")
     notes_status = next(s for s in r.json() if s["source"] == "notes")
     assert notes_status["doc_count"] == 1
+
+
+def test_injected_slide_renderer_reaches_local_docs(tmp_path, monkeypatch):
+    """create_app에 주입한 렌더러가 local_docs 동기화까지 전달된다."""
+    from llmsearch.config import Config
+    from llmsearch.connectors import local_docs
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app, run_sync
+
+    docs = tmp_path / "watch"
+    docs.mkdir()
+    (docs / "deck.pptx").write_bytes(b"fake")
+    # 72자 — garbled 임계(50) 초과·비전 임계(200) 미만: 증강 후에도 정상 인덱싱 경로 유지
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "표지 제목 텍스트 " * 8)
+    renderer = FakeSlideRenderer(images={"deck.pptx": [b"p1"]})
+    cfg = Config(data_dir=tmp_path / "data", watch_folders=[docs])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), slide_renderer=renderer, enable_scheduler=False)
+    entry = run_sync(app.state.llmsearch, "local_docs")
+    assert entry["ok"] is True and entry["indexed"] == 1
+    assert renderer.calls  # 주입된 렌더러가 실제 사용됨
+    row = app.state.llmsearch["read_conn"].execute(
+        "SELECT content_indexed FROM documents").fetchone()
+    assert row[0] == 1  # 비전 증강 텍스트가 정상 인덱싱됨 (DRM 폴백 아님)
+
+
+def test_slide_renderer_lazy_is_none_off_windows(tmp_path):
+    """비Windows에서 지연 생성은 None — 비전 보완이 조용히 생략된다."""
+    import os
+
+    from llmsearch.web.app import _get_slide_renderer
+
+    if hasattr(os, "startfile"):  # Windows에서는 이 테스트를 건너뜀 (COM 생성 방지)
+        import pytest
+        pytest.skip("non-Windows 전용 테스트")
+    state = {}
+    assert _get_slide_renderer(state) is None
+    assert _get_slide_renderer(state) is None  # 캐시 후에도 동일
+
+
+def test_archive_api_moves_project(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app
+
+    cfg = Config(data_dir=tmp_path / "data")
+    proj = cfg.summaries_dir / "Projects" / "알파"
+    proj.mkdir(parents=True)
+    (proj / "요약.md").write_text("# x", encoding="utf-8")
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    # TrustedHostMiddleware가 기본 Host("testserver")를 거부하므로 base_url 필수
+    client = TestClient(app, base_url="http://127.0.0.1")
+
+    listed = client.get("/api/para/projects").json()
+    assert listed == [{"name": "알파", "doc_count": 0}]
+
+    r = client.post("/api/archive", json={"project": "알파"})
+    assert r.status_code == 200
+    assert "config.yaml" in r.json()["hint"]
+    assert (cfg.summaries_dir / "Archives" / "알파" / "요약.md").exists()
+    assert client.get("/api/para/projects").json() == []
+
+
+def test_archive_api_unknown_project_404(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app
+
+    app = create_app(Config(data_dir=tmp_path / "data"), embedder=FakeEmbeddings(),
+                     summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")  # TrustedHost 통과
+    assert client.post("/api/archive", json={"project": "없음"}).status_code == 404
+    assert client.post("/api/archive", json={"project": ".."}).status_code == 400

@@ -123,3 +123,34 @@ def test_extract_category_invalid_project_demoted():
     md, cat = _extract_category(text, ["프로젝트A"], [])
     assert cat == "Resources/없는프젝"
     assert "CATEGORY:" not in md
+
+
+def test_fake_describe_images_is_deterministic():
+    from llmsearch.summarize import FakeSummarizer
+
+    out = FakeSummarizer().describe_images("발표.pptx", [b"a", b"b", b"c"])
+    assert "3" in out and "발표.pptx" in out
+
+
+def test_gemini_describe_images_graceful_failure_returns_empty_string(monkeypatch):
+    """비전 API 실패는 항상 빈 문자열로 조용히 강등된다 (global constraint)."""
+    from llmsearch.summarize import GeminiSummarizer
+
+    # GEMINI_API_KEY 주입 (실 키 불필요)
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+
+    # google.genai.Client 스텁: 생성자는 정상, generate_content는 예외 발생
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        class models:
+            @staticmethod
+            def generate_content(**kwargs):
+                raise RuntimeError("Vision API timeout")
+
+    monkeypatch.setattr("google.genai.Client", FakeClient)
+
+    summarizer = GeminiSummarizer()
+    out = summarizer.describe_images("t.pptx", [b"png"])
+    assert out == ""

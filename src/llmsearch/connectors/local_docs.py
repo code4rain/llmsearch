@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..models import Document, SyncResult
+from ..render import SlideRenderer
 from ..rules import is_excluded, match_override
 from ..summarize import Summarizer
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 EXTENSIONS = {".pptx", ".xlsx", ".docx", ".pdf"}
 MIN_TEXT_LEN = 50
 VALID_RATIO = 0.6
+VISION_MIN_CHARS = 200  # pptx 추출 텍스트가 이 미만이면 이미지 위주로 보고 비전 보완 (스펙 §7.1 P1)
 # 파일 단위 처리 실패 시 seen에 기록하는 재시도 센티널. 실제 (mtime, size)와 결코
 # 일치하지 않도록 불가능한 값을 사용해, 다음 동기화에서 시그니처 불일치로 강제
 # 재처리되게 한다. 동시에 seen에는 남아 있으므로 이번 실행에서 "삭제됨"으로
@@ -26,6 +28,29 @@ def extract_text(path: Path) -> str:
     from markitdown import MarkItDown  # 지연 import — 무거운 의존성
 
     return MarkItDown().convert(str(path)).text_content or ""
+
+
+def _augment_with_vision(path: Path, text: str, renderer: SlideRenderer | None,
+                         summarizer: Summarizer) -> str:
+    """이미지 위주 pptx의 짧은 추출 텍스트에 슬라이드 비전 설명을 덧붙인다 (스펙 §7.1 P1).
+
+    실패는 어떤 경우에도 전파하지 않는다 — 비전 보완은 부가 기능이므로, 렌더러/비전 API가
+    죽으면 원래 텍스트 그대로 기존 경로(garbled 판정 → DRM 폴백)를 타게 둔다.
+    """
+    if renderer is None or path.suffix.lower() != ".pptx":
+        return text
+    if len(text.strip()) >= VISION_MIN_CHARS:
+        return text
+    try:
+        images = renderer.render(path)
+        if not images:
+            return text
+        desc = summarizer.describe_images(path.name, images)
+        if desc.strip():
+            return text + "\n\n## 슬라이드 비전 설명\n" + desc.strip()
+    except Exception:
+        logger.warning("슬라이드 비전 보완 실패, 텍스트만 사용: %s", path, exc_info=True)
+    return text
 
 
 def looks_garbled(text: str) -> bool:
@@ -101,6 +126,7 @@ def sync_local_docs(
     summarizer: Summarizer, summaries_dir: Path,
     projects: list[str], areas: list[str], glossary: str, class_rules: str,
     state: dict, prior_map: dict[str, tuple[str, str]],
+    renderer: SlideRenderer | None = None,
 ) -> SyncResult:
     prev: dict[str, list] = dict(state.get("files", {}))
     seen: dict[str, list] = {}
@@ -128,6 +154,7 @@ def sync_local_docs(
                 content_indexed = True
                 try:
                     text = extract_text(path)
+                    text = _augment_with_vision(path, text, renderer, summarizer)
                     if looks_garbled(text):
                         raise ValueError("garbled")
                 except Exception:
