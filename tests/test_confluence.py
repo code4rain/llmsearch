@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from llmsearch.atlassian.client import FakeAtlassianClient
+from llmsearch.connectors import confluence
 from llmsearch.connectors.confluence import sync_confluence
 
 
@@ -67,3 +68,73 @@ def test_filesystem_unsafe_title_sanitized(tmp_path: Path):
     assert mirror.exists()
     for ch in ':*?"<>|':
         assert ch not in mirror.name
+
+
+def test_transient_keyerror_not_deleted(tmp_path: Path):
+    """접근 실패(KeyError)와 삭제를 구분: 자식 목록엔 남아있는데 조회만 실패하면
+    미스 카운터만 올리고 이전 상태를 이월한다 — 삭제 처리하지 않는다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    mirror3 = Path(next(d for d in r1.documents if d.source_id == "3").extra["mirror_path"])
+    del c.pages["3"]  # children["2"] == ["3"]는 그대로 — fetch는 시도되고 KeyError
+
+    r2 = sync_confluence(c, ["1"], r1.state, tmp_path)
+
+    assert r2.deleted_ids == []
+    assert mirror3.exists()
+    assert "3" in r2.state["versions"]
+    assert r2.state["misses"]["3"] == 1
+
+
+def test_three_consecutive_misses_deletes(tmp_path: Path):
+    """연속 3회 KeyError에 도달하면 라운드 안전 여부와 무관하게 진짜 삭제로 확정한다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    mirror3 = Path(next(d for d in r1.documents if d.source_id == "3").extra["mirror_path"])
+    del c.pages["3"]  # children["2"] == ["3"]는 유지 — 매 라운드 fetch 시도 후 KeyError
+
+    r2 = sync_confluence(c, ["1"], r1.state, tmp_path)  # miss 1
+    assert r2.state["misses"]["3"] == 1
+    assert r2.deleted_ids == []
+    assert mirror3.exists()
+
+    r3 = sync_confluence(c, ["1"], r2.state, tmp_path)  # miss 2
+    assert r3.state["misses"]["3"] == 2
+    assert r3.deleted_ids == []
+    assert mirror3.exists()
+
+    r4 = sync_confluence(c, ["1"], r3.state, tmp_path)  # miss 3 — 진짜 삭제 확정
+    assert r4.deleted_ids == ["3"]
+    assert not mirror3.exists()
+
+
+def test_cap_truncation_not_deleted(tmp_path: Path, monkeypatch):
+    """MAX_PAGES_PER_TREE에 걸려 잘린 라운드(UNSAFE)에서는 순회 밖 페이지를
+    삭제로 오판하지 않고 이전 상태를 이월한다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    mirror3 = Path(next(d for d in r1.documents if d.source_id == "3").extra["mirror_path"])
+
+    monkeypatch.setattr(confluence, "MAX_PAGES_PER_TREE", 2)
+    r2 = sync_confluence(c, ["1"], r1.state, tmp_path)
+
+    assert "3" not in {d.source_id for d in r2.documents}
+    assert r2.deleted_ids == []
+    assert mirror3.exists()
+    assert "3" in r2.state["versions"]
+    assert r2.state["versions"]["3"] == r1.state["versions"]["3"]
+
+
+def test_empty_mirror_dir_pruned_on_delete(tmp_path: Path):
+    """삭제된 페이지의 미러를 지운 뒤, 비어버린 상위(조상) 디렉터리도 정리된다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    mirror3 = Path(next(d for d in r1.documents if d.source_id == "3").extra["mirror_path"])
+    grandchild_dir = mirror3.parent  # .../ENG/루트/자식 — 손자__3.md만 담고 있던 디렉터리
+    assert grandchild_dir.is_dir()
+
+    del c.pages["3"]; c.children["2"] = []
+    sync_confluence(c, ["1"], r1.state, tmp_path)
+
+    assert not grandchild_dir.exists()
+    assert grandchild_dir.parent.exists()  # .../ENG/루트 — 자식__2.md가 남아있어 유지됨
