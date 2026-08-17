@@ -52,3 +52,16 @@ def test_changed_appointment_reemitted():
     a["location"] = "회의실B"  # 내용 변경 → 지문 변경
     r2 = sync_outlook_cal(c, 90, 180, r1.state, now=NOW)
     assert len(r2.documents) == 1 and "회의실B" in r2.documents[0].text
+
+
+def test_rescheduled_appointment_old_occurrence_deleted():
+    a = appt("e1", NOW + timedelta(days=1))
+    c = FakeOutlookClient(appointments=[a])
+    r1 = sync_outlook_cal(c, 90, 180, {}, now=NOW)
+    old_id = r1.documents[0].source_id
+    # 시작 시각 변경 → occurrence_id 자체가 바뀜
+    a["start"] = NOW + timedelta(days=2)
+    a["end"] = a["start"] + timedelta(hours=1)
+    r2 = sync_outlook_cal(c, 90, 180, r1.state, now=NOW)
+    assert r2.deleted_ids == [old_id]
+    assert len(r2.documents) == 1 and r2.documents[0].source_id != old_id
