@@ -16,21 +16,27 @@ _RESTRICT_FMT = "%m/%d/%Y %I:%M %p"  # Outlook Restrict가 요구하는 미국�
 _RESTRICT_SLACK = timedelta(minutes=1)  # Restrict 분 단위 절사 보정
 
 
+def _mail_in_window(received_at: datetime, since: datetime, until: datetime | None = None) -> bool:
+    """Exact mail window predicate: received_at > since AND (<= until if until given).
+
+    Single source of truth for since-exclusive/until-inclusive boundary semantics.
+    Shared by `_filter_mail` (post-hoc, list-level) and `ComOutlookClient.list_mail`'s
+    inline per-item pre-filter, so the two can never drift apart (FINDING 2).
+    """
+    if received_at <= since:  # Exclude since boundary
+        return False
+    if until is not None and received_at > until:  # Exclude beyond until boundary
+        return False
+    return True
+
+
 def _filter_mail(mails: list[dict], since: datetime, until: datetime | None = None) -> list[dict]:
     """Exact mail filtering: received_at > since AND (<= until if until given).
 
     Outlook Restrict truncates to minute, so COM-side window is widened by 1 minute.
     This filter applies exact boundary semantics for since-exclusive, until-inclusive.
     """
-    out = []
-    for mail in mails:
-        received = mail["received_at"]
-        if received <= since:  # Exclude since boundary
-            continue
-        if until is not None and received > until:  # Exclude beyond until boundary
-            continue
-        out.append(mail)
-    return out
+    return [mail for mail in mails if _mail_in_window(mail["received_at"], since, until)]
 
 
 def _filter_appointments(appts: list[dict], window_start: datetime,
@@ -106,8 +112,19 @@ class ComOutlookClient:
         for item in restricted:
             if getattr(item, "Class", None) != 43:  # olMail만 (회의요청 등 제외)
                 continue
+            received = item.ReceivedTime
+            received_at = datetime(received.year, received.month, received.day,
+                                   received.hour, received.minute, received.second)
+            # Lean exact pre-filter — same predicate as _filter_mail (_mail_in_window),
+            # decided BEFORE reading Body, so items past `limit` never pay the
+            # expensive COM read (FINDING 2: restores early-exit on cold start).
+            if not _mail_in_window(received_at, since, until):
+                continue
             mails.append(self._mail_dict(item, folder))
-        # Apply exact filter BEFORE limit truncation
+            if limit is not None and len(mails) >= limit:
+                break
+        # Apply exact filter again — double safety net, must be a no-op given the
+        # inline pre-filter above already applies identical since/until semantics.
         filtered = _filter_mail(mails, since, until)
         if limit is not None:
             return filtered[:limit]
