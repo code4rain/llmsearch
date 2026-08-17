@@ -1,5 +1,3 @@
-import json
-
 import httpx
 import pytest
 from llmsearch.atlassian.auth import AtlassianAuth
@@ -119,3 +117,23 @@ def test_auth_headers_basic_and_cookie():
     assert seen["cookie"] == "JSESSIONID=abc"
     make_client(handler, AtlassianAuth(mode="basic", user="u", password="p")).check_auth()
     assert seen["authorization"].startswith("Basic ")
+
+
+def test_child_page_ids_hard_cap_misbehaving_server():
+    """서버가 start를 무시하고 계속 같은 페이지를 반환해도 무한루프 방지."""
+    call_count = [0]
+
+    def handler(request):
+        # start 파라미터를 무시하고 항상 같은 전체 크기 페이지 반환
+        call_count[0] += 1
+        return httpx.Response(200, json={
+            "results": [{"id": f"child-{i}"} for i in range(10)],
+            "size": 10,
+            "limit": 10
+        })
+
+    ids = make_client(handler).child_page_ids("1")
+    # _MAX_CHILD_PAGES = 20이고 limit = 10이므로, 최대 20 * 10 = 200개
+    assert len(ids) == 200
+    # 20번 호출해야 하드 캡에 도달
+    assert call_count[0] == 20

@@ -9,6 +9,7 @@ import httpx
 from .auth import AtlassianAuth
 
 _CHILD_LIMIT = 100
+_MAX_CHILD_PAGES = 20  # 하드 캡: limit=100일 때 최대 2000개 자식, MAX_PAGES_PER_TREE=500 훨씬 초과
 
 
 class HttpAtlassianClient:
@@ -64,7 +65,8 @@ class HttpAtlassianClient:
     def child_page_ids(self, page_id: str) -> list[str]:
         out: list[str] = []
         start = 0
-        while True:
+        page_count = 0
+        while page_count < _MAX_CHILD_PAGES:
             data = self._get(
                 f"{self.confluence_base}/rest/api/content/{page_id}/child/page",
                 params={"limit": _CHILD_LIMIT, "start": start},
@@ -74,6 +76,7 @@ class HttpAtlassianClient:
             if len(results) < data.get("limit", _CHILD_LIMIT) or not results:
                 break
             start += len(results)
+            page_count += 1
         return out
 
     def get_issue(self, key: str) -> dict:
