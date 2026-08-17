@@ -39,6 +39,31 @@ def _filter_mail(mails: list[dict], since: datetime, until: datetime | None = No
     return [mail for mail in mails if _mail_in_window(mail["received_at"], since, until)]
 
 
+def _smtp_address(item) -> str:
+    """Resolve a usable SMTP sender address from an Outlook MailItem.
+
+    Exchange-internal senders report SenderEmailAddress as an X.500 DN (not a usable
+    SMTP address) when SenderEmailType == "EX". In that case, resolve the real SMTP
+    address via Sender.GetExchangeUser().PrimarySmtpAddress; fall back to the raw
+    SenderEmailAddress if resolution fails or returns nothing (FINDING 4).
+
+    Not pure (touches live COM objects) — cannot be unit-tested under WSL. Verify
+    manually via scripts/check_outlook.py, which prints whether sender_email looks
+    like an SMTP address (contains '@').
+    """
+    raw = getattr(item, "SenderEmailAddress", "") or ""
+    if getattr(item, "SenderEmailType", "") == "EX":
+        try:
+            exchange_user = item.Sender.GetExchangeUser()
+            if exchange_user is not None:
+                smtp = exchange_user.PrimarySmtpAddress
+                if smtp:
+                    return smtp
+        except Exception:
+            pass
+    return raw
+
+
 def _filter_appointments(appts: list[dict], window_start: datetime,
                         window_end: datetime) -> list[dict]:
     """Exact appointment filtering: end > window_start AND start < window_end (overlap).
@@ -91,7 +116,7 @@ class ComOutlookClient:
             "subject": item.Subject or "(제목 없음)",
             "body": item.Body or "",
             "sender_name": getattr(item, "SenderName", "") or "",
-            "sender_email": getattr(item, "SenderEmailAddress", "") or "",
+            "sender_email": _smtp_address(item),
             "received_at": datetime(received.year, received.month, received.day,
                                     received.hour, received.minute, received.second),
             "folder": folder,

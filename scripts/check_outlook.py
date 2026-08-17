@@ -35,6 +35,14 @@ try:
     for m in mails:
         print(" -", m["received_at"], m["sender_email"], "|", m["subject"][:40])
 
+    # FINDING 4: 조직 내부(Exchange, X.500 DN) 발신자도 SMTP 주소로 정규화됐는지 육안 확인.
+    # sender_email에 '@'가 없으면 X.500 DN 폴백이 실패했거나 GetExchangeUser 경로가
+    # 예상과 다르게 동작한 것 — Sender.GetExchangeUser().PrimarySmtpAddress 로직 재점검 필요.
+    print("\n[EX 발신자 SMTP 확인] sender_email이 SMTP 형식(@ 포함)인지:")
+    for m in mails:
+        ok = "@" in m["sender_email"]
+        print(f"  {'OK ' if ok else 'FAIL'} {m['sender_email'] or '(빈 값)'} | {m['subject'][:40]}")
+
     appts = client.list_appointments(datetime.now() - timedelta(days=7),
                                      datetime.now() + timedelta(days=14))
     print(f"\n±기간 일정 {len(appts)}건:")

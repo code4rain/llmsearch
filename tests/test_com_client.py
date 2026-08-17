@@ -65,6 +65,82 @@ def test_filter_mail_until_inclusive():
     assert filtered[1]["subject"] == "at_until"
 
 
+class _FakeExchangeUser:
+    def __init__(self, smtp):
+        self.PrimarySmtpAddress = smtp
+
+
+class _FakeSender:
+    def __init__(self, exchange_user=None, raises=False):
+        self._exchange_user = exchange_user
+        self._raises = raises
+
+    def GetExchangeUser(self):
+        if self._raises:
+            raise RuntimeError("COM call failed")
+        return self._exchange_user
+
+
+class _FakeMailItem:
+    """Plain-Python stand-in for an Outlook MailItem's sender-related attributes.
+
+    _smtp_address only ever touches attribute access (getattr) and calls
+    Sender.GetExchangeUser() — no win32com import required — so its branching logic
+    is unit-testable with a duck-typed stub even though real COM objects (and thus
+    end-to-end verification) are Windows-only (FINDING 4).
+    """
+
+    def __init__(self, sender_email_address="", sender_email_type="", sender=None):
+        self.SenderEmailAddress = sender_email_address
+        self.SenderEmailType = sender_email_type
+        self.Sender = sender
+
+
+def test_smtp_address_non_exchange_sender_uses_raw_address():
+    from llmsearch.outlook.com_client import _smtp_address
+
+    item = _FakeMailItem(sender_email_address="alice@example.com", sender_email_type="SMTP")
+    assert _smtp_address(item) == "alice@example.com"
+
+
+def test_smtp_address_exchange_sender_resolves_via_exchange_user():
+    from llmsearch.outlook.com_client import _smtp_address
+
+    item = _FakeMailItem(
+        sender_email_address="/O=ORG/OU=EXCHANGE/CN=RECIPIENTS/CN=kim",
+        sender_email_type="EX",
+        sender=_FakeSender(exchange_user=_FakeExchangeUser("kim@corp.com")),
+    )
+    assert _smtp_address(item) == "kim@corp.com"
+
+
+def test_smtp_address_exchange_sender_falls_back_when_exchange_user_none():
+    from llmsearch.outlook.com_client import _smtp_address
+
+    dn = "/O=ORG/OU=EXCHANGE/CN=RECIPIENTS/CN=kim"
+    item = _FakeMailItem(sender_email_address=dn, sender_email_type="EX",
+                         sender=_FakeSender(exchange_user=None))
+    assert _smtp_address(item) == dn
+
+
+def test_smtp_address_exchange_sender_falls_back_when_smtp_empty():
+    from llmsearch.outlook.com_client import _smtp_address
+
+    dn = "/O=ORG/OU=EXCHANGE/CN=RECIPIENTS/CN=kim"
+    item = _FakeMailItem(sender_email_address=dn, sender_email_type="EX",
+                         sender=_FakeSender(exchange_user=_FakeExchangeUser("")))
+    assert _smtp_address(item) == dn
+
+
+def test_smtp_address_exchange_sender_falls_back_on_com_error():
+    from llmsearch.outlook.com_client import _smtp_address
+
+    dn = "/O=ORG/OU=EXCHANGE/CN=RECIPIENTS/CN=kim"
+    item = _FakeMailItem(sender_email_address=dn, sender_email_type="EX",
+                         sender=_FakeSender(raises=True))
+    assert _smtp_address(item) == dn
+
+
 def test_mail_in_window_matches_filter_mail_boundaries():
     """FINDING 2: _mail_in_window is the single predicate shared by _filter_mail and
     ComOutlookClient.list_mail's inline pre-filter. Verify it reproduces the exact
