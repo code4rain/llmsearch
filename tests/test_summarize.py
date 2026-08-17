@@ -123,3 +123,10 @@ def test_extract_category_invalid_project_demoted():
     md, cat = _extract_category(text, ["프로젝트A"], [])
     assert cat == "Resources/없는프젝"
     assert "CATEGORY:" not in md
+
+
+def test_fake_describe_images_is_deterministic():
+    from llmsearch.summarize import FakeSummarizer
+
+    out = FakeSummarizer().describe_images("발표.pptx", [b"a", b"b", b"c"])
+    assert "3" in out and "발표.pptx" in out
