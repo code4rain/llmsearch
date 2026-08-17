@@ -1,4 +1,4 @@
-from llmsearch.summarize import FakeSummarizer, resolve_category, _extract_category
+from llmsearch.summarize import FakeSummarizer, resolve_category, _extract_category, _sanitize_segment
 
 
 def test_fake_summarizer_classifies_to_project():
@@ -29,6 +29,30 @@ def test_resolve_category_validates_closed_list():
     assert resolve_category("Projects/없는프젝", ["프로젝트A"], []) == "Resources/없는프젝"
     assert resolve_category("Resources/경쟁사", [], []) == "Resources/경쟁사"
     assert resolve_category("이상한값", [], []) == "Resources/일반"
+
+
+def test_resolve_category_sanitizes_name_part():
+    """LLM 분류 출력의 위험 문자는 살균되어 파일시스템에 안전한 단일 세그먼트가 된다."""
+    assert resolve_category("Resources/기타: 참고?", [], []) == "Resources/기타 참고"
+
+
+def test_resolve_category_strips_path_separators_in_name():
+    """name 부분에 경로 구분자가 섞여 있어도 폴더가 추가로 생기지 않고 단일 세그먼트로 유지된다."""
+    result = resolve_category("Resources/a/b", [], [])
+    assert result == "Resources/a b"
+    assert result.count("/") == 1  # Top/name 딱 한 번만 — 하위 폴더가 새로 생기지 않음
+
+
+def test_resolve_category_empty_after_sanitize_falls_back():
+    assert resolve_category("Resources/???", [], []) == "Resources/일반"
+
+
+def test_sanitize_segment_truncates_and_collapses_whitespace():
+    long_name = "가" * 100
+    assert len(_sanitize_segment(long_name)) == 80
+    assert _sanitize_segment("여러   공백   포함") == "여러 공백 포함"
+    assert _sanitize_segment("") == "일반"
+    assert _sanitize_segment('bad\\/:*?"<>|name') == "bad name"
 
 
 def test_fake_describe_filename():

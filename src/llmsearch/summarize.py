@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
 MAX_SUMMARY_INPUT_CHARS = 30000
+
+# Windows에서 파일/폴더명에 금지된 문자(\/:*?"<>|) + 제어문자
+_INVALID_SEGMENT_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_MAX_SEGMENT_LEN = 80
 
 
 @dataclass
@@ -13,21 +18,45 @@ class SummaryResult:
     category: str  # PARA 경로: "Projects/x" | "Areas/x" | "Resources/x"
 
 
+def _sanitize_segment(name: str) -> str:
+    """카테고리 경로의 폴더명 한 조각을 파일시스템에 안전한 단일 세그먼트로 정리한다.
+
+    LLM이 반환한 분류명을 그대로 파일시스템 경로에 쓰면, 안에 섞인 구분자(\\, /)나
+    Windows 금지 문자(:*?"<>|) 때문에 의도치 않은 하위 폴더가 생기거나 파일 생성이
+    실패해 동기화 전체가 중단될 수 있다 (스펙 §7.1 P0).
+
+    - \\/:*?"<>| 및 제어문자는 공백으로 치환한다 — 경로 구분자(\\, /)도 폴더 계층을
+      새로 만들지 않도록 여기서 함께 제거한다. 예: "a/b" → "a b" (단일 세그먼트 유지).
+    - 연속 공백은 하나로 모으고 양끝 공백을 제거한다.
+    - 80자로 자른다.
+    - 결과가 빈 문자열이면 "일반"으로 대체한다.
+    """
+    cleaned = _INVALID_SEGMENT_CHARS.sub(" ", name)
+    cleaned = " ".join(cleaned.split())
+    cleaned = cleaned[:_MAX_SEGMENT_LEN].strip()
+    return cleaned or "일반"
+
+
 def resolve_category(raw: str, projects: list[str], areas: list[str]) -> str:
-    """LLM 분류 출력을 검증한다: 닫힌 목록 밖의 Projects/Areas는 Resources로 강등 (스펙 §7.1 P0)."""
+    """LLM 분류 출력을 검증한다: 닫힌 목록 밖의 Projects/Areas는 Resources로 강등 (스펙 §7.1 P0).
+
+    반환값의 name 부분은 항상 `_sanitize_segment`로 살균된 단일 경로 세그먼트다 —
+    파일시스템 경로로 그대로 쓰여도 안전하다.
+    """
     raw = raw.strip().strip("/")
     parts = raw.split("/", 1)
     if len(parts) != 2 or not parts[1]:
         return "Resources/일반"
-    top, name = parts
+    top, raw_name = parts
+    name = _sanitize_segment(raw_name)
     if top == "Projects" and name in projects:
-        return raw
+        return f"{top}/{name}"
     if top == "Areas" and name in areas:
-        return raw
+        return f"{top}/{name}"
     if top in ("Projects", "Areas"):
         return f"Resources/{name}"
     if top in ("Resources", "Archives"):
-        return raw
+        return f"{top}/{name}"
     return "Resources/일반"
 
 

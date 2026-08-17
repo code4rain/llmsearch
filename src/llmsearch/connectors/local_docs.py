@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -8,6 +9,8 @@ from pathlib import Path
 from ..models import Document, SyncResult
 from ..rules import is_excluded, match_override
 from ..summarize import Summarizer
+
+logger = logging.getLogger(__name__)
 
 EXTENSIONS = {".pptx", ".xlsx", ".docx", ".pdf"}
 MIN_TEXT_LEN = 50
@@ -110,51 +113,58 @@ def sync_local_docs(
             except OSError:
                 continue
             sig = [st.st_mtime, st.st_size]
-            seen[sid] = sig
             if prev.get(sid) == sig:
+                seen[sid] = sig  # 변경 없음 — 이미 처리된 파일로 유지
                 continue
 
             prior = prior_map.get(sid)
-            content_indexed = True
             try:
-                text = extract_text(path)
-                if looks_garbled(text):
-                    raise ValueError("garbled")
+                content_indexed = True
+                try:
+                    text = extract_text(path)
+                    if looks_garbled(text):
+                        raise ValueError("garbled")
+                except Exception:
+                    content_indexed = False
+                    text = ""
+
+                if content_indexed:
+                    result = summarizer.summarize_and_classify(
+                        title=path.name, text=text, projects=projects, areas=areas,
+                        existing_resources=_existing_resources(summaries_dir),
+                        prior_category=prior[0] if prior else None,
+                        glossary=glossary, rules=class_rules,
+                    )
+                    category, body = result.category, result.markdown
+                else:
+                    # DRM 폴백: 파일명·메타데이터만으로 설명 생성 (스펙 §7.1 P0)
+                    desc = summarizer.describe_filename(path.name)
+                    category = prior[0] if prior else "Resources/미분류"
+                    body = (
+                        f"# {path.name}\n\n## 요약\n{desc}\n\n"
+                        f"(🔒 DRM/암호화로 내용 미인덱싱 — 파일명 기반)\n\n"
+                        f"## 키워드\n{path.stem.replace('_', ' ').replace('-', ' ')}\n"
+                    )
+                override = match_override(sid, None, overrides)
+                if override:
+                    category = override  # 결정적 규칙이 LLM 판단보다 우선 (스펙 §9)
+
+                summary_path = _place(summaries_dir, category, path, body, prior)
+                documents.append(
+                    Document(
+                        source_type="local_docs", source_id=sid, title=path.name,
+                        text=body, url_or_path=sid,
+                        updated_at=datetime.fromtimestamp(st.st_mtime),
+                        content_indexed=content_indexed,
+                        extra={"para_path": category, "summary_path": summary_path},
+                    )
+                )
+                seen[sid] = sig
             except Exception:
-                content_indexed = False
-                text = ""
-
-            if content_indexed:
-                result = summarizer.summarize_and_classify(
-                    title=path.name, text=text, projects=projects, areas=areas,
-                    existing_resources=_existing_resources(summaries_dir),
-                    prior_category=prior[0] if prior else None,
-                    glossary=glossary, rules=class_rules,
-                )
-                category, body = result.category, result.markdown
-            else:
-                # DRM 폴백: 파일명·메타데이터만으로 설명 생성 (스펙 §7.1 P0)
-                desc = summarizer.describe_filename(path.name)
-                category = prior[0] if prior else "Resources/미분류"
-                body = (
-                    f"# {path.name}\n\n## 요약\n{desc}\n\n"
-                    f"(🔒 DRM/암호화로 내용 미인덱싱 — 파일명 기반)\n\n"
-                    f"## 키워드\n{path.stem.replace('_', ' ').replace('-', ' ')}\n"
-                )
-            override = match_override(sid, None, overrides)
-            if override:
-                category = override  # 결정적 규칙이 LLM 판단보다 우선 (스펙 §9)
-
-            summary_path = _place(summaries_dir, category, path, body, prior)
-            documents.append(
-                Document(
-                    source_type="local_docs", source_id=sid, title=path.name,
-                    text=body, url_or_path=sid,
-                    updated_at=datetime.fromtimestamp(st.st_mtime),
-                    content_indexed=content_indexed,
-                    extra={"para_path": category, "summary_path": summary_path},
-                )
-            )
+                # 파일 단위 격리: 이 파일 처리가 실패해도 소스 동기화 전체가 중단되지
+                # 않도록 로그만 남기고 건너뛴다. seen에 넣지 않아 다음 동기화에서 재시도된다.
+                logger.exception("local_docs 동기화 실패, 파일 건너뜀: %s", sid)
+                continue
 
     deleted = [sid for sid in prev if sid not in seen]
     for sid in deleted:

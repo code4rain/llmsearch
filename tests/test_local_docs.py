@@ -182,6 +182,35 @@ def test_collision_identity_drift_no_orphan(tmp_path: Path, patch_extract):
     assert len(all_copies) == 1
 
 
+def test_one_file_failure_does_not_abort_sync(tmp_path: Path, patch_extract):
+    """요약기가 특정 파일에서 예외를 던져도 다른 파일은 정상 동기화되고 예외가 새지 않는다."""
+
+    class FlakySummarizer(FakeSummarizer):
+        def summarize_and_classify(self, title, text, *a, **kw):
+            if "boom" in title:
+                raise RuntimeError("summarizer exploded")
+            return super().summarize_and_classify(title, text, *a, **kw)
+
+    docs = tmp_path / "docs"; docs.mkdir()
+    (docs / "boom.pptx").write_bytes(b"fake-pptx")
+    (docs / "ok.pptx").write_bytes(b"fake-pptx")
+
+    result = local_docs.sync_local_docs(
+        folders=[docs], excludes=[], overrides=[],
+        summarizer=FlakySummarizer(), summaries_dir=tmp_path / "summaries",
+        projects=["프로젝트A"], areas=[], glossary="", class_rules="",
+        state={}, prior_map={},
+    )
+    titles = [d.title for d in result.documents]
+    assert "ok.pptx" in titles
+    assert "boom.pptx" not in titles
+    # 실패한 파일은 seen(state)에 남지 않아 다음 동기화에서 재시도된다.
+    boom_sid = str((docs / "boom.pptx").resolve())
+    assert boom_sid not in result.state["files"]
+    ok_sid = str((docs / "ok.pptx").resolve())
+    assert ok_sid in result.state["files"]
+
+
 def test_extract_text_real_smoke(tmp_path: Path):
     """markitdown 실변환 스모크 — 지원 포맷 파일이 없으면 skip."""
     pytest.importorskip("markitdown")
