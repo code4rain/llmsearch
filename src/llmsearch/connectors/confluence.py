@@ -5,8 +5,10 @@
 
 삭제 판정 (접근 실패와 삭제 구분):
 - KeyError(접근 불가)는 "삭제됨"과 다르다 — 네트워크/권한 일시 장애로도 발생할 수 있다.
-  이번 순회에서 KeyError가 한 번이라도 나거나(had_failures) 어느 루트든
-  MAX_PAGES_PER_TREE에서 잘렸으면(truncated) 그 순회는 "UNSAFE 라운드"다. UNSAFE
+  이전에 알던(prev_versions에 있던) 페이지에 대한 KeyError가 한 번이라도 나거나
+  (had_failures — 미등록/오탈자 루트 같은 처음 보는 pid의 KeyError는 지킬 이전 자식이
+  없으므로 제외) 어느 루트든 MAX_PAGES_PER_TREE에서 잘렸으면(truncated) 그 순회는
+  "UNSAFE 라운드"다. UNSAFE
   라운드에서는 이번 순회에 없던 이전 page_id를 삭제하지 않고 이전 상태(version+미러
   경로)를 그대로 이월한다 — 잘린/실패한 지점 아래 자식들은 애초에 enqueue되지 않아
   하위 트리 전체가 잘못 삭제 판정될 수 있기 때문이다.
@@ -98,8 +100,8 @@ def sync_confluence(client: AtlassianClient, page_ids: list[str], state: dict,
             try:
                 page = client.get_page(pid)
             except KeyError:
-                had_failures = True
                 if pid in prev_versions:
+                    had_failures = True  # 이전에 알던 페이지의 실패만 라운드를 UNSAFE로 만든다
                     miss = prev_misses.get(pid, 0) + 1
                     if miss >= MAX_CONSECUTIVE_MISSES:
                         expired_misses.add(pid)  # 연속 3회 미스 — 진짜 삭제로 확정

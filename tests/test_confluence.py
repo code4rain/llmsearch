@@ -138,3 +138,17 @@ def test_empty_mirror_dir_pruned_on_delete(tmp_path: Path):
 
     assert not grandchild_dir.exists()
     assert grandchild_dir.parent.exists()  # .../ENG/루트 — 자식__2.md가 남아있어 유지됨
+
+
+def test_unknown_root_keyerror_keeps_round_safe(tmp_path: Path):
+    """처음 보는(미등록/오탈자) 루트의 KeyError는 지킬 이전 자식이 없으므로
+    라운드를 UNSAFE로 만들지 않는다 — 같은 호출 안의 진짜 삭제는 정상 반영된다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    mirror3 = Path(next(d for d in r1.documents if d.source_id == "3").extra["mirror_path"])
+    del c.pages["3"]; c.children["2"] = []  # "3"은 진짜로 사라짐
+
+    r2 = sync_confluence(c, ["999", "1"], r1.state, tmp_path)  # 999는 KeyError(미지의 pid)
+
+    assert r2.deleted_ids == ["3"]
+    assert not mirror3.exists()
