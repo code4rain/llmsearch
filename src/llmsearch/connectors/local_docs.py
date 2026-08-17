@@ -116,6 +116,7 @@ def sync_local_docs(
             try:
                 st = path.stat()
             except OSError:
+                seen[sid] = list(_RETRY_SENTINEL)  # 삭제 오판 방지 + 다음 라운드 재시도
                 continue
             sig = [st.st_mtime, st.st_size]
             if prev.get(sid) == sig:

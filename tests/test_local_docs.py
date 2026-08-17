@@ -254,6 +254,31 @@ def test_transient_failure_does_not_delete_previously_synced_file(tmp_path: Path
     assert r3.documents[0].source_id == sid
 
 
+def test_stat_failure_previously_synced_not_deleted(tmp_path: Path, patch_extract, monkeypatch):
+    """stat() 일시 실패(파일 잠김 등) 시 기수집 파일이 삭제로 오판되면 안 된다."""
+    docs = tmp_path / "docs"; docs.mkdir()
+    f = docs / "킥오프.pptx"; f.write_bytes(b"v1")
+    r1 = run(tmp_path, docs)
+    sid = r1.documents[0].source_id
+    summary = Path(r1.documents[0].extra["summary_path"])
+
+    real_stat = Path.stat
+    def flaky_stat(self, **kw):
+        if self.name == "킥오프.pptx":
+            raise PermissionError("locked")
+        return real_stat(self, **kw)
+    monkeypatch.setattr(Path, "stat", flaky_stat)
+    r2 = run(tmp_path, docs, state=r1.state,
+             prior={sid: (r1.documents[0].extra["para_path"], str(summary))})
+    assert sid not in r2.deleted_ids
+    assert summary.exists()
+    monkeypatch.undo()
+    # 복구 후 재동기화되어야 함 (센티널 시그니처 불일치 → 재처리)
+    r3 = run(tmp_path, docs, state=r2.state,
+             prior={sid: (r1.documents[0].extra["para_path"], str(summary))})
+    assert any(d.source_id == sid for d in r3.documents)
+
+
 def test_extract_text_real_smoke(tmp_path: Path):
     """markitdown 실변환 스모크 — 지원 포맷 파일이 없으면 skip."""
     pytest.importorskip("markitdown")
