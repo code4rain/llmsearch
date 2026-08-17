@@ -63,20 +63,22 @@ def archive_project(conn: sqlite3.Connection, summaries_dir: Path, name: str) ->
             )
             moved_maps += 1
         conn.commit()
-    except Exception:
+    except Exception as exc:
         # DB 갱신 실패 시 폴더 이동을 되돌린다 — 파일과 인덱스가 서로 다른 위치를
         # 가리키는 반쪽 상태를 남기지 않기 위해서다. rollback은 실패해도 무시(이미 예외 전파 중).
+        # 내부 오류(손상된 JSON 등)는 RuntimeError로 래핑하여 Task 7의 예외 매핑(400/500)과
+        # 검증 오류(ValueError/KeyError)를 구분한다.
         try:
             conn.rollback()
         except Exception:
             pass
         shutil.move(str(dst), str(src))
-        raise
+        raise RuntimeError(f"아카이브 인덱스 갱신 실패: {name}") from exc
 
     return {
         "project": name, "documents": moved_docs, "mappings": moved_maps,
         "hint": (
-            f"config.yaml의 para.projects에서 '{name}'을 제거하세요 — 활성 목록에 남아 있으면 "
+            f"config.yaml의 para.projects에서 '{name}'을(를) 제거하세요 — 활성 목록에 남아 있으면 "
             f"새 문서가 다시 Projects/{name}로 분류될 수 있습니다"
         ),
     }
