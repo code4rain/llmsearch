@@ -80,6 +80,62 @@ def test_per_doc_cap_keeps_top_rrf_chunk_not_first_by_id(tmp_path: Path):
     assert "고유마커777" in hits[0].excerpt
 
 
+def test_source_filter_survives_overwhelmed_candidates(tmp_path: Path):
+    """구조 필터는 후보 검색 단계에서 적용돼야 한다 (스펙 §8 P0).
+
+    top-CANDIDATES(30) 벡터/FTS 후보를 필터링 없이 뽑은 뒤 사후 필터링하면, 필터에 맞는
+    문서가 상위 30위 밖으로 밀려나 있을 때 결과가 통째로 사라진다. notes 문서 40개로
+    타겟(local_docs) 문서를 상위 30위 밖으로 밀어내 이 회귀를 재현한다.
+    """
+    conn = db.open_db(tmp_path / "s7.db")
+    now = datetime(2026, 8, 15)
+    docs = [
+        Document(
+            "notes", f"noise{i}.md", f"노이즈{i}",
+            "핵심키워드 " * 20,
+            f"/n/noise{i}.md", now,
+        )
+        for i in range(40)
+    ]
+    docs.append(
+        Document(
+            "local_docs", "target.pptx", "타겟 문서",
+            "핵심키워드 그리고 다른 부가 설명이 섞인 자료입니다.",
+            "/d/target.pptx", now,
+        )
+    )
+    indexer.index_documents(conn, docs, EMB)
+
+    # 필터 없이는 노이즈 문서들이 상위 후보를 채워 타겟이 후보에서 밀려남을 전제로 한다.
+    unfiltered = search.search(conn, EMB, "핵심키워드", k=40)
+    assert "target.pptx" not in [h.source_id for h in unfiltered][:1]
+
+    hits = search.search(conn, EMB, "핵심키워드", source_filter=["local_docs"])
+    assert hits and hits[0].source_id == "target.pptx"
+
+
+def test_date_filter_survives_overwhelmed_candidates(tmp_path: Path):
+    """날짜 필터도 동일하게 후보 검색 단계에서 적용돼야 한다."""
+    conn = db.open_db(tmp_path / "s8.db")
+    old = datetime(2020, 1, 1)
+    recent = datetime(2026, 8, 10)
+    docs = [
+        Document("notes", f"noise{i}.md", f"노이즈{i}", "핵심키워드 " * 20, f"/n/noise{i}.md", old)
+        for i in range(40)
+    ]
+    docs.append(
+        Document(
+            "notes", "target.md", "타겟 문서",
+            "핵심키워드 그리고 다른 부가 설명이 섞인 자료입니다.",
+            "/n/target.md", recent,
+        )
+    )
+    indexer.index_documents(conn, docs, EMB)
+
+    hits = search.search(conn, EMB, "핵심키워드", date_from="2026-01-01")
+    assert hits and hits[0].source_id == "target.md"
+
+
 def test_date_to_bare_date_includes_full_day(tmp_path: Path):
     conn = db.open_db(tmp_path / "s6.db")
     doc = Document(

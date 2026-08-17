@@ -31,6 +31,32 @@ def _recency_boost(updated_at: str, now: datetime) -> float:
     return 1.0 + 0.3 * max(0.0, 1.0 - days / 365)  # 1년 내 문서에 최대 +30%
 
 
+def _filter_clause(
+    source_filter: list[str] | None, date_from: str | None, date_to_bound: str | None, sender: str | None
+) -> tuple[str, list]:
+    """documents 별칭 d에 대한 구조 필터 SQL 조각 생성 (스펙 §8 P0: 후보 검색 단계에서 적용).
+
+    Returns: (" AND ..." 형태의 조건 문자열 또는 "", 파라미터 리스트)
+    """
+    conditions: list[str] = []
+    params: list = []
+    if source_filter:
+        placeholders = ",".join("?" * len(source_filter))
+        conditions.append(f"d.source_type IN ({placeholders})")
+        params.extend(source_filter)
+    if date_from:
+        conditions.append("d.updated_at >= ?")
+        params.append(date_from)
+    if date_to_bound:
+        conditions.append("d.updated_at <= ?")
+        params.append(date_to_bound)
+    if sender:
+        conditions.append("LOWER(json_extract(d.extra_json, '$.sender')) = ?")
+        params.append(sender.lower())
+    where_sql = (" AND " + " AND ".join(conditions)) if conditions else ""
+    return where_sql, params
+
+
 def search(
     conn: sqlite3.Connection,
     embedder: EmbeddingProvider,
@@ -47,10 +73,37 @@ def search(
         _QUERY_CACHE[query] = embedder.embed([query])[0]
     qvec = _QUERY_CACHE[query]
 
-    vec_hits = search_embeddings(conn, qvec, CANDIDATES)          # [(chunk_id, dist)]
+    date_to_bound = date_to
+    if date_to and len(date_to) == 10:  # bare YYYY-MM-DD → 해당 날짜 자정까지 포함
+        date_to_bound = date_to + "T23:59:59"
+
+    where_sql, filter_params = _filter_clause(source_filter, date_from, date_to_bound, sender)
+    has_filter = bool(where_sql)
+
+    # 구조 필터는 후보 검색(retrieval) 단계에서부터 적용한다 — 필터링을 상위-k 컷 이후로
+    # 미루면(post-filter) 필터에 맞는 문서가 top-CANDIDATES 밖으로 밀려나 있을 때
+    # 결과가 통째로 사라진다 (스펙 §8 P0).
+    if has_filter:
+        # sqlite-vec vec0은 임의의 JOIN 필터를 신뢰성 있게 지원하지 않으므로,
+        # k*10(상한 300)만큼 넉넉히 벡터 후보를 뽑은 뒤 허용 chunk_id 집합으로 걸러낸다.
+        allowed_rows = conn.execute(
+            f"SELECT c.id FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE 1=1{where_sql}",
+            filter_params,
+        ).fetchall()
+        allowed_chunk_ids = {r[0] for r in allowed_rows}
+        overfetch = min(max(k * 10, CANDIDATES), 300)
+        vec_candidates = search_embeddings(conn, qvec, overfetch)
+        vec_hits = [(cid, dist) for cid, dist in vec_candidates if cid in allowed_chunk_ids][:CANDIDATES]
+    else:
+        vec_hits = search_embeddings(conn, qvec, CANDIDATES)      # [(chunk_id, dist)]
+
     fts_rows = conn.execute(
-        "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
-        (_fts_query(query), CANDIDATES),
+        f"""SELECT c.id FROM chunks_fts
+            JOIN chunks c ON c.id = chunks_fts.rowid
+            JOIN documents d ON d.id = c.doc_id
+            WHERE chunks_fts MATCH ?{where_sql}
+            ORDER BY rank LIMIT ?""",
+        [_fts_query(query), *filter_params, CANDIDATES],
     ).fetchall()
 
     rrf: dict[int, float] = {}
@@ -72,10 +125,6 @@ def search(
     # (ORDER BY 없는 SQL IN 절 결과는 순서를 보장하지 않아, 정렬 없이는 상한이
     #  chunk id 오름차순으로 잘려 최고 점수 청크가 누락될 수 있었다)
     rows = sorted(rows, key=lambda r: -rrf[r[0]])
-
-    date_to_bound = date_to
-    if date_to and len(date_to) == 10:  # bare YYYY-MM-DD → 해당 날짜 자정까지 포함
-        date_to_bound = date_to + "T23:59:59"
 
     now = datetime.now()
     doc_scores: dict[int, float] = {}
