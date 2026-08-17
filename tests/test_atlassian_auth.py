@@ -60,3 +60,27 @@ def test_repr_hides_secrets():
     r = repr(AtlassianAuth(mode="pat", token="SECRET_TOKEN", password="PW", cookie="CK"))
     assert "SECRET_TOKEN" not in r and "PW" not in r and "CK" not in r
     assert "pat" in r  # mode는 보임
+
+
+def test_service_specific_candidates_come_first():
+    env = {"CONFLUENCE_PAT": "cpat", "ATLASSIAN_PAT": "apat"}
+    out = resolve_auth_candidates(env, service="confluence")
+    assert [(a.mode, a.token) for a in out] == [("pat", "cpat"), ("pat", "apat")]
+
+
+def test_service_falls_back_to_generic_when_no_specific():
+    env = {"ATLASSIAN_USER": "u", "ATLASSIAN_PASSWORD": "p"}
+    out = resolve_auth_candidates(env, service="jira")
+    assert len(out) == 1 and out[0].mode == "basic" and out[0].user == "u"
+
+
+def test_jira_prefix_not_used_for_confluence():
+    env = {"JIRA_PAT": "jpat"}
+    assert resolve_auth_candidates(env, service="confluence") == []
+    assert [a.token for a in resolve_auth_candidates(env, service="jira")] == ["jpat"]
+
+
+def test_no_service_keeps_legacy_behavior():
+    env = {"CONFLUENCE_PAT": "cpat", "ATLASSIAN_COOKIE": "ck"}
+    out = resolve_auth_candidates(env)
+    assert [a.mode for a in out] == ["cookie"]  # 서비스 프리픽스는 service 지정 시에만
