@@ -13,7 +13,11 @@ from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .. import db, indexer, search
+from ..atlassian.auth import diagnose, resolve_auth_candidates
+from ..atlassian.registry import Registry
 from ..config import Config
+from ..connectors.confluence import sync_confluence
+from ..connectors.jira import sync_jira
 from ..connectors.local_docs import sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
@@ -21,7 +25,7 @@ from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..rules import load_rules_md
 
 STATIC_DIR = Path(__file__).parent / "static"
-SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal")
+SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
 
 
 def _get_outlook_client(state):
@@ -34,6 +38,31 @@ def _get_outlook_client(state):
         state["outlook_worker"] = worker
         state["outlook_client"] = ThreadedOutlookClient(worker)
     return state["outlook_client"]
+
+
+def _get_atlassian_client(state):
+    """3단 폴백 자동 진단으로 클라이언트 지연 생성 (스펙 §7.2 P0). 진단 결과는 세션 캐시.
+
+    자격증명(.env) 부재는 diagnose()가 안내 메시지와 함께 RuntimeError로 알린다.
+    base URL 미설정은 자격증명이 있을 때만 별도로 더 구체적인 안내를 준다 — 그래야
+    두 조건이 동시에 비어 있는 흔한 케이스(로컬 개발/테스트)에서도 자격증명 안내가
+    먼저 보인다.
+    """
+    if state.get("atlassian_client") is None:
+        cfg = state["config"]
+        candidates = resolve_auth_candidates()
+        if candidates and not cfg.confluence_base_url and not cfg.jira_base_url:
+            raise RuntimeError(
+                "config.yaml의 atlassian.confluence_base_url / jira_base_url을 설정하세요"
+            )
+        from ..atlassian.http_client import HttpAtlassianClient
+
+        def factory(auth):
+            return HttpAtlassianClient(cfg.confluence_base_url, cfg.jira_base_url, auth)
+
+        client, _auth = diagnose(candidates, factory)
+        state["atlassian_client"] = client
+    return state["atlassian_client"]
 
 
 def run_sync(state: dict, source: str) -> dict:
@@ -66,9 +95,17 @@ def run_sync(state: dict, source: str) -> dict:
                     client, cfg.mail_folders, cfg.mail_since_days, cfg.exclude,
                     prev, batch_size=cfg.mail_batch_size,
                 )
-            else:  # outlook_cal
+            elif source == "outlook_cal":
                 client = _get_outlook_client(state)
                 result = sync_outlook_cal(client, cfg.cal_past_days, cfg.cal_future_days, prev)
+            elif source == "confluence":
+                client = _get_atlassian_client(state)
+                result = sync_confluence(client, state["registry"].confluence_page_ids(),
+                                         prev, cfg.data_dir / "confluence")
+            else:  # jira
+                client = _get_atlassian_client(state)
+                result = sync_jira(client, state["registry"].jira_keys(),
+                                   prev, cfg.data_dir / "jira")
             entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
             entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
             for doc in result.documents:
@@ -85,7 +122,7 @@ def run_sync(state: dict, source: str) -> dict:
 
 
 def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
-               outlook_client=None, enable_scheduler: bool = True) -> FastAPI:
+               outlook_client=None, atlassian_client=None, enable_scheduler: bool = True) -> FastAPI:
     if embedder is None:
         from ..embeddings import GeminiEmbeddings
         embedder = GeminiEmbeddings(model=config.embed_model)
@@ -106,7 +143,9 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     read_conn = db.open_db(config.db_path)
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
-             "sync_lock": threading.Lock(), "outlook_client": outlook_client}
+             "sync_lock": threading.Lock(), "outlook_client": outlook_client,
+             "atlassian_client": atlassian_client,
+             "registry": Registry(config.data_dir / "atlassian.json")}
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -160,6 +199,23 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.get("/api/log")
     def log():
         return state["log"]
+
+    @app.post("/api/atlassian/register")
+    def atlassian_register(payload: dict):
+        try:
+            return state["registry"].add(str(payload.get("url", "")))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/api/atlassian/registrations")
+    def atlassian_registrations():
+        return state["registry"].list()
+
+    @app.delete("/api/atlassian/registrations")
+    def atlassian_deregister(payload: dict):
+        if not state["registry"].remove(str(payload.get("url", ""))):
+            raise HTTPException(404, "등록되지 않은 URL")
+        return {"ok": True}
 
     @app.post("/api/open")
     def open_item(payload: dict):

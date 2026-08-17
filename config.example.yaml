@@ -14,3 +14,6 @@ outlook:
   mail_batch_size: 200              # 콜드스타트 1회당 처리량 (재개 가능)
   cal_past_days: 90
   cal_future_days: 180
+atlassian:
+  confluence_base_url: ""   # 예: https://wiki.corp.com (사내 Server/DC)
+  jira_base_url: ""         # 예: https://jira.corp.com

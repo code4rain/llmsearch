@@ -41,6 +41,21 @@ def test_load_config_defaults(tmp_path: Path):
     assert cfg.para_overrides == []
 
 
+def test_atlassian_config(tmp_path: Path):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "data_dir: /d\natlassian:\n  confluence_base_url: https://wiki.corp.com\n"
+        "  jira_base_url: https://jira.corp.com\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.confluence_base_url == "https://wiki.corp.com"
+    assert cfg.jira_base_url == "https://jira.corp.com"
+    # 미설정 시 빈 문자열
+    cfg_file.write_text("data_dir: /d\n", encoding="utf-8")
+    assert load_config(cfg_file).confluence_base_url == ""
+
+
 def test_outlook_config_defaults_and_load(tmp_path: Path):
     cfg_file = tmp_path / "config.yaml"
     cfg_file.write_text(
