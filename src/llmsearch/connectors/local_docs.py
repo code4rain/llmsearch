@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -35,19 +36,40 @@ def _existing_resources(summaries_dir: Path) -> list[str]:
 
 def _place(summaries_dir: Path, category: str, original: Path, summary_md: str,
            prior: tuple[str, str] | None) -> str:
-    """요약 md와 원본 복사본을 카테고리 폴더에 기록. 카테고리 변경 시 이전 것을 이동(삭제 후 재생성)."""
+    """요약 md와 원본 복사본을 카테고리 폴더에 기록.
+
+    - 카테고리 변경 시 이전 요약본·복사본을 이동(삭제 후 재생성)한다. 고아 파일 방지를 위해
+      요약본·복사본의 존재 여부를 각각 독립적으로 확인한다(하나만 남아 있어도 정리됨).
+    - 동일 카테고리에 동명 파일이 이미 있으면(다른 원본에서 비롯된 것) 원본 절대경로 해시로
+      파일명을 구분해 덮어쓰기·중복 생성을 방지한다 (스펙 §7.1 중복 생성 금지·정확한 이동).
+    """
     target_dir = summaries_dir / category
     target_dir.mkdir(parents=True, exist_ok=True)
+
+    candidate_summary = target_dir / (original.name + ".md")
+    is_ours = bool(prior) and Path(prior[1]) == candidate_summary
+
     if prior:
         old_summary = Path(prior[1])
-        if old_summary.exists() and old_summary.parent != target_dir:
-            old_summary.unlink()
-            old_copy = old_summary.parent / original.name
+        if old_summary.parent != target_dir:
+            # 카테고리 변경: 요약본·복사본을 독립적으로 정리 (하나가 이미 없어도 나머지는 정리)
+            if old_summary.exists():
+                old_summary.unlink()
+            old_copy = old_summary.parent / old_summary.name.removesuffix(".md")
             if old_copy.exists():
                 old_copy.unlink()
-    summary_path = target_dir / (original.name + ".md")
+
+    if candidate_summary.exists() and not is_ours:
+        # 동명 파일 충돌: 다른 원본이 이미 이 이름을 쓰고 있음 → 해시로 구분
+        suffix = "__" + hashlib.sha1(str(original.resolve()).encode()).hexdigest()[:8]
+        copy_name = Path(original.name).stem + suffix + Path(original.name).suffix
+        summary_path = target_dir / (copy_name + ".md")
+    else:
+        summary_path = candidate_summary
+        copy_name = original.name
+
     summary_path.write_text(summary_md, encoding="utf-8")
-    copy_path = target_dir / original.name
+    copy_path = target_dir / copy_name
     if not copy_path.exists() or copy_path.stat().st_mtime < original.stat().st_mtime:
         shutil.copy2(original, copy_path)
     return str(summary_path)
@@ -112,8 +134,7 @@ def sync_local_docs(
             else:
                 # DRM 폴백: 파일명·메타데이터만으로 설명 생성 (스펙 §7.1 P0)
                 desc = summarizer.describe_filename(path.name)
-                override = match_override(sid, None, overrides)
-                category = override or (prior[0] if prior else "Resources/미분류")
+                category = prior[0] if prior else "Resources/미분류"
                 body = (
                     f"# {path.name}\n\n## 요약\n{desc}\n\n"
                     f"(🔒 DRM/암호화로 내용 미인덱싱 — 파일명 기반)\n\n"
