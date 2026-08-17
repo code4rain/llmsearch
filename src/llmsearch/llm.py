@@ -80,13 +80,14 @@ class ClaudeAnswerer:
         return "\n\n".join(parts)
 
     def answer_stream(self, question, history, search_fn) -> Iterator[dict]:
-        all_hits: list[Hit] = list(search_fn(question))  # fast path 사전 검색 (스펙 §8)
-        messages = list(history) + [{
-            "role": "user",
-            "content": f"질문: {question}\n\n사전 검색 결과:\n{_hits_block(all_hits)}",
-        }]
-        rounds = 0
+        all_hits: list[Hit] = []
         try:
+            all_hits = list(search_fn(question))  # fast path 사전 검색 (스펙 §8)
+            messages = list(history) + [{
+                "role": "user",
+                "content": f"질문: {question}\n\n사전 검색 결과:\n{_hits_block(all_hits)}",
+            }]
+            rounds = 0
             while True:
                 with self.client.messages.stream(
                     model=self.model, max_tokens=16000,
@@ -116,10 +117,12 @@ class ClaudeAnswerer:
                         date_to=args.get("date_to"),
                     )
                     known = {h.source_id for h in all_hits}
-                    all_hits.extend(h for h in hits if h.source_id not in known)
+                    start = len(all_hits)
+                    fresh = [h for h in hits if h.source_id not in known]
+                    all_hits.extend(fresh)
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": block.id,
-                        "content": _hits_block(hits, offset=len(all_hits) - len(hits)),
+                        "content": _hits_block(fresh, offset=start),
                     })
                 messages.append({"role": "user", "content": tool_results})
         except Exception as exc:  # API 실패 시에도 출처는 전달 (스펙 §5 에러 처리)

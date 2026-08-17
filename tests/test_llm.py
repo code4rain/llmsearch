@@ -30,3 +30,28 @@ def test_fake_answerer_no_results():
 def test_claude_answerer_importable_without_key():
     # 키 없이 모듈 import 가능해야 함 (지연 초기화)
     from llmsearch.llm import ClaudeAnswerer  # noqa: F401
+
+
+def test_claude_answerer_presearch_exception_yields_error_and_sources(monkeypatch):
+    # 사전 검색 실패 시 error + sources 이벤트 전달 확인 (계약 준수)
+    from llmsearch.llm import ClaudeAnswerer
+
+    # anthropic.Anthropic 스텁으로 API 없이 생성 가능하게
+    monkeypatch.setattr("anthropic.Anthropic", lambda **k: object())
+
+    answerer = ClaudeAnswerer()
+
+    def failing_search_fn(*a, **k):
+        raise ValueError("Search failed")
+
+    events = list(answerer.answer_stream("질문", [], failing_search_fn))
+
+    # error 이벤트 확인
+    errors = [e for e in events if e["type"] == "error"]
+    assert len(errors) == 1
+    assert "Search failed" in errors[0]["message"]
+
+    # sources 이벤트 확인 (빈 hits)
+    sources = [e for e in events if e["type"] == "sources"]
+    assert len(sources) == 1
+    assert sources[0]["hits"] == []
