@@ -33,11 +33,12 @@ def test_index_and_reindex(tmp_path: Path):
 def test_delete_documents(tmp_path: Path):
     conn = db.open_db(tmp_path / "i.db")
     emb = FakeEmbeddings(dim=768)
-    indexer.index_documents(conn, [make_doc("a.md", "본문"), make_doc("b.md", "본문2")], emb)
+    indexer.index_documents(conn, [make_doc("a.md", "본문"), make_doc("b.md", "다른 본문")], emb)
     deleted = indexer.delete_documents(conn, "notes", ["a.md"])
     assert deleted == 1
     assert conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH '본문'").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH '다른'").fetchone()[0] == 1
 
 
 def test_sync_state_roundtrip(tmp_path: Path):
