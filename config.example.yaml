@@ -1,0 +1,10 @@
+data_dir: "D:/llmsearch-data"        # WSL 개발 시 /mnt/d/llmsearch-data
+watch_folders: ["D:/업무문서"]        # local_docs 감시 폴더
+notes_folders: ["D:/llmsearch-data/notes"]
+para:
+  projects: ["프로젝트A"]             # 활성 프로젝트 — 닫힌 목록 (GUI 개편 전까지 여기서 관리)
+  areas: ["팀운영"]
+rules:
+  para_overrides: []                  # 예: - {match: "path:**/경영회의/**", target: "Areas/경영지원"}
+  exclude: []                         # 예: - "folder:인사평가"
+sync_interval_minutes: 30
