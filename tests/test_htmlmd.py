@@ -19,3 +19,10 @@ def test_table_preserved_as_text():
 
 def test_empty():
     assert html_to_markdown("") == ""
+
+
+def test_literal_script_in_cdata_preserved():
+    """코드 예제 속 문자 그대로의 <script>는 삭제되면 안 된다 (markdownify가 파싱 계층에서 실제 요소만 제거)."""
+    html = "<p>예제:</p><ac:plain-text-body><![CDATA[<script>alert('example');</script>]]></ac:plain-text-body><p>참고하세요.</p>"
+    md = html_to_markdown(html)
+    assert "example" in md and "참고하세요" in md
