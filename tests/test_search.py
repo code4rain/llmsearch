@@ -57,3 +57,39 @@ def test_excerpt_capped(tmp_path: Path):
     )
     hits = search.search(conn, EMB, "프로젝트B 섹션5")
     assert hits and len(hits[0].excerpt) <= 6000
+
+
+def test_per_doc_cap_keeps_top_rrf_chunk_not_first_by_id(tmp_path: Path):
+    # 문서 하나에 청크가 12개 있고, 마지막 청크에만 질의어가 들어 있다.
+    # 문서당 청크 상한(3)을 적용할 때 chunk id 오름차순으로 자르면
+    # 정작 질의와 가장 잘 맞는(마지막) 청크가 상한 밖으로 밀려나
+    # 발췌 중심(centering)도 엉뚱한 앞부분 청크를 기준으로 잡히게 된다.
+    conn = db.open_db(tmp_path / "s5.db")
+    paragraphs = []
+    for i in range(12):
+        filler = f"섹션{i} 프로젝트B 내용 " + "나" * 750
+        if i == 11:
+            filler += " 고유마커777"
+        paragraphs.append(filler)
+    long_text = "\n\n".join(paragraphs)
+    indexer.index_documents(
+        conn, [Document("notes", "cap.md", "긴 문서", long_text, "/n/cap.md", datetime(2026, 8, 1))], EMB
+    )
+    hits = search.search(conn, EMB, "프로젝트B 고유마커777")
+    assert hits and hits[0].source_id == "cap.md"
+    assert "고유마커777" in hits[0].excerpt
+
+
+def test_date_to_bare_date_includes_full_day(tmp_path: Path):
+    conn = db.open_db(tmp_path / "s6.db")
+    doc = Document(
+        "notes", "afternoon.md", "오후 회의", "프로젝트C 오후 회의록 내용.",
+        "/n/afternoon.md", datetime(2026, 8, 15, 14, 30),
+    )
+    indexer.index_documents(conn, [doc], EMB)
+
+    included = search.search(conn, EMB, "프로젝트C", date_to="2026-08-15")
+    assert any(h.source_id == "afternoon.md" for h in included)
+
+    excluded = search.search(conn, EMB, "프로젝트C", date_to="2026-08-14")
+    assert all(h.source_id != "afternoon.md" for h in excluded)

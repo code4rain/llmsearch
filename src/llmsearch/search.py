@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
 
@@ -67,6 +68,14 @@ def search(
             FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE c.id IN ({placeholders})""",
         list(rrf),
     ).fetchall()
+    # RRF 점수 내림차순 정렬 — 문서당 청크 상한 컷이 최고 점수 청크부터 채택하도록 보장
+    # (ORDER BY 없는 SQL IN 절 결과는 순서를 보장하지 않아, 정렬 없이는 상한이
+    #  chunk id 오름차순으로 잘려 최고 점수 청크가 누락될 수 있었다)
+    rows = sorted(rows, key=lambda r: -rrf[r[0]])
+
+    date_to_bound = date_to
+    if date_to and len(date_to) == 10:  # bare YYYY-MM-DD → 해당 날짜 자정까지 포함
+        date_to_bound = date_to + "T23:59:59"
 
     now = datetime.now()
     doc_scores: dict[int, float] = {}
@@ -74,15 +83,14 @@ def search(
     doc_best_chunk: dict[int, int] = {}
     doc_chunk_count: dict[int, int] = {}
     for cid, doc_id, stype, sid, title, url, updated, cidx, para, extra in rows:
-        import json as _json
-        ex = _json.loads(extra)
+        ex = json.loads(extra)
         if source_filter and stype not in source_filter:
             continue
         if date_from and updated < date_from:
             continue
-        if date_to and updated > date_to:
+        if date_to_bound and updated > date_to_bound:
             continue
-        if sender and ex.get("sender", "").lower() != sender.lower():
+        if sender and (ex.get("sender") or "").lower() != sender.lower():
             continue
         if doc_chunk_count.get(doc_id, 0) >= PER_DOC_CAP:
             continue
