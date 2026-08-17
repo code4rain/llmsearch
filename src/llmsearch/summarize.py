@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from typing import Protocol
 
+MAX_SUMMARY_INPUT_CHARS = 30000
+
 
 @dataclass
 class SummaryResult:
@@ -27,6 +29,27 @@ def resolve_category(raw: str, projects: list[str], areas: list[str]) -> str:
     if top in ("Resources", "Archives"):
         return raw
     return "Resources/일반"
+
+
+def _extract_category(text: str, projects: list[str], areas: list[str]) -> tuple[str, str]:
+    """LLM 출력에서 마지막 CATEGORY: 줄을 파싱·검증하고 마크다운에서 제거한다.
+
+    Returns: (markdown_without_category_line, category)
+    - CATEGORY 줄이 없으면: (text_unchanged, "Resources/일반")
+    - 여러 줄 있으면: 마지막 한 줄만 파싱하고 마크다운에서 제거
+    - 잘못된 접두사(예: "Category: ..."): CATEGORY 줄로 인식 안 함
+    """
+    category = "Resources/일반"
+    out = text
+    lines = text.strip().splitlines()
+    for line in reversed(lines):
+        if line.startswith("CATEGORY:"):
+            raw_category = line.removeprefix("CATEGORY:").strip()
+            category = resolve_category(raw_category, projects, areas)
+            # 마크다운에서 CATEGORY 줄 제거
+            out = out[: out.rfind(line)].rstrip()
+            break
+    return out, category
 
 
 class Summarizer(Protocol):
@@ -91,12 +114,18 @@ class GeminiSummarizer:
     def __init__(self, model: str = "gemini-flash-latest"):
         from google import genai  # 지연 import
 
-        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        key = os.environ.get("GEMINI_API_KEY")
+        if not key:
+            raise RuntimeError("GEMINI_API_KEY 환경변수를 설정하세요 (.env)")
+        self.client = genai.Client(api_key=key)
         self.model = model
 
     def _generate(self, prompt: str) -> str:
-        resp = self.client.models.generate_content(model=self.model, contents=prompt)
-        return resp.text or ""
+        try:
+            resp = self.client.models.generate_content(model=self.model, contents=prompt)
+            return resp.text or ""
+        except Exception:
+            return ""
 
     def summarize_and_classify(self, title, text, projects, areas, existing_resources,
                                prior_category, glossary, rules) -> SummaryResult:
@@ -108,16 +137,10 @@ class GeminiSummarizer:
             glossary=f"\n## 용어집\n{glossary}" if glossary else "",
             rules=f"\n## 분류 규칙\n{rules}" if rules else "",
             title=title,
-            text=text[:30000],  # 프롬프트 상한 — 초과분은 요약 대상에서 절단
+            text=text[:MAX_SUMMARY_INPUT_CHARS],
         )
         out = self._generate(prompt)
-        category = "Resources/일반"
-        lines = out.strip().splitlines()
-        for line in reversed(lines):
-            if line.startswith("CATEGORY:"):
-                category = resolve_category(line.removeprefix("CATEGORY:"), projects, areas)
-                out = out[: out.rfind(line)].rstrip()
-                break
+        out, category = _extract_category(out, projects, areas)
         return SummaryResult(out, category)
 
     def describe_filename(self, filename: str) -> str:

@@ -1,4 +1,4 @@
-from llmsearch.summarize import FakeSummarizer, resolve_category
+from llmsearch.summarize import FakeSummarizer, resolve_category, _extract_category
 
 
 def test_fake_summarizer_classifies_to_project():
@@ -34,3 +34,44 @@ def test_resolve_category_validates_closed_list():
 def test_fake_describe_filename():
     d = FakeSummarizer().describe_filename("2026_상반기_실적보고_v3.pptx")
     assert "실적보고" in d
+
+
+def test_extract_category_no_category_line():
+    """CATEGORY 줄이 없으면 마크다운 변경 없고 기본값 Resources/일반"""
+    text = "# 문서\n## 요약\n본문"
+    md, cat = _extract_category(text, [], [])
+    assert cat == "Resources/일반"
+    assert md == text
+
+
+def test_extract_category_valid_project():
+    """유효한 Projects/프로젝트A는 파싱되고 줄이 제거됨"""
+    text = "# 문서\n## 요약\n내용\nCATEGORY: Projects/프로젝트A"
+    md, cat = _extract_category(text, ["프로젝트A"], [])
+    assert cat == "Projects/프로젝트A"
+    assert "CATEGORY:" not in md
+    assert "내용" in md
+
+
+def test_extract_category_multiple_lines_last_wins():
+    """여러 CATEGORY 줄이 있으면 마지막 한 줄만 파싱"""
+    text = "CATEGORY: Projects/잘못됨\n# 문서\n내용\nCATEGORY: Projects/프로젝트A"
+    md, cat = _extract_category(text, ["프로젝트A"], [])
+    assert cat == "Projects/프로젝트A"
+    assert md.count("CATEGORY:") == 1  # 마지막 줄만 제거되므로 첫 줄은 남음
+
+
+def test_extract_category_malformed_prefix():
+    """Category: 같은 잘못된 접두사는 CATEGORY로 인식 안 함"""
+    text = "# 문서\nCategory: Projects/X\n내용"
+    md, cat = _extract_category(text, ["프로젝트A"], [])
+    assert cat == "Resources/일반"
+    assert "Category: Projects/X" in md  # 제거되지 않음
+
+
+def test_extract_category_invalid_project_demoted():
+    """닫힌 목록 밖의 Projects는 Resources로 강등"""
+    text = "# 문서\nCATEGORY: Projects/없는프젝"
+    md, cat = _extract_category(text, ["프로젝트A"], [])
+    assert cat == "Resources/없는프젝"
+    assert "CATEGORY:" not in md
