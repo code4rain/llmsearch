@@ -1,6 +1,8 @@
+import concurrent.futures
 import threading
 
 import pytest
+from llmsearch.outlook import com_worker
 from llmsearch.outlook.com_worker import ComWorker
 
 
@@ -32,3 +34,42 @@ def test_shutdown_then_submit_raises():
     w.shutdown()
     with pytest.raises(RuntimeError):
         w.submit(lambda: 1)
+
+
+def test_reentrant_submit_direct_execution():
+    """워커 스레드에서 submit 호출 시 데드락 없이 직접 실행."""
+    w = ComWorker()
+    try:
+        # 외부 스레드에서 시작, 워커 내부의 람다가 다시 submit
+        # timeout을 걸어서 데드락 감지
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                lambda: w.submit(lambda: w.submit(lambda: threading.current_thread().name))
+            )
+            result = future.result(timeout=5)
+            assert result == "com-worker"
+    finally:
+        w.shutdown()
+
+
+def test_double_shutdown_does_not_raise():
+    """shutdown() 호출 2회는 에러 발생 안 함."""
+    w = ComWorker()
+    w.shutdown()
+    w.shutdown()  # should not raise
+
+
+def test_submit_survives_init_failure(monkeypatch):
+    """COM 초기화 실패해도 워커는 정상 동작."""
+    # _com_initialize를 RuntimeError로 만들기
+    monkeypatch.setattr(
+        com_worker, "_com_initialize", lambda: (_ for _ in ()).throw(RuntimeError("init failed"))
+    )
+
+    w = ComWorker()
+    try:
+        # 초기화 실패했지만 submit은 작동해야 함
+        assert w.submit(lambda: 1) == 1
+        assert w.submit(lambda a: a * 2, 3) == 6
+    finally:
+        w.shutdown()
