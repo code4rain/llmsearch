@@ -26,3 +26,27 @@ def test_confluence_modern_path():
 def test_unknown_url():
     assert parse_atlassian_url("https://example.com/whatever") is None
     assert parse_atlassian_url("not a url") is None
+
+
+def test_reject_non_http_schemes():
+    """Regression: httpx:// and other non-standard schemes must be rejected"""
+    assert parse_atlassian_url("httpx://jira.corp.com/browse/PROJ-123") is None
+    assert parse_atlassian_url("ftp://wiki.corp.com/pages/123") is None
+
+
+def test_reject_unicode_digits_in_browse():
+    """Regression: full-width digits in Jira key must be rejected"""
+    # Full-width digits １２３ should not match as issue number
+    assert parse_atlassian_url("https://jira.corp.com/browse/PROJ-１２３") is None
+
+
+def test_reject_unicode_digits_in_confluence_path():
+    """Regression: full-width digits in Confluence path must be rejected"""
+    # Full-width page ID １２３ should not match
+    assert parse_atlassian_url("https://wiki.corp.com/spaces/ENG/pages/１２３/title") is None
+
+
+def test_reject_unicode_digits_in_pageid_query():
+    """Regression: full-width digits in pageId query parameter must be rejected"""
+    # Full-width pageId １２３ should not match
+    assert parse_atlassian_url("https://wiki.corp.com/pages/viewpage.action?pageId=１２３") is None
