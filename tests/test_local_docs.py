@@ -204,11 +204,54 @@ def test_one_file_failure_does_not_abort_sync(tmp_path: Path, patch_extract):
     titles = [d.title for d in result.documents]
     assert "ok.pptx" in titles
     assert "boom.pptx" not in titles
-    # 실패한 파일은 seen(state)에 남지 않아 다음 동기화에서 재시도된다.
-    boom_sid = str((docs / "boom.pptx").resolve())
-    assert boom_sid not in result.state["files"]
     ok_sid = str((docs / "ok.pptx").resolve())
     assert ok_sid in result.state["files"]
+    # 실패한 파일은 seen에 재시도 센티널로 남는다: deleted로 오판되지 않으면서도
+    # 실제 (mtime, size)와는 달라 다음 동기화에서 강제로 재시도된다.
+    boom_sid = str((docs / "boom.pptx").resolve())
+    boom_path = docs / "boom.pptx"
+    real_sig = [boom_path.stat().st_mtime, boom_path.stat().st_size]
+    assert boom_sid in result.state["files"]
+    assert result.state["files"][boom_sid] != real_sig
+
+
+def test_transient_failure_does_not_delete_previously_synced_file(tmp_path: Path, patch_extract):
+    """이전에 성공 동기화된 파일이 이번 실행에서 일시적으로 실패해도 삭제로 오판돼
+    기존 요약본/복사본이 지워지면 안 되고, 다음 성공 실행에서 재동기화돼야 한다."""
+    docs = tmp_path / "docs"; docs.mkdir()
+    f = docs / "flaky.pptx"; f.write_bytes(b"v1")
+
+    # Round 1: 정상 동기화 성공
+    r1 = run(tmp_path, docs)
+    sid = r1.documents[0].source_id
+    assert r1.documents[0].extra["para_path"] == "Projects/프로젝트A"
+    summary_path = Path(r1.documents[0].extra["summary_path"])
+    copy_path = summary_path.parent / "flaky.pptx"
+    assert summary_path.exists() and copy_path.exists()
+
+    # Round 2: 파일이 변경돼 재처리 대상이 되지만, 요약기가 일시적으로 예외를 던짐
+    import os, time
+    os.utime(f, (time.time() + 5, time.time() + 5))
+
+    class FlakyOnceSummarizer(FakeSummarizer):
+        def summarize_and_classify(self, title, text, *a, **kw):
+            raise RuntimeError("transient failure")
+
+    prior = {sid: ("Projects/프로젝트A", str(summary_path))}
+    r2 = local_docs.sync_local_docs(
+        folders=[docs], excludes=[], overrides=[],
+        summarizer=FlakyOnceSummarizer(), summaries_dir=tmp_path / "summaries",
+        projects=["프로젝트A"], areas=[], glossary="", class_rules="",
+        state=r1.state, prior_map=prior,
+    )
+    assert r2.documents == []             # 이번 라운드엔 재동기화되지 않음
+    assert sid not in r2.deleted_ids      # 삭제로 오판되지 않음
+    assert summary_path.exists() and copy_path.exists()  # 기존 요약본/복사본 그대로 유지
+
+    # Round 3: 요약기가 정상으로 돌아오면 다음 동기화에서 자동으로 재시도돼 재동기화된다.
+    r3 = run(tmp_path, docs, state=r2.state, prior=prior)
+    assert len(r3.documents) == 1
+    assert r3.documents[0].source_id == sid
 
 
 def test_extract_text_real_smoke(tmp_path: Path):

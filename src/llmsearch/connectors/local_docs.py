@@ -15,6 +15,11 @@ logger = logging.getLogger(__name__)
 EXTENSIONS = {".pptx", ".xlsx", ".docx", ".pdf"}
 MIN_TEXT_LEN = 50
 VALID_RATIO = 0.6
+# 파일 단위 처리 실패 시 seen에 기록하는 재시도 센티널. 실제 (mtime, size)와 결코
+# 일치하지 않도록 불가능한 값을 사용해, 다음 동기화에서 시그니처 불일치로 강제
+# 재처리되게 한다. 동시에 seen에는 남아 있으므로 이번 실행에서 "삭제됨"으로
+# 오판되지 않아 기존 요약본/복사본/색인이 지워지지 않는다.
+_RETRY_SENTINEL = [0.0, 0]
 
 
 def extract_text(path: Path) -> str:
@@ -162,8 +167,11 @@ def sync_local_docs(
                 seen[sid] = sig
             except Exception:
                 # 파일 단위 격리: 이 파일 처리가 실패해도 소스 동기화 전체가 중단되지
-                # 않도록 로그만 남기고 건너뛴다. seen에 넣지 않아 다음 동기화에서 재시도된다.
+                # 않도록 로그만 남기고 건너뛴다. seen에 재시도 센티널을 넣어 (1) 이번
+                # 실행에서 deleted로 오판되어 기존 요약본/복사본/색인이 삭제되지 않게
+                # 하고, (2) 실제 시그니처와 항상 달라 다음 동기화에서 재시도되게 한다.
                 logger.exception("local_docs 동기화 실패, 파일 건너뜀: %s", sid)
+                seen[sid] = _RETRY_SENTINEL
                 continue
 
     deleted = [sid for sid in prev if sid not in seen]
