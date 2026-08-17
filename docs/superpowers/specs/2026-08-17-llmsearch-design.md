@@ -111,6 +111,7 @@ class Connector(Protocol):
 - GUI에서 URL 등록 → 페이지 ID/이슈 키 파싱 → REST API로 **페이지+하위 트리** (Jira: 이슈+댓글) 수집
 - **인증 3단 폴백 (P0)**: PAT(DC 7.9+) → Basic(사번/비밀번호) → 브라우저 세션 쿠키 수동 붙여넣기. 첫 등록 시 자동 진단으로 가능한 방식 판별, 쿠키 만료 시 GUI에서 갱신 안내. 자격증명은 Windows 자격 증명 관리자(keyring) 저장 — 평문 config 금지
   - *M3 구현 노트: keyring 저장은 M3 범위에서 제외하고 `.env`(gitignore) 환경변수로 대체 — keyring 도입은 후속 마일스톤 결정 사항. 진단은 등록 시점이 아닌 첫 동기화 시점에 수행(실질 동등). 단일 자격증명 세트가 Confluence·Jira 두 서버 모두에 유효해야 하며, 병용 시 Basic(사내 AD 계정) 권장.*
+  - *M4 구현 노트: 서비스별 자격증명 분리 도입 — `CONFLUENCE_*`/`JIRA_*` 프리픽스가 공용 `ATLASSIAN_*`보다 우선하며, 서비스별 클라이언트가 독립 진단·독립 401 리셋된다. 단일 세트 제약은 해소됨.*
 - HTML → Markdown 변환 후 `confluence/스페이스/페이지계층/`, `jira/PROJ-123.md` 저장
 - 주기 동기화는 수정시각 비교로 변경분만, 삭제 페이지는 인덱스·미러에서 제거
 

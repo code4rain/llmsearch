@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 MAX_SUMMARY_INPUT_CHARS = 30000
 
@@ -215,4 +218,5 @@ class GeminiSummarizer:
             resp = self.client.models.generate_content(model=self.model, contents=parts + [prompt])
             return resp.text or ""
         except Exception:
+            logger.warning("비전 설명 생성 실패 (이미지 %d장): %s", len(images), title, exc_info=True)
             return ""

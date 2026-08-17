@@ -42,10 +42,12 @@ class HttpAtlassianClient:
     def check_auth(self) -> bool:
         """설정된 서비스(Confluence/Jira) 전부를 프로브해 전부 성공해야 인증 유효로 본다.
 
-        base URL이 하나만 설정돼 있으면 그 서비스만 프로브한다. 두 base가 모두 설정된
-        경우 하나만 프로브하면(예: jira만) confluence 쪽 인증이 이미 만료됐어도 True를
-        반환하는 2-서버 부정합이 생긴다 — 단일 자격증명이 두 서버 모두에 유효해야
-        한다는 전제이므로(README 참고) 둘 다 확인해야 한다.
+        base URL이 하나만 설정돼 있으면 그 서비스만 프로브한다 — 웹 계층은 서비스별로
+        base 하나만 가진 클라이언트를 만들어 쓰므로(서비스별 자격증명 분리, README 참고)
+        이 경로가 사실상의 단일 프로브가 된다. 두 base가 모두 설정된 채로 직접 사용하는
+        경우(예: 단일 자격증명으로 둘 다 인증하는 구성)에는 하나만 프로브하면(예: jira만)
+        confluence 쪽 인증이 이미 만료됐어도 True를 반환하는 2-서버 부정합이 생기므로
+        둘 다 확인한다.
         """
         try:
             if self.confluence_base:

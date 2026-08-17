@@ -106,7 +106,8 @@ async function archiveProject(name) {
   if (!confirm(`'${name}' 프로젝트를 Archives로 이동할까요? 검색 순위가 하향됩니다.`)) return;
   const r = await fetch('/api/archive', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({project: name})});
-  const data = await r.json();
+  let data = {};
+  try { data = await r.json(); } catch { data = {detail: '서버 내부 오류 — 로그를 확인하세요'}; }
   alert(r.ok ? (data.hint || '완료') : (data.detail || '실패'));
   loadProjects(); loadSources();
 }
