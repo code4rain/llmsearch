@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import traceback
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -26,6 +28,11 @@ from ..rules import load_rules_md
 
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
+_AUTH_EXPIRED_MSG = (
+    "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_PAT/USER/PASSWORD/COOKIE)을 "
+    "갱신한 뒤 다시 동기화하세요."
+)
+_logger = logging.getLogger(__name__)
 
 
 def _get_outlook_client(state):
@@ -112,6 +119,17 @@ def run_sync(state: dict, source: str) -> dict:
                 if "summary_path" in doc.extra:
                     indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
             indexer.set_sync_state(conn, source, result.state)
+        except httpx.HTTPStatusError as exc:
+            conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
+            entry["ok"] = False
+            if exc.response.status_code == 401:
+                # 캐시된 클라이언트를 리셋 — 다음 confluence/jira 동기화 때 diagnose()가
+                # 자연히 다시 돌아 재로그인을 시도한다 (스펙 §7.2 P0, 앱 재시작 없이 복구).
+                state["atlassian_client"] = None
+                entry["error"] = _AUTH_EXPIRED_MSG
+                _logger.warning("Atlassian 401 — 클라이언트 캐시 리셋: %s", _AUTH_EXPIRED_MSG)
+            else:
+                entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
         except Exception as exc:
             conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
             entry["ok"] = False

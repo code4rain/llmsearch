@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 
+import httpx
 from fastapi.testclient import TestClient
 
 from llmsearch.atlassian.client import FakeAtlassianClient
@@ -60,6 +61,60 @@ def test_confluence_and_jira_sync(tmp_path: Path):
     # 미러 파일 존재 (스펙 §13 레이아웃)
     assert list((tmp_path / "data" / "confluence").rglob("*.md"))
     assert (tmp_path / "data" / "jira" / "PROJ-1.md").exists()
+
+
+def _http_401():
+    request = httpx.Request("GET", "https://wiki/x")
+    response = httpx.Response(401, request=request)
+    return httpx.HTTPStatusError("401 Unauthorized", request=request, response=response)
+
+
+class Expired401Client:
+    """인증이 만료된 상황을 흉내내는 fake — get_page/get_issue가 401 HTTPStatusError를 낸다."""
+
+    def check_auth(self):
+        return True
+
+    def get_page(self, page_id):
+        raise _http_401()
+
+    def child_page_ids(self, page_id):
+        return []
+
+    def get_issue(self, key):
+        raise _http_401()
+
+
+def test_confluence_401_resets_client_and_guides_reauth(tmp_path: Path):
+    """스펙 §7.2 P0: 쿠키/인증 만료 시 앱 재시작 없이도 재진단이 가능해야 한다 —
+    401을 만나면 캐시된 atlassian_client를 리셋하고 한국어 안내 메시지를 남긴다."""
+    client = make_client(tmp_path, atlassian=Expired401Client())
+    client.post("/api/atlassian/register",
+                json={"url": "https://wiki/pages/viewpage.action?pageId=123"})
+    r = client.post("/api/sync/confluence")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert "인증이 만료되었습니다" in body["error"]
+    assert "다시 동기화" in body["error"]
+    state = client.app.state.llmsearch
+    assert state["atlassian_client"] is None  # 다음 동기화 때 재진단이 자연히 일어남
+    # 안내 문구는 .env 변수명만 언급하고 실제 자격증명 값은 노출하지 않는다
+    assert body["error"] == (
+        "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_PAT/USER/PASSWORD/COOKIE)을 "
+        "갱신한 뒤 다시 동기화하세요."
+    )
+
+
+def test_jira_401_resets_client_and_guides_reauth(tmp_path: Path):
+    client = make_client(tmp_path, atlassian=Expired401Client())
+    client.post("/api/atlassian/register", json={"url": "https://jira/browse/PROJ-1"})
+    r = client.post("/api/sync/jira")
+    body = r.json()
+    assert body["ok"] is False
+    assert "인증이 만료되었습니다" in body["error"]
+    state = client.app.state.llmsearch
+    assert state["atlassian_client"] is None
 
 
 def test_open_registered_http_url(tmp_path: Path, monkeypatch):
