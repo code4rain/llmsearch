@@ -22,6 +22,14 @@ def test_list_mail_limit():
     assert len(out) == 2 and out[0]["entry_id"] == "0"
 
 
+def test_list_mail_until_inclusive():
+    c = FakeOutlookClient(mails={"inbox": [
+        mail("a", datetime(2026, 8, 1)), mail("b", datetime(2026, 8, 2)), mail("c", datetime(2026, 8, 3)),
+    ]})
+    out = c.list_mail("inbox", since=datetime(2026, 7, 31), until=datetime(2026, 8, 2))
+    assert [m["entry_id"] for m in out] == ["a", "b"]  # until 시각과 같은 메일 포함(inclusive), 이후 제외
+
+
 def test_list_mail_ids():
     c = FakeOutlookClient(mails={"inbox": [mail("a", datetime(2026, 8, 1)), mail("b", datetime(2026, 8, 2))]})
     assert c.list_mail_ids("inbox", since=datetime(2026, 7, 31)) == {"a", "b"}
