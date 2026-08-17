@@ -90,7 +90,7 @@ class Expired401Client:
 
 def test_confluence_401_resets_client_and_guides_reauth(tmp_path: Path):
     """스펙 §7.2 P0: 쿠키/인증 만료 시 앱 재시작 없이도 재진단이 가능해야 한다 —
-    401을 만나면 캐시된 atlassian_client를 리셋하고 한국어 안내 메시지를 남긴다."""
+    401을 만나면 캐시된 confluence_client를 리셋하고 한국어 안내 메시지를 남긴다."""
     client = make_client(tmp_path, atlassian=Expired401Client())
     client.post("/api/atlassian/register",
                 json={"url": "https://wiki/pages/viewpage.action?pageId=123"})
@@ -101,11 +101,12 @@ def test_confluence_401_resets_client_and_guides_reauth(tmp_path: Path):
     assert "인증이 만료되었습니다" in body["error"]
     assert "다시 동기화" in body["error"]
     state = client.app.state.llmsearch
-    assert state["atlassian_client"] is None  # 다음 동기화 때 재진단이 자연히 일어남
+    assert state["confluence_client"] is None  # 다음 동기화 때 재진단이 자연히 일어남
+    assert state["jira_client"] is not None  # 다른 서비스는 영향 없음
     # 안내 문구는 .env 변수명만 언급하고 실제 자격증명 값은 노출하지 않는다
     assert body["error"] == (
-        "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_PAT/USER/PASSWORD/COOKIE)을 "
-        "갱신한 뒤 다시 동기화하세요."
+        "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
+        "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
     )
 
 
@@ -117,7 +118,8 @@ def test_jira_401_resets_client_and_guides_reauth(tmp_path: Path):
     assert body["ok"] is False
     assert "인증이 만료되었습니다" in body["error"]
     state = client.app.state.llmsearch
-    assert state["atlassian_client"] is None
+    assert state["jira_client"] is None
+    assert state["confluence_client"] is not None
 
 
 def test_registry_dedups_by_page_id_across_different_url_forms(tmp_path: Path):
@@ -184,7 +186,9 @@ def test_open_unregistered_http_url_rejected(tmp_path: Path, monkeypatch):
 
 def test_auth_failure_isolated(tmp_path: Path, monkeypatch):
     # 주입 없음 + env 자격증명 없음 → 진단 실패가 로그로 격리
-    for var in ("ATLASSIAN_PAT", "ATLASSIAN_USER", "ATLASSIAN_PASSWORD", "ATLASSIAN_COOKIE"):
+    for var in ("ATLASSIAN_PAT", "ATLASSIAN_USER", "ATLASSIAN_PASSWORD", "ATLASSIAN_COOKIE",
+                "CONFLUENCE_PAT", "CONFLUENCE_USER", "CONFLUENCE_PASSWORD", "CONFLUENCE_COOKIE",
+                "JIRA_PAT", "JIRA_USER", "JIRA_PASSWORD", "JIRA_COOKIE"):
         monkeypatch.delenv(var, raising=False)
     client = make_client(tmp_path)
     client.post("/api/atlassian/register", json={"url": "https://jira/browse/PROJ-1"})
@@ -192,3 +196,33 @@ def test_auth_failure_isolated(tmp_path: Path, monkeypatch):
     assert r.status_code == 200 and r.json()["ok"] is False
     assert "ATLASSIAN_" in r.json()["error"]
     assert client.post("/api/sync/notes").status_code == 200  # 타 소스 정상
+
+
+def test_per_service_env_reaches_diagnose(tmp_path, monkeypatch):
+    """confluence 동기화는 service='confluence' 후보로 진단한다 — JIRA_ 전용 자격증명은 배제."""
+    from llmsearch.web.app import _get_atlassian_client
+
+    for var in ("ATLASSIAN_PAT", "ATLASSIAN_USER", "ATLASSIAN_PASSWORD", "ATLASSIAN_COOKIE",
+                "CONFLUENCE_PAT", "CONFLUENCE_USER", "CONFLUENCE_PASSWORD", "CONFLUENCE_COOKIE",
+                "JIRA_PAT", "JIRA_USER", "JIRA_PASSWORD", "JIRA_COOKIE"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("JIRA_PAT", "jpat")  # confluence에는 후보가 없음
+
+    from llmsearch.config import Config
+
+    cfg = Config(data_dir=tmp_path, confluence_base_url="https://wiki.example.com",
+                 jira_base_url="https://jira.example.com")
+    state = {"config": cfg}
+    try:
+        _get_atlassian_client(state, "confluence")
+        assert False, "후보가 없으니 RuntimeError가 나야 함"
+    except RuntimeError as exc:
+        assert "ATLASSIAN_" in str(exc)  # 안내 메시지 (자격증명 값은 미포함)
+
+
+def test_injected_client_serves_both_services(tmp_path):
+    """create_app(atlassian_client=...)는 confluence/jira 모두에 주입 인스턴스를 쓴다."""
+    client = make_client(tmp_path, atlassian=fake_atlassian())  # 이 파일의 기존 헬퍼 재사용
+    state = client.app.state.llmsearch
+    assert state["confluence_client"] is not None  # None is None 동어반복 방지
+    assert state["confluence_client"] is state["jira_client"]
