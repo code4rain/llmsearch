@@ -72,6 +72,24 @@ def _get_atlassian_client(state):
     return state["atlassian_client"]
 
 
+def _scheduled_sources(state: dict) -> list[str]:
+    """스케줄러가 이번 라운드에 실제로 동기화할 소스 목록.
+
+    confluence/jira는 atlassian registry에 등록된 게 하나도 없으면 매 라운드(기본
+    30분)마다 의미 없는 오류 로그만 쌓이므로 스킵한다. 수동 동기화(/api/sync/{source})는
+    이 필터를 거치지 않는다 — 등록 직후 사용자가 바로 확인해 보는 경우를 막지 않기 위해서다.
+    """
+    registry = state["registry"]
+    out = []
+    for source in SOURCES:
+        if source == "confluence" and not registry.confluence_page_ids():
+            continue
+        if source == "jira" and not registry.jira_keys():
+            continue
+        out.append(source)
+    return out
+
+
 def run_sync(state: dict, source: str) -> dict:
     """커넥터 1개 동기화 실행. 실패는 소스별로 격리해 로그에 남긴다 (스펙 §5)."""
     cfg: Config = state["config"]
@@ -173,7 +191,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     async def scheduler_loop():
         while True:
             await asyncio.sleep(config.sync_interval_minutes * 60)
-            for source in SOURCES:
+            for source in _scheduled_sources(state):
                 await asyncio.to_thread(run_sync, state, source)
 
     @app.on_event("startup")

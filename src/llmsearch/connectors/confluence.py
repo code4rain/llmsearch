@@ -33,6 +33,11 @@ from ..models import Document, SyncResult
 from ..summarize import _sanitize_segment
 
 MAX_PAGES_PER_TREE = 500  # 폭주 방지 상한 — 초과분은 다음 스펙 개정에서 페이징
+# http_client.py의 _MAX_CHILD_PAGES(자식 목록 페이지네이션 하드 캡)는 이 상한보다 항상
+# 먼저/더 크게 걸려야 한다 — _MAX_CHILD_PAGES가 여기 MAX_PAGES_PER_TREE보다 작아 자식
+# 목록 자체가 조용히 잘리면 safe/unsafe 라운드 판정(truncated 플래그)에 그 잘림이 전혀
+# 보이지 않아 삭제 오판(진짜 삭제가 아닌데 안전 라운드로 오인)이 날 수 있다. 두 상수를
+# 손댈 때는 이 관계(_MAX_CHILD_PAGES 유효 상한 ≥ MAX_PAGES_PER_TREE)를 유지할 것.
 MAX_CONSECUTIVE_MISSES = 3  # 이 횟수만큼 연속 KeyError가 나야 "진짜 삭제"로 확정
 
 
@@ -120,7 +125,7 @@ def sync_confluence(client: AtlassianClient, page_ids: list[str], state: dict,
                         expired_misses.add(pid)  # 연속 3회 미스 — 진짜 삭제로 확정
                     else:
                         versions[pid] = prev_versions[pid]
-                        mirrors[pid] = prev_mirrors[pid]
+                        mirrors[pid] = prev_mirrors.get(pid, "")  # 손상된 상태 방어 — KeyError로 전체 중단 방지
                         misses[pid] = miss
                 continue  # 접근 불가 페이지는 건너뛰고 트리 나머지 계속 (부분 격리)
             queue.extend(client.child_page_ids(pid))
@@ -155,7 +160,7 @@ def sync_confluence(client: AtlassianClient, page_ids: list[str], state: dict,
             # 실패/잘림이 있었던 라운드에서는 "안 보인 페이지"를 삭제로 오판하지 않고
             # 이전 상태를 그대로 이월한다(그 하위 트리는 애초에 순회되지 않았을 수 있음).
             versions[pid] = prev_versions[pid]
-            mirrors[pid] = prev_mirrors[pid]
+            mirrors[pid] = prev_mirrors.get(pid, "")  # 손상된 상태 방어 — KeyError로 전체 중단 방지
             if pid in prev_misses:
                 misses[pid] = prev_misses[pid]
             continue

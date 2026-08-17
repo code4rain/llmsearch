@@ -7,6 +7,15 @@ from pathlib import Path
 from .urls import parse_atlassian_url
 
 
+def _same_target(a: dict, b: dict) -> bool:
+    """URL 표기가 달라도 같은 confluence page_id / jira key를 가리키는지 비교한다."""
+    if a["kind"] == "confluence_page":
+        return a.get("page_id") == b.get("page_id")
+    if a["kind"] == "jira_issue":
+        return a.get("key") == b.get("key")
+    return False
+
+
 class Registry:
     def __init__(self, path: Path):
         self.path = path
@@ -27,7 +36,9 @@ class Registry:
         items = self._load()
         for it in items:
             if it["url"] == url:
-                return it  # 중복 등록은 기존 항목 반환
+                return it  # 완전히 같은 URL 재등록은 기존 항목 반환
+            if it["kind"] == parsed["kind"] and _same_target(it, parsed):
+                return it  # URL 표기가 달라도(쿼리 vs 경로 형태 등) 같은 page_id/key면 중복 추가 안 함
         items.append(parsed)
         self._save(items)
         return parsed

@@ -10,6 +10,10 @@ from .auth import AtlassianAuth
 
 _CHILD_LIMIT = 100
 _MAX_CHILD_PAGES = 20  # 하드 캡: limit=100일 때 최대 2000개 자식, MAX_PAGES_PER_TREE=500 훨씬 초과
+# 이 절단(최대 2000개)은 connectors/confluence.py의 safe/unsafe 라운드 판정에는 보이지
+# 않는다(child_page_ids는 그냥 잘린 목록을 반환할 뿐 truncated를 알리지 않음) — 그래도
+# 안전한 이유는 2000 ≫ MAX_PAGES_PER_TREE(500)라 트리 순회가 항상 confluence.py 쪽
+# 상한에 먼저 걸리기 때문이다. 두 상수를 조정할 때는 이 관계를 유지할 것.
 
 
 class HttpAtlassianClient:

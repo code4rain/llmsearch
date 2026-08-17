@@ -4,6 +4,9 @@ from pathlib import Path
 import httpx
 from fastapi.testclient import TestClient
 
+from llmsearch.atlassian.registry import Registry
+from llmsearch.web.app import SOURCES, _scheduled_sources
+
 from llmsearch.atlassian.client import FakeAtlassianClient
 from llmsearch.config import Config
 from llmsearch.embeddings import FakeEmbeddings
@@ -115,6 +118,34 @@ def test_jira_401_resets_client_and_guides_reauth(tmp_path: Path):
     assert "인증이 만료되었습니다" in body["error"]
     state = client.app.state.llmsearch
     assert state["atlassian_client"] is None
+
+
+def test_registry_dedups_by_page_id_across_different_url_forms(tmp_path: Path):
+    """같은 confluence page_id/jira key가 이미 등록돼 있으면 URL 표기가 달라도(pageId
+    쿼리 파라미터 vs /pages/<id> 경로 형태) 중복 추가하지 않는다."""
+    registry = Registry(tmp_path / "atlassian.json")
+    first = registry.add("https://wiki/pages/viewpage.action?pageId=123")
+    second = registry.add("https://wiki/pages/123/제목")  # 같은 page_id, 다른 URL 표기
+    assert first["page_id"] == second["page_id"] == "123"
+    assert len(registry.list()) == 1
+
+
+def test_scheduled_sources_skips_confluence_jira_when_registry_empty(tmp_path: Path):
+    """registry에 등록이 하나도 없으면 스케줄러는 confluence/jira를 건너뛴다 — 30분마다
+    무의미한 인증 오류 로그가 쌓이는 것을 방지한다."""
+    state = {"registry": Registry(tmp_path / "atlassian.json")}
+    scheduled = _scheduled_sources(state)
+    assert "confluence" not in scheduled
+    assert "jira" not in scheduled
+    assert set(scheduled) == set(SOURCES) - {"confluence", "jira"}
+
+
+def test_scheduled_sources_includes_confluence_jira_when_registered(tmp_path: Path):
+    registry = Registry(tmp_path / "atlassian.json")
+    registry.add("https://wiki/pages/viewpage.action?pageId=123")
+    registry.add("https://jira/browse/PROJ-1")
+    scheduled = _scheduled_sources({"registry": registry})
+    assert "confluence" in scheduled and "jira" in scheduled
 
 
 def test_open_registered_http_url(tmp_path: Path, monkeypatch):

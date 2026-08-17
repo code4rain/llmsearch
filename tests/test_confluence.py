@@ -167,6 +167,27 @@ def test_empty_mirror_dir_pruned_on_delete(tmp_path: Path):
     assert grandchild_dir.parent.exists()  # .../ENG/루트 — 자식__2.md가 남아있어 유지됨
 
 
+def test_unsafe_round_carryover_survives_missing_mirror_entry(tmp_path: Path):
+    """이월 대상 pid가 prev_versions엔 있지만(예: 손상/구버전 상태 파일) prev_mirrors엔
+    없는 방어적 상황에서도 KeyError로 sync 전체가 중단되지 않아야 한다."""
+    c = make_client()
+    r1 = sync_confluence(c, ["1"], {}, tmp_path)
+    corrupted_state = dict(r1.state)
+    corrupted_mirrors = dict(corrupted_state["mirrors"])
+    del corrupted_mirrors["3"]  # "3"의 미러 항목만 누락된 손상 상태를 흉내낸다
+    corrupted_state["mirrors"] = corrupted_mirrors
+
+    monkeypatch_target = confluence.MAX_PAGES_PER_TREE
+    confluence.MAX_PAGES_PER_TREE = 2  # 강제로 잘라 UNSAFE 라운드를 만든다("3"은 순회 밖)
+    try:
+        r2 = sync_confluence(c, ["1"], corrupted_state, tmp_path)
+    finally:
+        confluence.MAX_PAGES_PER_TREE = monkeypatch_target
+
+    assert r2.deleted_ids == []
+    assert r2.state["mirrors"]["3"] == ""  # 누락분은 빈 문자열로 방어적 이월
+
+
 def test_unknown_root_keyerror_keeps_round_safe(tmp_path: Path):
     """처음 보는(미등록/오탈자) 루트의 KeyError는 지킬 이전 자식이 없으므로
     라운드를 UNSAFE로 만들지 않는다 — 같은 호출 안의 진짜 삭제는 정상 반영된다."""
