@@ -27,10 +27,11 @@ def index_documents(conn: sqlite3.Connection, docs: list[Document], embedder: Em
         if row:
             _delete_doc_rows(conn, row[0])
         cur = conn.execute(
-            "INSERT INTO documents(source_type, source_id, title, url_or_path, updated_at, content_indexed, extra_json)"
-            " VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO documents(source_type, source_id, title, url_or_path, updated_at, content_indexed, para_path, extra_json)"
+            " VALUES (?,?,?,?,?,?,?,?)",
             (doc.source_type, doc.source_id, doc.title, doc.url_or_path,
-             doc.updated_at.isoformat(), int(doc.content_indexed), json.dumps(doc.extra, ensure_ascii=False)),
+             doc.updated_at.isoformat(), int(doc.content_indexed),
+             doc.extra.get("para_path"), json.dumps(doc.extra, ensure_ascii=False)),
         )
         doc_id = cur.lastrowid
         # 청크 헤더에 제목·날짜 포함 (스펙 §8 청킹)
