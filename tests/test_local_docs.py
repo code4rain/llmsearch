@@ -378,3 +378,91 @@ def test_vision_not_used_for_non_pptx(tmp_path, monkeypatch):
         state={}, prior_map={}, renderer=renderer,
     )
     assert renderer.calls == []
+
+
+def test_vision_rescues_garbled_text(tmp_path, monkeypatch):
+    """핵심: garbled 텍스트(50자 미만)가 비전 설명으로 보완되면 content_indexed=True로 정상 인덱싱된다."""
+    from llmsearch.connectors import local_docs
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+
+    src = tmp_path / "docs"
+    src.mkdir()
+    ppt = src / "garbled_to_rescued_with_very_long_filename_for_vision_description.pptx"
+    ppt.write_bytes(b"fake")
+    # extract_text가 40자만 반환(garbled 임계 50 미만) → DRM 폴백 상황인데
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "짧은 표지 텍스트 뿐")
+    # 비전 설명이 추가되면 총 길이가 50자 이상이 되어 garbled 회피
+    renderer = FakeSlideRenderer(
+        images={"garbled_to_rescued_with_very_long_filename_for_vision_description.pptx": [b"p1"] * 5}
+    )
+
+    r = local_docs.sync_local_docs(
+        folders=[src], excludes=[], overrides=[], summarizer=FakeSummarizer(),
+        summaries_dir=tmp_path / "sum", projects=[], areas=[], glossary="", class_rules="",
+        state={}, prior_map={}, renderer=renderer,
+    )
+    assert len(r.documents) == 1
+    d = r.documents[0]
+    assert d.content_indexed is True  # 비전 보완으로 가능해짐
+    assert "비전 설명" in d.text
+
+
+def test_vision_augment_empty_images_no_augmentation():
+    """렌더러가 빈 이미지 리스트 반환 → 원문 그대로(증강 없음, DRM 폴백)."""
+    from llmsearch.connectors.local_docs import _augment_with_vision
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+    from pathlib import Path
+
+    renderer = FakeSlideRenderer(images={"test.pptx": []})  # 빈 리스트
+    text = "짧은 텍스트"
+    path = Path("test.pptx")
+    result = _augment_with_vision(path, text, renderer, FakeSummarizer())
+    assert result == text  # 변경 없음
+
+
+def test_vision_augment_whitespace_only_description_no_augmentation():
+    """describe_images가 공백만 반환 → 원문 그대로(증강 없음)."""
+    from llmsearch.connectors.local_docs import _augment_with_vision
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+    from pathlib import Path
+
+    class WhitespaceSummarizer(FakeSummarizer):
+        def describe_images(self, title, images):
+            return "   "  # 공백만
+
+    renderer = FakeSlideRenderer(images={"test.pptx": [b"p1"]})
+    text = "짧은 텍스트"
+    path = Path("test.pptx")
+    result = _augment_with_vision(path, text, renderer, WhitespaceSummarizer())
+    assert result == text  # 변경 없음
+
+
+def test_vision_augment_boundary_199_chars():
+    """정확히 199자: VISION_MIN_CHARS 미만이므로 증강 시도 → 렌더러 호출됨."""
+    from llmsearch.connectors.local_docs import _augment_with_vision
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+    from pathlib import Path
+
+    renderer = FakeSlideRenderer(images={"test.pptx": [b"p1"]})
+    text = "x" * 199  # 정확히 199자
+    path = Path("test.pptx")
+    _augment_with_vision(path, text, renderer, FakeSummarizer())
+    assert len(renderer.calls) == 1  # 렌더러가 호출됨
+
+
+def test_vision_augment_boundary_200_chars():
+    """정확히 200자: VISION_MIN_CHARS 이상이므로 증강 스킵 → 렌더러 호출 안 됨."""
+    from llmsearch.connectors.local_docs import _augment_with_vision
+    from llmsearch.render import FakeSlideRenderer
+    from llmsearch.summarize import FakeSummarizer
+    from pathlib import Path
+
+    renderer = FakeSlideRenderer(images={"test.pptx": [b"p1"]})
+    text = "x" * 200  # 정확히 200자
+    path = Path("test.pptx")
+    _augment_with_vision(path, text, renderer, FakeSummarizer())
+    assert len(renderer.calls) == 0  # 렌더러가 호출되지 않음
