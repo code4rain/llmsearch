@@ -55,6 +55,30 @@ def test_sanitize_segment_truncates_and_collapses_whitespace():
     assert _sanitize_segment('bad\\/:*?"<>|name') == "bad name"
 
 
+def test_sanitize_segment_dot_only_rejected():
+    """경로 탈출(".."/".")로 해석될 수 있는 순수 점(.) 세그먼트는 "_"로 대체한다."""
+    assert _sanitize_segment("..") == "_"
+    assert _sanitize_segment(".") == "_"
+    assert _sanitize_segment("...") == "_"
+
+
+def test_sanitize_segment_strips_trailing_dot_and_space():
+    """Windows는 파일/폴더명 끝의 점·공백을 금지한다 — 후행 점/공백은 제거한다."""
+    assert _sanitize_segment("이름.") == "이름"
+    assert _sanitize_segment("이름...") == "이름"
+    assert _sanitize_segment("이름  ") == "이름"
+
+
+def test_sanitize_segment_windows_reserved_name_prefixed():
+    """Windows 예약 디바이스명은 대소문자 무관하게 앞에 "_"를 붙여 충돌을 피한다."""
+    assert _sanitize_segment("CON") == "_CON"
+    assert _sanitize_segment("con") == "_con"
+    assert _sanitize_segment("COM1") == "_COM1"
+    assert _sanitize_segment("lpt9") == "_lpt9"
+    assert _sanitize_segment("NUL") == "_NUL"
+    assert _sanitize_segment("일반제목") == "일반제목"  # 예약명이 아니면 그대로
+
+
 def test_fake_describe_filename():
     d = FakeSummarizer().describe_filename("2026_상반기_실적보고_v3.pptx")
     assert "실적보고" in d

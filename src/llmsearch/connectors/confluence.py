@@ -44,9 +44,22 @@ def _parse_dt(value: str) -> datetime:
 
 
 def _mirror_path(mirror_dir: Path, page: dict) -> Path:
+    """미러 파일 경로를 계산한다 — 원격(Confluence) 제목이 경로 세그먼트로 쓰이므로
+    2계층 방어를 적용한다 (스펙 §7.2 P0 보안, ancestor 제목 ".." 경로 탈출 방지).
+
+    1계층: `_sanitize_segment`가 세그먼트 단위에서 순수 점(".."/".") 등을 걸러낸다.
+    2계층: 그래도 최종 경로가 mirror_dir 밖을 가리키면(살균 우회/예상 못한 케이스 대비)
+      제목__id 형태의 평면(flat) 경로로 폴백한다 — 항상 mirror_dir 바로 아래에 위치.
+    """
     parts = [_sanitize_segment(page["space"])] + [_sanitize_segment(a) for a in page["ancestors"]]
     name = f"{_sanitize_segment(page['title'])}__{page['id']}.md"
-    return mirror_dir.joinpath(*parts, name)
+    resolved_root = mirror_dir.resolve()
+    candidate = mirror_dir.joinpath(*parts, name)
+    try:
+        candidate.resolve().relative_to(resolved_root)
+    except ValueError:
+        candidate = mirror_dir / name  # flat fallback — mirror_dir 직하
+    return candidate
 
 
 def _page_document(page: dict, mirror: Path) -> Document:

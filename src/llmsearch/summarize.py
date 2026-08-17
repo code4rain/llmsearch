@@ -10,6 +10,12 @@ MAX_SUMMARY_INPUT_CHARS = 30000
 # Windows에서 파일/폴더명에 금지된 문자(\/:*?"<>|) + 제어문자
 _INVALID_SEGMENT_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _MAX_SEGMENT_LEN = 80
+# Windows 예약 디바이스명 — 대소문자 무관, 확장자 없이 정확히 일치할 때만 대상 (스펙 §7.2 보안)
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
 
 
 @dataclass
@@ -29,11 +35,23 @@ def _sanitize_segment(name: str) -> str:
       새로 만들지 않도록 여기서 함께 제거한다. 예: "a/b" → "a b" (단일 세그먼트 유지).
     - 연속 공백은 하나로 모으고 양끝 공백을 제거한다.
     - 80자로 자른다.
+    - 순수 점(.)으로만 구성되면("..", ".") 경로 탈출/자기참조로 해석될 수 있으므로 "_"로
+      대체한다 (스펙 §7.2 P0 — Confluence ancestor 제목이 ".."일 때 미러 경로가 mirror_dir
+      밖으로 탈출하는 것을 막는 방어 1계층).
+    - 후행 점·공백은 제거한다 (Windows는 파일/폴더명 끝의 점·공백을 금지).
+    - Windows 예약 디바이스명(CON, PRN, AUX, NUL, COM1-9, LPT1-9, 대소문자 무관)이면 앞에
+      "_"를 붙인다.
     - 결과가 빈 문자열이면 "일반"으로 대체한다.
     """
     cleaned = _INVALID_SEGMENT_CHARS.sub(" ", name)
     cleaned = " ".join(cleaned.split())
     cleaned = cleaned[:_MAX_SEGMENT_LEN].strip()
+    if cleaned and set(cleaned) <= {"."}:
+        cleaned = "_"
+    else:
+        cleaned = cleaned.rstrip(". ")
+    if cleaned.upper() in _RESERVED_NAMES:
+        cleaned = "_" + cleaned
     return cleaned or "일반"
 
 

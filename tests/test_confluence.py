@@ -2,7 +2,7 @@ from pathlib import Path
 
 from llmsearch.atlassian.client import FakeAtlassianClient
 from llmsearch.connectors import confluence
-from llmsearch.connectors.confluence import sync_confluence
+from llmsearch.connectors.confluence import _mirror_path, sync_confluence
 
 
 def page(pid, title, version=1, ancestors=None, html="<p>본문</p>"):
@@ -59,6 +59,33 @@ def test_inaccessible_root_isolated(tmp_path: Path):
     c = make_client()
     r = sync_confluence(c, ["999", "1"], {}, tmp_path)  # 999는 KeyError
     assert {d.source_id for d in r.documents} == {"1", "2", "3"}  # 나머지 루트는 정상
+
+
+def test_ancestor_dotdot_does_not_escape_mirror_dir(tmp_path: Path):
+    """조상 제목이 ".."이어도 미러 경로는 mirror_dir 밖으로 탈출하지 않는다 (스펙 §7.2 P0 보안).
+
+    _sanitize_segment가 ".."을 "_"로 막는 1계층 방어와, _mirror_path가 최종 경로를
+    relative_to로 재검증하는 2계층 방어(defense in depth)를 함께 확인한다.
+    """
+    outside_marker = tmp_path.parent / "notes"
+    c = FakeAtlassianClient(
+        pages={"9": page("9", "문서", ancestors=["..", "..", "notes"])}
+    )
+    r = sync_confluence(c, ["9"], {}, tmp_path)
+    mirror = Path(r.documents[0].extra["mirror_path"])
+    assert mirror.exists()
+    mirror.resolve().relative_to(tmp_path.resolve())  # ValueError면 탈출 — 테스트 실패
+    assert not outside_marker.exists()
+
+
+def test_mirror_path_layer2_falls_back_when_sanitize_bypassed(tmp_path: Path, monkeypatch):
+    """1계층(_sanitize_segment)이 우회되더라도 _mirror_path의 relative_to 재검증이
+    mirror_dir 밖 경로를 평면(flat) 폴백으로 막아야 한다 (defense in depth)."""
+    monkeypatch.setattr(confluence, "_sanitize_segment", lambda s: s)  # 살균 우회 시뮬레이션
+    p = page("9", "문서", ancestors=["..", "..", "notes"])
+    mirror = _mirror_path(tmp_path, p)
+    mirror.resolve().relative_to(tmp_path.resolve())  # ValueError면 탈출 — 테스트 실패
+    assert mirror.parent == tmp_path  # flat fallback: mirror_dir 직하
 
 
 def test_filesystem_unsafe_title_sanitized(tmp_path: Path):
