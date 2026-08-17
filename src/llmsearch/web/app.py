@@ -41,10 +41,35 @@ def _get_outlook_client(state):
         from ..outlook.com_client import ThreadedOutlookClient
         from ..outlook.com_worker import ComWorker
 
-        worker = ComWorker()
-        state["outlook_worker"] = worker
+        worker = state.get("outlook_worker")
+        if worker is None:
+            worker = ComWorker()
+            state["outlook_worker"] = worker
         state["outlook_client"] = ThreadedOutlookClient(worker)
     return state["outlook_client"]
+
+
+def _get_slide_renderer(state):
+    """Windows에서만 PowerPoint COM 렌더러를 지연 생성 — 그 외 환경은 None(비전 보완 생략).
+
+    ComWorker는 Outlook 클라이언트와 공유한다(STA 스레드 1개로 직렬화). 아직 없으면
+    여기서 만들어 state["outlook_worker"]에 둔다 — 이후 _get_outlook_client도 재사용.
+    """
+    if "slide_renderer" not in state:
+        import os
+
+        if hasattr(os, "startfile"):
+            from ..outlook.com_worker import ComWorker
+            from ..render import PowerPointRenderer
+
+            worker = state.get("outlook_worker")
+            if worker is None:
+                worker = ComWorker()
+                state["outlook_worker"] = worker
+            state["slide_renderer"] = PowerPointRenderer(worker)
+        else:
+            state["slide_renderer"] = None
+    return state["slide_renderer"]
 
 
 def _get_atlassian_client(state):
@@ -113,6 +138,7 @@ def run_sync(state: dict, source: str) -> dict:
                     projects=cfg.projects, areas=cfg.areas,
                     glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
                     state=prev, prior_map=prior_map,
+                    renderer=_get_slide_renderer(state),
                 )
             elif source == "outlook_mail":
                 client = _get_outlook_client(state)
@@ -158,7 +184,8 @@ def run_sync(state: dict, source: str) -> dict:
 
 
 def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
-               outlook_client=None, atlassian_client=None, enable_scheduler: bool = True) -> FastAPI:
+               outlook_client=None, atlassian_client=None, slide_renderer=None,
+               enable_scheduler: bool = True) -> FastAPI:
     if embedder is None:
         from ..embeddings import GeminiEmbeddings
         embedder = GeminiEmbeddings(model=config.embed_model)
@@ -182,6 +209,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
              "atlassian_client": atlassian_client,
              "registry": Registry(config.data_dir / "atlassian.json")}
+    if slide_renderer is not None:
+        state["slide_renderer"] = slide_renderer
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
