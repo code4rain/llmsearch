@@ -52,7 +52,8 @@ function esc(s) {
 async function loadSources() {
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
-    `<tr><td>${esc(s.source)}</td><td>${esc(s.doc_count)}</td><td>${esc(s.last_sync ?? '-')}` +
+    `<tr><td>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
+    `<td>${esc(s.doc_count)}</td><td>${esc(s.last_sync ?? '-')}` +
     `${s.last_error ? ' ⚠️' : ''}</td>` +
     `<td><button onclick="syncNow('${esc(s.source)}')">동기화</button></td></tr>`).join('');
 }

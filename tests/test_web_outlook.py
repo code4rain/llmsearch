@@ -48,6 +48,18 @@ def test_mail_sync_and_search(tmp_path: Path):
     assert mail_status["backlog"] is False
 
 
+def test_static_index_html_renders_backlog_badge():
+    """FINDING 3: backlog=true sources must show a visible badge in the sources tab.
+
+    API-level backlog field coverage lives in test_mail_sync_and_search; this checks
+    the static template actually renders something for it.
+    """
+    html_path = Path(__file__).parent.parent / "src" / "llmsearch" / "web" / "static" / "index.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert "s.backlog" in html
+    assert "수집 중" in html
+
+
 def test_cal_sync(tmp_path: Path):
     client = make_client(tmp_path, outlook=fake_outlook())
     assert client.post("/api/sync/outlook_cal").json()["indexed"] == 1
