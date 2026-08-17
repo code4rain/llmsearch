@@ -25,11 +25,17 @@ def sync_notes(folders: list[Path], excludes: list[str], state: dict) -> SyncRes
             sid = str(path.resolve())
             if is_excluded(sid, None, path.parent.name, excludes):
                 continue
-            mtime = path.stat().st_mtime
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
             seen[sid] = mtime
             if prev.get(sid) == mtime:
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
             documents.append(
                 Document(
                     source_type="notes", source_id=sid, title=_title_of(path, text),

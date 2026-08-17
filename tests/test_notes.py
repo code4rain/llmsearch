@@ -40,3 +40,34 @@ def test_exclude(tmp_path: Path):
     (tmp_path / "비밀" / "s.md").write_text("x", encoding="utf-8")
     result = sync_notes([tmp_path], ["path:**/비밀/**"], {})
     assert result.documents == []
+
+
+def test_broken_symlink_isolation(tmp_path: Path):
+    (tmp_path / "good.md").write_text("# 정상", encoding="utf-8")
+    (tmp_path / "broken.md").symlink_to(tmp_path / "nonexistent")
+    result = sync_notes([tmp_path], [], {})
+    assert len(result.documents) == 1
+    assert result.documents[0].source_id.endswith("good.md")
+
+
+def test_unreadable_file_isolation(tmp_path: Path, monkeypatch):
+    (tmp_path / "good.md").write_text("# 정상", encoding="utf-8")
+    unreadable = tmp_path / "unreadable.md"
+    unreadable.write_text("# 불가능", encoding="utf-8")
+    r1 = sync_notes([tmp_path], [], {})
+    assert len(r1.documents) == 2
+    unreadable_sid = str(unreadable.resolve())
+    assert unreadable_sid in r1.state["files"]
+
+    def mock_read_text(self, *args, **kwargs):
+        if self.name == "unreadable.md":
+            raise PermissionError("mock permission denied")
+        return self._original_read_text(*args, **kwargs)
+
+    original_read_text = Path.read_text
+    monkeypatch.setattr(Path, "read_text", mock_read_text)
+    Path._original_read_text = original_read_text
+
+    r2 = sync_notes([tmp_path], [], r1.state)
+    assert len(r2.documents) == 0
+    assert unreadable_sid in r2.state["files"]
