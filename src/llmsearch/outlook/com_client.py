@@ -5,7 +5,7 @@ ComOutlookClient는 반드시 ComWorker 스레드에서 생성·사용해야 한
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 from .com_worker import ComWorker
@@ -13,6 +13,38 @@ from .com_worker import ComWorker
 _FOLDER_IDS = {"inbox": 6, "sent": 5}  # OlDefaultFolders 상수
 _CALENDAR_ID = 9
 _RESTRICT_FMT = "%m/%d/%Y %I:%M %p"  # Outlook Restrict가 요구하는 미국식 포맷
+
+
+def _filter_mail(mails: list[dict], since: datetime, until: datetime | None = None) -> list[dict]:
+    """Exact mail filtering: received_at > since AND (<= until if until given).
+
+    Outlook Restrict truncates to minute, so COM-side window is widened by 1 minute.
+    This filter applies exact boundary semantics for since-exclusive, until-inclusive.
+    """
+    out = []
+    for mail in mails:
+        received = mail["received_at"]
+        if received <= since:  # Exclude since boundary
+            continue
+        if until is not None and received > until:  # Exclude beyond until boundary
+            continue
+        out.append(mail)
+    return out
+
+
+def _filter_appointments(appts: list[dict], window_start: datetime,
+                        window_end: datetime) -> list[dict]:
+    """Exact appointment filtering: end > window_start AND start < window_end (overlap).
+
+    Outlook Restrict truncates to minute, so COM-side window is widened.
+    This filter applies exact overlap semantics.
+    """
+    out = []
+    for appt in appts:
+        if appt["end"] <= window_start or appt["start"] >= window_end:
+            continue
+        out.append(appt)
+    return out
 
 
 class ComOutlookClient:
@@ -23,9 +55,14 @@ class ComOutlookClient:
         self._ns = self._app.GetNamespace("MAPI")
 
     def _folder(self, name: str):
+        """Resolve folder by name.
+
+        For known folders (inbox, sent), use OlDefaultFolders constant.
+        For custom folders, search only 1 level deep: inbox's siblings and direct children.
+        """
         if name in _FOLDER_IDS:
             return self._ns.GetDefaultFolder(_FOLDER_IDS[name])
-        # 커스텀 폴더: 기본 스토어의 받은편지함 형제/하위에서 이름으로 탐색
+        # 커스텀 폴더: 기본 스토어의 받은편지함 형제/하위에서 이름으로 탐색 (1단계만)
         inbox = self._ns.GetDefaultFolder(6)
         for candidate in (inbox.Folders, inbox.Parent.Folders):
             for f in candidate:
@@ -57,24 +94,34 @@ class ComOutlookClient:
                   limit: int | None = None) -> list[dict]:
         items = self._folder(folder).Items
         items.Sort("[ReceivedTime]", False)  # 오름차순
-        query = f"[ReceivedTime] > '{since.strftime(_RESTRICT_FMT)}'"
+        # Widen Restrict window by 1 minute to account for minute truncation
+        since_widened = since - timedelta(minutes=1)
+        query = f"[ReceivedTime] > '{since_widened.strftime(_RESTRICT_FMT)}'"
         if until is not None:
             query += f" AND [ReceivedTime] <= '{until.strftime(_RESTRICT_FMT)}'"
         restricted = items.Restrict(query)
-        out: list[dict] = []
+        mails: list[dict] = []
         for item in restricted:
             if getattr(item, "Class", None) != 43:  # olMail만 (회의요청 등 제외)
                 continue
-            out.append(self._mail_dict(item, folder))
-            if limit is not None and len(out) >= limit:
-                break
-        return out
+            mails.append(self._mail_dict(item, folder))
+        # Apply exact filter BEFORE limit truncation
+        filtered = _filter_mail(mails, since, until)
+        if limit is not None:
+            return filtered[:limit]
+        return filtered
 
     def list_mail_ids(self, folder: str, since: datetime) -> set[str]:
         items = self._folder(folder).Items
         items.Sort("[ReceivedTime]", False)
-        restricted = items.Restrict(f"[ReceivedTime] > '{since.strftime(_RESTRICT_FMT)}'")
-        return {item.EntryID for item in restricted if getattr(item, "Class", None) == 43}
+        # Widen Restrict window by 1 minute to account for minute truncation
+        since_widened = since - timedelta(minutes=1)
+        restricted = items.Restrict(f"[ReceivedTime] > '{since_widened.strftime(_RESTRICT_FMT)}'")
+        mails = [self._mail_dict(item, folder) for item in restricted
+                 if getattr(item, "Class", None) == 43]
+        # Apply exact filter
+        filtered = _filter_mail(mails, since)
+        return {mail["entry_id"] for mail in filtered}
 
     def open_item(self, entry_id: str) -> None:
         self._ns.GetItemFromID(entry_id).Display()  # Outlook 창으로 표시 (스펙 §7.4)
@@ -83,21 +130,26 @@ class ComOutlookClient:
         items = self._ns.GetDefaultFolder(_CALENDAR_ID).Items
         items.Sort("[Start]")            # IncludeRecurrences 전에 Sort 필수 (Outlook 규약)
         items.IncludeRecurrences = True  # 반복 일정 전개 — Restrict로 기간 한정 (스펙 §7.5)
-        query = (f"[Start] >= '{window_start.strftime(_RESTRICT_FMT)}'"
-                 f" AND [Start] <= '{window_end.strftime(_RESTRICT_FMT)}'")
-        out: list[dict] = []
+        # Widen window by 1 minute to account for minute truncation in Restrict
+        window_start_widened = window_start - timedelta(minutes=1)
+        window_end_widened = window_end + timedelta(minutes=1)
+        # Overlap semantics: start <= window_end AND end >= window_start
+        query = (f"[Start] <= '{window_end_widened.strftime(_RESTRICT_FMT)}'"
+                 f" AND [End] >= '{window_start_widened.strftime(_RESTRICT_FMT)}'")
+        appts: list[dict] = []
         for item in items.Restrict(query):
             start, end = item.Start, item.End
-            out.append({
+            appts.append({
                 "entry_id": item.EntryID,
                 "subject": item.Subject or "(제목 없음)",
                 "body": item.Body or "",
                 "location": item.Location or "",
-                "start": datetime(start.year, start.month, start.day, start.hour, start.minute),
-                "end": datetime(end.year, end.month, end.day, end.hour, end.minute),
+                "start": datetime(start.year, start.month, start.day, start.hour, start.minute, start.second),
+                "end": datetime(end.year, end.month, end.day, end.hour, end.minute, end.second),
                 "attendees": (getattr(item, "RequiredAttendees", "") or ""),
             })
-        return out
+        # Apply exact overlap filter
+        return _filter_appointments(appts, window_start, window_end)
 
 
 class ThreadedOutlookClient:
@@ -117,10 +169,7 @@ class ThreadedOutlookClient:
         return self._worker.submit(run)
 
     def is_available(self) -> bool:
-        try:
-            return self._call("is_available")
-        except Exception:
-            return False
+        return self._call("is_available")
 
     def list_mail(self, folder, since, until=None, limit=None):
         return self._call("list_mail", folder, since, until=until, limit=limit)
