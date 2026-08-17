@@ -111,6 +111,25 @@ def test_forwarded_message_separator_cuts():
     assert "원본 메일" not in out
 
 
+def test_cuts_outlook_standard_reply_header_block():
+    """Standard Korean Outlook reply header block (보낸 사람:/보낸 날짜:/받는 사람:/제목:) must cut.
+
+    Regression for FINDING 1: '보낸 날짜:' was not in _CORROBORATION_MARKERS, so the
+    lookahead in _has_corroboration broke before reaching '받는 사람:' two lines later.
+    """
+    body = (
+        "회신 본문입니다.\n\n"
+        "보낸 사람: 김철수 <kim@corp.com>\n"
+        "보낸 날짜: 2026년 8월 17일 월요일 오전 9:00\n"
+        "받는 사람: 나\n"
+        "제목: 회의 일정\n"
+        "이전 메일 전문"
+    )
+    out = clean_mail_body(body)
+    assert "회신 본문" in out
+    assert "이전 메일 전문" not in out
+
+
 def test_quote_lines_with_blanks_in_tail():
     """Quote tail with blank lines interspersed must still cut (blanks OK)."""
     body = (

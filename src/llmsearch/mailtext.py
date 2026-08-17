@@ -24,6 +24,7 @@ _CORROBORATION_MARKERS = [
     re.compile(r"^제목\s?:\s*"),
     re.compile(r"^Date:\s*", re.IGNORECASE),
     re.compile(r"^날짜\s?:\s*"),
+    re.compile(r"^보낸 날짜\s?:\s*"),
     re.compile(r"^Sent:\s*", re.IGNORECASE),
     re.compile(r"^Cc:\s*", re.IGNORECASE),
     re.compile(r"^참조\s?:\s*"),
