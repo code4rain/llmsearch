@@ -16,10 +16,24 @@ from .. import db, indexer, search
 from ..config import Config
 from ..connectors.local_docs import sync_local_docs
 from ..connectors.notes import sync_notes
+from ..connectors.outlook_cal import sync_outlook_cal
+from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..rules import load_rules_md
 
 STATIC_DIR = Path(__file__).parent / "static"
-SOURCES = ("notes", "local_docs")
+SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal")
+
+
+def _get_outlook_client(state):
+    """실 클라이언트 지연 생성 — 테스트는 create_app 주입으로 이 경로를 타지 않는다."""
+    if state.get("outlook_client") is None:
+        from ..outlook.com_client import ThreadedOutlookClient
+        from ..outlook.com_worker import ComWorker
+
+        worker = ComWorker()
+        state["outlook_worker"] = worker
+        state["outlook_client"] = ThreadedOutlookClient(worker)
+    return state["outlook_client"]
 
 
 def run_sync(state: dict, source: str) -> dict:
@@ -34,7 +48,7 @@ def run_sync(state: dict, source: str) -> dict:
             rules_md = load_rules_md(cfg.rules_md_path)
             if source == "notes":
                 result = sync_notes(cfg.notes_folders, cfg.exclude, prev)
-            else:  # local_docs
+            elif source == "local_docs":
                 prior_map = {
                     sid: pm for sid in list(prev.get("files", {}))
                     if (pm := indexer.get_para_map(conn, sid))
@@ -46,6 +60,15 @@ def run_sync(state: dict, source: str) -> dict:
                     glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
                     state=prev, prior_map=prior_map,
                 )
+            elif source == "outlook_mail":
+                client = _get_outlook_client(state)
+                result = sync_outlook_mail(
+                    client, cfg.mail_folders, cfg.mail_since_days, cfg.exclude,
+                    prev, batch_size=cfg.mail_batch_size,
+                )
+            else:  # outlook_cal
+                client = _get_outlook_client(state)
+                result = sync_outlook_cal(client, cfg.cal_past_days, cfg.cal_future_days, prev)
             entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
             entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
             for doc in result.documents:
@@ -62,7 +85,7 @@ def run_sync(state: dict, source: str) -> dict:
 
 
 def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
-               enable_scheduler: bool = True) -> FastAPI:
+               outlook_client=None, enable_scheduler: bool = True) -> FastAPI:
     if embedder is None:
         from ..embeddings import GeminiEmbeddings
         embedder = GeminiEmbeddings(model=config.embed_model)
@@ -83,7 +106,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     read_conn = db.open_db(config.db_path)
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
-             "sync_lock": threading.Lock()}
+             "sync_lock": threading.Lock(), "outlook_client": outlook_client}
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -111,9 +134,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         for source in SOURCES:
             row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
             last = next((e for e in state["log"] if e["source"] == source), None)
-            out.append({"source": source, "doc_count": row[0],
-                        "last_sync": last["at"] if last else None,
-                        "last_error": last["error"] if last else None})
+            entry = {"source": source, "doc_count": row[0],
+                     "last_sync": last["at"] if last else None,
+                     "last_error": last["error"] if last else None}
+            if source == "outlook_mail":
+                entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
+            out.append(entry)
         return out
 
     @app.post("/api/sync/{source}")
@@ -125,6 +151,21 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.get("/api/log")
     def log():
         return state["log"]
+
+    @app.post("/api/open")
+    def open_item(payload: dict):
+        target = str(payload.get("url_or_path", ""))
+        try:
+            if target.startswith("outlook:"):
+                _get_outlook_client(state).open_item(target.removeprefix("outlook:"))
+                return {"ok": True}
+            import os
+            if hasattr(os, "startfile"):  # Windows 전용
+                os.startfile(target)  # noqa: S606 — 로컬 개인 도구, 사용자 소유 경로
+                return {"ok": True}
+            return {"ok": False, "error": "파일 열기는 Windows에서만 지원됩니다"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     @app.post("/api/chat")
     def chat(payload: dict):

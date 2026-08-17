@@ -60,6 +60,11 @@ async function syncNow(source) {
   await fetch('/api/sync/' + source, {method: 'POST'});
   loadSources();
 }
+async function openItem(p) {
+  const r = await (await fetch('/api/open', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url_or_path: p})})).json();
+  if (!r.ok) alert(r.error);
+}
 async function loadLog() {
   const data = await (await fetch('/api/log')).json();
   document.getElementById('logBody').textContent = JSON.stringify(data, null, 2);
@@ -100,7 +105,8 @@ async function ask(e) {
           const lock = h.content_indexed ? '' : ' 🔒';
           answerDiv.insertAdjacentHTML('beforeend',
             `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
-            `<code>${esc(h.url_or_path)}</code></div>`);
+            `<code>${esc(h.url_or_path)}</code> ` +
+            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button></div>`);
         }
       }
       box.scrollTop = box.scrollHeight;

@@ -19,6 +19,11 @@ class Config:
     answer_model: str = "claude-opus-5"
     summary_model: str = "gemini-flash-latest"
     embed_model: str = "gemini-embedding-001"
+    mail_folders: list[str] = field(default_factory=lambda: ["inbox", "sent"])
+    mail_since_days: int = 365
+    mail_batch_size: int = 200
+    cal_past_days: int = 90
+    cal_future_days: int = 180
 
     @property
     def db_path(self) -> Path:
@@ -37,6 +42,7 @@ def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     para = raw.get("para", {})
     rules = raw.get("rules", {})
+    outlook = raw.get("outlook", {})
     return Config(
         data_dir=Path(raw["data_dir"]),
         watch_folders=[Path(p) for p in raw.get("watch_folders", [])],
@@ -49,4 +55,9 @@ def load_config(path: Path) -> Config:
         answer_model=raw.get("answer_model", "claude-opus-5"),
         summary_model=raw.get("summary_model", "gemini-flash-latest"),
         embed_model=raw.get("embed_model", "gemini-embedding-001"),
+        mail_folders=list(outlook.get("mail_folders", ["inbox", "sent"])),
+        mail_since_days=int(outlook.get("mail_since_days", 365)),
+        mail_batch_size=int(outlook.get("mail_batch_size", 200)),
+        cal_past_days=int(outlook.get("cal_past_days", 90)),
+        cal_future_days=int(outlook.get("cal_future_days", 180)),
     )

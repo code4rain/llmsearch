@@ -39,3 +39,16 @@ def test_load_config_defaults(tmp_path: Path):
     assert cfg.sync_interval_minutes == 30
     assert cfg.watch_folders == []
     assert cfg.para_overrides == []
+
+
+def test_outlook_config_defaults_and_load(tmp_path: Path):
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "data_dir: /d\noutlook:\n  mail_folders: [\"inbox\"]\n  mail_since_days: 30\n",
+        encoding="utf-8",
+    )
+    cfg = load_config(cfg_file)
+    assert cfg.mail_folders == ["inbox"]
+    assert cfg.mail_since_days == 30
+    assert cfg.mail_batch_size == 200      # 기본값
+    assert cfg.cal_past_days == 90 and cfg.cal_future_days == 180

@@ -8,3 +8,9 @@ rules:
   para_overrides: []                  # 예: - {match: "path:**/경영회의/**", target: "Areas/경영지원"}
   exclude: []                         # 예: - "folder:인사평가"
 sync_interval_minutes: 30
+outlook:
+  mail_folders: ["inbox", "sent"]   # 커스텀 폴더는 Outlook 폴더명 그대로
+  mail_since_days: 365
+  mail_batch_size: 200              # 콜드스타트 1회당 처리량 (재개 가능)
+  cal_past_days: 90
+  cal_future_days: 180
