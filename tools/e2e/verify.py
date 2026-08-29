@@ -202,6 +202,39 @@ with sync_playwright() as p:
           " / ".join(m[:40] for m in dialogs))
     check("전체 재요약: summary +1", usage_today().get("summary", 0) == before.get("summary", 0) + 1)
 
+    # 9.9 M6b — 인덱스 재구축: 요약 md 재사용(summary/vision 불변), 문서 수 복원 (스펙 M6 §6)
+    # 9.5에서 만든 rules.md는 아직 notes 인덱스에 없다 — 먼저 반영해야 재구축 후 수가 일치한다 (notes 2→3)
+    page.request.post(f"{BASE}/api/sync/notes")
+    page.wait_for_timeout(300)
+    before = usage_today()
+    counts_before = {r["source"]: r["doc_count"] for r in page.request.get(f"{BASE}/api/sources").json()}
+    dialogs.clear()
+    page.click("nav >> text=설정")
+    page.click("#rebuildBtn")  # confirm·alert는 dialog 핸들러가 accept
+    page.wait_for_timeout(1000)
+    check("재구축 시작 alert", any("재구축 시작" in m for m in dialogs), " / ".join(m[:40] for m in dialogs))
+    # 재수집은 백그라운드 스레드 — /api/status를 폴링해 기다린다. (wait_for_function에 Promise를 넘기면
+    # Playwright가 pending Promise를 truthy로 보고 즉시 반환하므로 쓰지 않는다.)
+    status = {"rebuilding": True, "rebuild_in_progress": True}
+    for _ in range(60):  # 0.5s × 60 = 30s
+        status = page.request.get(f"{BASE}/api/status").json()
+        if not status["rebuilding"] and not status["rebuild_in_progress"]:
+            break
+        page.wait_for_timeout(500)
+    check("재구축 재수집 완료", not status["rebuilding"] and not status["rebuild_in_progress"], str(status))
+    counts_after = {r["source"]: r["doc_count"] for r in page.request.get(f"{BASE}/api/sources").json()}
+    for src in ("notes", "local_docs", "outlook_mail", "outlook_cal"):
+        check(f"재구축 후 문서 수 복원: {src}", counts_after[src] == counts_before[src],
+              f"{counts_before[src]}→{counts_after[src]}")
+    after = usage_today()
+    check("재구축: summary 불변(요약 md 재사용)", after.get("summary", 0) == before.get("summary", 0))
+    check("재구축: vision 불변", after.get("vision", 0) == before.get("vision", 0))
+    check("재구축: embed 증가", after.get("embed", 0) > before.get("embed", 0))
+    check("재구축: 미등록 jira는 재수집 대상 아님", counts_after["jira"] == 0, f"jira={counts_after['jira']}")
+    page.click("nav >> text=소스")
+    page.wait_for_timeout(300)
+    check("재구축 후 배너 없음", page.locator("#banner").is_hidden())
+
     # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
     #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다
     #     (매직 카운트 금지). 무한 루프 방지로 40회 상한을 두고, 초과 시 check()가 FAIL 처리한다.

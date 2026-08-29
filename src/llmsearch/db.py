@@ -73,9 +73,41 @@ def open_db(path: Path) -> sqlite3.Connection:
     elif int(row[0]) != SCHEMA_VERSION:
         conn.close()
         raise SchemaMismatchError(
-            f"index.db schema v{row[0]} != v{SCHEMA_VERSION}. index.db를 삭제하고 재인덱싱하세요."
+            f"index.db schema v{row[0]} != v{SCHEMA_VERSION}. 설정 탭 [인덱스 재구축] 또는 --rebuild로 재구축하세요."
         )
     return conn
+
+
+def read_legacy_maps(path: Path) -> tuple[list[tuple[str, str, str]], dict]:
+    """스키마 버전 검사 없이 para_map 전체와 local_docs sync_state만 읽는다 (스펙 M6 §6).
+
+    스키마 불일치(M9 임베딩 차원 변경 등)로 open_db가 거부하는 index.db에서 요약 md 매핑을
+    회수하기 위한 진입점 — 두 테이블은 스키마 변경 대상이 아니다. 파일이 없거나 sqlite가
+    아니거나 테이블이 없으면 빈 결과.
+    """
+    if not path.exists():
+        return [], {}
+    try:
+        # 확장(sqlite_vec) 미로드 커넥션 — vec0 가상 테이블은 건드리지 않는다 (SELECT * 금지)
+        conn = sqlite3.connect(path)
+    except sqlite3.Error:
+        return [], {}
+    try:
+        try:
+            rows = [tuple(r) for r in conn.execute(
+                "SELECT source_id, para_path, summary_path FROM para_map ORDER BY source_id").fetchall()]
+        except sqlite3.Error:
+            rows = []
+        try:
+            row = conn.execute("SELECT state_json FROM sync_state WHERE source_type='local_docs'").fetchone()
+            state = json.loads(row[0]) if row else {}
+            if not isinstance(state, dict):
+                state = {}
+        except (sqlite3.Error, ValueError):
+            state = {}
+    finally:
+        conn.close()
+    return rows, state
 
 
 def _pack(vector: list[float]) -> bytes:

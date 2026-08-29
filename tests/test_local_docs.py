@@ -486,3 +486,73 @@ def test_summary_rules_passed_to_summarizer(tmp_path: Path, patch_extract):
         summary_rules="실적 수치는 표로",
     )
     assert s.kwargs["summary_rules"] == "실적 수치는 표로"
+
+
+class _NoCallSummarizer(FakeSummarizer):
+    """force_reindex 재사용 경로는 summarizer를 호출하면 안 된다."""
+
+    def summarize_and_classify(self, *args, **kwargs):
+        raise AssertionError("summarizer가 호출됨 — 요약 md 재사용 실패")
+
+    def describe_filename(self, filename):
+        raise AssertionError("describe_filename 호출됨")
+
+    def describe_images(self, title, images):
+        raise AssertionError("describe_images 호출됨")
+
+
+def _force(tmp_path, docs, state, prior, summarizer=None, folders=None):
+    return local_docs.sync_local_docs(
+        folders=folders if folders is not None else [docs], excludes=[], overrides=[],
+        summarizer=summarizer or _NoCallSummarizer(), summaries_dir=tmp_path / "summaries",
+        projects=["프로젝트A"], areas=[], glossary="", class_rules="",
+        state=state, prior_map=prior, force_reindex=True,
+    )
+
+
+def test_force_reindex_reuses_summary_md_without_llm(tmp_path: Path, patch_extract):
+    docs = tmp_path / "docs"; docs.mkdir()
+    (docs / "킥오프.pptx").write_bytes(b"fake-pptx")
+    first = run(tmp_path, docs)  # 정상 요약 1회 → 요약 md + para 정보
+    d0 = first.documents[0]
+    prior = {d0.source_id: (d0.extra["para_path"], d0.extra["summary_path"])}
+
+    r = _force(tmp_path, docs, first.state, prior)
+    assert len(r.documents) == 1
+    d = r.documents[0]
+    assert d.text == Path(d0.extra["summary_path"]).read_text(encoding="utf-8")  # md 본문 그대로
+    assert d.extra == {"para_path": d0.extra["para_path"], "summary_path": d0.extra["summary_path"]}
+    assert d.content_indexed is True and d.title == "킥오프.pptx" and d.url_or_path == d0.source_id
+    assert r.deleted_ids == [] and r.state["files"][d0.source_id] == first.state["files"][d0.source_id]
+
+
+def test_force_reindex_drm_marker_and_missing_md_fallback(tmp_path: Path, patch_extract):
+    docs = tmp_path / "docs"; docs.mkdir()
+    (docs / "drm.pptx").write_bytes(b"x")       # DRM 폴백 본문 (마커 포함)
+    (docs / "일반.pptx").write_bytes(b"y")
+    first = run(tmp_path, docs)
+    by_sid = {d.source_id: d for d in first.documents}
+    prior = {sid: (d.extra["para_path"], d.extra["summary_path"]) for sid, d in by_sid.items()}
+    drm_sid = next(s for s in by_sid if s.endswith("drm.pptx"))
+    normal_sid = next(s for s in by_sid if s.endswith("일반.pptx"))
+    assert local_docs.DRM_MARKER in by_sid[drm_sid].text
+    Path(prior[normal_sid][1]).unlink()  # 요약 md 소실 → 정상 요약 경로 폴백(LLM 호출)
+
+    r = _force(tmp_path, docs, first.state, prior, summarizer=FakeSummarizer())
+    out = {d.source_id: d for d in r.documents}
+    assert out[drm_sid].content_indexed is False          # 마커로 DRM 판정
+    assert Path(prior[normal_sid][1]).exists()            # 폴백이 md를 다시 생성
+    assert "## 요약" in out[normal_sid].text
+
+
+def test_force_reindex_skips_deletion_and_keeps_unseen_as_sentinel(tmp_path: Path, patch_extract):
+    docs = tmp_path / "docs"; docs.mkdir()
+    (docs / "a.pptx").write_bytes(b"a")
+    first = run(tmp_path, docs)
+    d0 = first.documents[0]
+    prior = {d0.source_id: (d0.extra["para_path"], d0.extra["summary_path"])}
+
+    r = _force(tmp_path, docs, first.state, prior, folders=[tmp_path / "unmounted"])  # 폴더 미마운트
+    assert r.documents == [] and r.deleted_ids == []
+    assert Path(d0.extra["summary_path"]).exists()        # 요약 md unlink 없음
+    assert r.state["files"][d0.source_id] == [0.0, 0]     # 다음 정상 동기화가 재처리

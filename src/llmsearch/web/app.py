@@ -13,10 +13,10 @@ from urllib.parse import urlsplit
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .. import db, indexer, search
+from .. import db, indexer, rebuild, search
 from ..archive import archive_project
 from ..atlassian.auth import diagnose, resolve_auth_candidates
 from ..atlassian.registry import Registry
@@ -191,6 +191,7 @@ def run_sync(state: dict, source: str) -> dict:
                     summary_rules=rules_md.get("요약 규칙", ""),
                     state=prev, prior_map=prior_map,
                     renderer=_get_slide_renderer(state),
+                    force_reindex=bool(state.get("force_reindex_local_docs")),
                 )
             elif source == "outlook_mail":
                 client = _get_outlook_client(state)
@@ -215,6 +216,13 @@ def run_sync(state: dict, source: str) -> dict:
                 if "summary_path" in doc.extra:
                     indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
             indexer.set_sync_state(conn, source, result.state)
+            if source == "local_docs" and state.get("force_reindex_local_docs"):
+                # 플래그는 커넥터가 정상 반환한 뒤에만 소비 — 마커도 이 시점에만 삭제 (스펙 M6 §6).
+                # 영속(마커 삭제 + commit)이 먼저 — 그 뒤에야 인메모리 플래그를 내린다. 순서가
+                # 반대면 커밋 전에 프로세스가 죽었을 때 마커는 남는데 플래그만 꺼진 상태가 된다.
+                rebuild.clear_marker(conn)
+                conn.commit()
+                state["force_reindex_local_docs"] = False
         except httpx.HTTPStatusError as exc:
             conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
             entry["ok"] = False
@@ -258,10 +266,17 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     embedder = CountingEmbedder(embedder, tracker)
     summarizer = CountingSummarizer(summarizer, tracker)
 
-    conn = db.open_db(config.db_path)
-    # 쓰기는 conn(run_sync 전용), 읽기는 read_conn — 동기화 쓰기 트랜잭션 중에도
-    # /api/chat, /api/sources 같은 읽기 요청이 같은 커넥션을 공유하지 않게 분리한다.
-    read_conn = db.open_db(config.db_path)
+    try:
+        conn = db.open_db(config.db_path)
+        # 쓰기는 conn(run_sync 전용), 읽기는 read_conn — 동기화 쓰기 트랜잭션 중에도
+        # /api/chat, /api/sources 같은 읽기 요청이 같은 커넥션을 공유하지 않게 분리한다.
+        read_conn = db.open_db(config.db_path)
+        schema_mismatch = None
+    except db.SchemaMismatchError as exc:
+        # 기동은 살린다 — GUI 배너의 [재구축]으로 복구 (M9 임베딩 차원 변경이 이 경로를 탄다)
+        conn = read_conn = None
+        schema_mismatch = str(exc)
+        _logger.error("index.db 스키마 불일치 — 재구축 필요: %s", exc)
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
@@ -269,9 +284,13 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "jira_client": atlassian_client,
              "registry": Registry(config.data_dir / "atlassian.json"),
              "usage": tracker,
-             "resummarizing": False, "resummarize_lock": threading.Lock()}
+             "resummarizing": False, "resummarize_lock": threading.Lock(),
+             "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
+    if conn is not None and rebuild.marker_present(conn):
+        state["force_reindex_local_docs"] = True  # 이전 재구축이 완료되지 않음 — 배너 [재개]
+        _logger.warning("이전 재구축이 완료되지 않았습니다 — 설정 탭에서 [재개]하세요")
 
     def _require_db() -> None:
         """DB를 만지는 엔드포인트 진입 가드 — 스키마 불일치 상태에서는 503으로 안내 (M6b 배너와 짝)."""
@@ -286,6 +305,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     async def scheduler_loop():
         while True:
             await asyncio.sleep(config.sync_interval_minutes * 60)
+            if state.get("rebuilding"):
+                continue
             for source in _scheduled_sources(state):
                 try:
                     await asyncio.to_thread(run_sync, state, source)
@@ -347,6 +368,51 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 "indexing_allowed": t.indexing_allowed(),
                 "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
 
+    @app.get("/api/status")
+    def status():
+        read_conn = state["read_conn"]
+        return {"schema_mismatch": state.get("schema_mismatch"),
+                "rebuild_in_progress": read_conn is not None and rebuild.marker_present(read_conn),
+                "rebuilding": bool(state.get("rebuilding")),
+                "resummarizing": bool(state.get("resummarizing"))}
+
+    @app.post("/api/rebuild", dependencies=[Depends(local_origin_only)])
+    def rebuild_index(payload: dict):
+        """인덱스 재구축 (스펙 M6 §6). 초기화·복원은 동기, 재수집은 백그라운드 — 진행은 소스 탭·로그 탭."""
+        force = payload.get("force") is True
+        try:
+            rebuild.precheck(state, force=force)
+            rebuild.claim(state)  # 여기부터 rebuilding=True — 동시 POST는 409
+        except rebuild.RebuildRefused as exc:
+            return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": exc.missing_folders})
+        try:
+            info = rebuild.recover_schema_mismatch(state) if state.get("schema_mismatch") else rebuild.reset_index(state)
+            targets = _scheduled_sources(state)
+            rebuild.start_resync(state, run_sync, targets)
+        except Exception:
+            rebuild.release(state)
+            raise
+        return {"ok": True, "phase": "resync", "targets": targets, **info}
+
+    @app.post("/api/rebuild/resume", dependencies=[Depends(local_origin_only)])
+    def rebuild_resume():
+        _require_db()
+        if not rebuild.marker_present(state["read_conn"]):
+            return JSONResponse(status_code=409, content={"detail": "재개할 재구축이 없습니다", "missing_folders": []})
+        try:
+            rebuild.precheck(state, force=True)  # 상한 도달 시 게이트에 막혀 도는 대신 사유를 바로 알린다
+            rebuild.claim(state)
+        except rebuild.RebuildRefused as exc:
+            return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": []})
+        state["force_reindex_local_docs"] = True  # 마커가 진실 원천 — claim 성공 뒤 명시적으로 맞춰둔다
+        try:
+            targets = _scheduled_sources(state)
+            rebuild.start_resync(state, run_sync, targets)
+        except Exception:
+            rebuild.release(state)
+            raise
+        return {"ok": True, "phase": "resync", "targets": targets}
+
     @app.get("/api/rules")
     def rules_get():
         path = config.rules_md_path
@@ -389,9 +455,14 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             raise HTTPException(409, "일일 API 호출 상한 도달 — 상한이 초기화된 뒤 재요약하세요")
         if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
             raise HTTPException(409, "재요약이 이미 진행 중입니다")
-        state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
         try:
             with state["sync_lock"]:
+                # rebuilding 판정과 resummarizing 표시를 같은 락 임계구역 첫 줄에 둔다 — claim()도
+                # 같은 락 안에서 두 플래그를 검사하므로(M6b 리뷰 Important 1·2), 이 순서가 아니면
+                # 재구축과 전체 재요약이 서로를 못 보고 동시에 진행돼 LLM을 이중 호출할 수 있다.
+                if state.get("rebuilding"):
+                    raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 재요약하세요")
+                state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
                 st = indexer.get_sync_state(state["conn"], "local_docs")
                 files = dict(st.get("files", {}))
                 if payload.get("all") is True:
