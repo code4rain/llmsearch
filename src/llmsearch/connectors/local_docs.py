@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -122,7 +123,7 @@ def _cleanup(prior: tuple[str, str] | None) -> None:
         copy.unlink()
 
 
-def _reuse_summary(path: Path, sid: str, st, prior: tuple[str, str] | None) -> Document | None:
+def _reuse_summary(path: Path, sid: str, st: os.stat_result, prior: tuple[str, str] | None) -> Document | None:
     """rebuild 재인덱싱: 기존 요약 md 본문으로 Document를 만든다 — summarizer 미호출 (스펙 M6 §6).
 
     md가 없거나 읽히지 않으면 None → 호출자가 정상 요약 경로로 폴백한다. _place는 호출하지 않는다

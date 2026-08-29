@@ -73,7 +73,7 @@ def open_db(path: Path) -> sqlite3.Connection:
     elif int(row[0]) != SCHEMA_VERSION:
         conn.close()
         raise SchemaMismatchError(
-            f"index.db schema v{row[0]} != v{SCHEMA_VERSION}. index.db를 삭제하고 재인덱싱하세요."
+            f"index.db schema v{row[0]} != v{SCHEMA_VERSION}. 설정 탭 [인덱스 재구축] 또는 --rebuild로 재구축하세요."
         )
     return conn
 

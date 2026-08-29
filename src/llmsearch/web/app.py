@@ -400,6 +400,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if not rebuild.marker_present(state["read_conn"]):
             return JSONResponse(status_code=409, content={"detail": "재개할 재구축이 없습니다", "missing_folders": []})
         try:
+            rebuild.precheck(state, force=True)  # 상한 도달 시 게이트에 막혀 도는 대신 사유를 바로 알린다
             rebuild.claim(state)
         except rebuild.RebuildRefused as exc:
             return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": []})

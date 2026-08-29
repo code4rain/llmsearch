@@ -97,6 +97,31 @@ def test_reset_index_keeps_para_map_and_local_state(tmp_path: Path, monkeypatch)
     assert indexer.delete_all_documents(conn) == 0
 
 
+def test_reset_index_rolls_back_on_failure(tmp_path: Path, monkeypatch):
+    """M6b 최종 리뷰 Important 1: delete_all_documents 실패는 부분 삭제를 커밋하지 않는다 —
+    안 그러면 이후 무관한 sync가 그 부분 삭제 상태를 그대로 이어받는다."""
+    from llmsearch.web.app import run_sync
+
+    _, state = make_state(tmp_path, monkeypatch)
+    run_sync(state, "notes"); run_sync(state, "local_docs")
+    conn = state["conn"]
+    before = doc_count(conn)
+    assert before == 3
+
+    def boom(_conn):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rebuild.indexer, "delete_all_documents", boom)
+
+    with pytest.raises(RuntimeError):
+        rebuild.reset_index(state)
+
+    assert doc_count(conn) == before
+    assert rebuild.marker_present(conn) is False
+    assert conn.in_transaction is False
+    assert state["force_reindex_local_docs"] is False
+
+
 def client_of(app) -> TestClient:
     return TestClient(app, base_url="http://127.0.0.1")
 
@@ -211,6 +236,31 @@ def test_startup_detects_marker_and_resume(tmp_path: Path, monkeypatch):
     assert client.post("/api/rebuild/resume", json={}).status_code == 409  # 재개할 것 없음
 
 
+def test_resume_refused_when_daily_limit_exceeded(tmp_path: Path, monkeypatch):
+    """M6b 최종 리뷰 minor: resume은 claim 전에 precheck(force=True)를 돌린다 — 안 그러면
+    상한이 이미 초과된 상태에서 매 소스마다 게이트에 막혀 도는 스레드만 돌고 사유를 알 수 없다."""
+    app1, state1 = make_state(tmp_path, monkeypatch, daily_limit=1)
+    from llmsearch.web.app import run_sync
+    run_sync(state1, "local_docs")
+    rebuild.reset_index(state1)  # 마커를 남기고 재수집 전에 중단됐다고 가정
+    state1["usage"].record("embed", 5)  # 다음 기동 전에 이미 상한 초과 (usage.json은 data_dir 공유로 영속)
+    state1["conn"].close(); state1["read_conn"].close()
+
+    cfg = state1["config"]
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)
+    state2 = app2.state.llmsearch
+    client = client_of(app2)
+    assert client.get("/api/status").json()["rebuild_in_progress"] is True
+
+    r = client.post("/api/rebuild/resume", json={})
+    assert r.status_code == 409
+    assert "상한" in r.json()["detail"]
+    assert r.json()["missing_folders"] == []
+    assert state2["rebuilding"] is False  # precheck에서 거부 — claim 전이라 선점되지 않음
+
+
 def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
     app1, state1 = make_state(tmp_path, monkeypatch)
     from llmsearch.web.app import run_sync
@@ -246,6 +296,39 @@ def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
     after = state2["usage"].today_by_kind()
     assert after.get("summary", 0) == usage_before.get("summary", 0)  # legacy 매핑 회수 → 요약 재사용
     assert client.post("/api/sync/notes").status_code == 200           # 가드 해제
+
+
+def test_recover_schema_mismatch_restores_backup_on_failure(tmp_path: Path, monkeypatch):
+    """M6b 최종 리뷰 Important 2: open_db 실패로 새 index.db를 못 열면 백업을 원위치로 되돌린다 —
+    안 그러면 DB가 통째로 사라져 다음 시도가 legacy 매핑 없이 전량 재요약·중복 md를 만든다."""
+    from llmsearch.web.app import run_sync
+
+    app1, state1 = make_state(tmp_path, monkeypatch)
+    run_sync(state1, "notes"); run_sync(state1, "local_docs")
+    sid = next(iter(indexer.get_sync_state(state1["conn"], "local_docs")["files"]))
+    state1["conn"].execute("UPDATE meta SET value='0' WHERE key='schema_version'"); state1["conn"].commit()
+    state1["conn"].close(); state1["read_conn"].close()
+
+    cfg = state1["config"]
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)
+    state2 = app2.state.llmsearch
+    assert state2["conn"] is None and state2["schema_mismatch"]
+
+    def boom(_path):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rebuild.db, "open_db", boom)
+
+    with pytest.raises(RuntimeError):
+        rebuild.recover_schema_mismatch(state2)
+
+    assert cfg.db_path.exists()
+    assert not list(cfg.db_path.parent.glob(cfg.db_path.name + ".corrupt-*"))
+    assert state2["conn"] is None
+    rows, _local_state = db.read_legacy_maps(cfg.db_path)
+    assert any(r[0] == sid for r in rows)                              # legacy 매핑 여전히 회수 가능
 
 
 def test_resummarize_refused_while_rebuilding_leaves_state_untouched(tmp_path: Path, monkeypatch):

@@ -60,13 +60,20 @@ def precheck(state: dict, force: bool = False) -> None:
 
 
 def reset_index(state: dict) -> dict:
-    """제자리 초기화 — documents 전 행·local_docs 외 sync_state 삭제 + 마커, 단일 트랜잭션."""
+    """제자리 초기화 — documents 전 행·local_docs 외 sync_state 삭제 + 마커, 단일 트랜잭션.
+
+    실패 시 롤백한다 — 부분 삭제가 커밋되면 이후 무관한 sync가 그 상태를 그대로 이어받는다.
+    """
     with state["sync_lock"]:
         conn: sqlite3.Connection = state["conn"]
-        deleted = indexer.delete_all_documents(conn)
-        conn.execute("DELETE FROM sync_state WHERE source_type != 'local_docs'")
-        set_marker(conn)
-        conn.commit()
+        try:
+            deleted = indexer.delete_all_documents(conn)
+            conn.execute("DELETE FROM sync_state WHERE source_type != 'local_docs'")
+            set_marker(conn)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         state["force_reindex_local_docs"] = True
     logger.info("인덱스 초기화 — documents %d건 삭제, para_map·local_docs 상태 보존", deleted)
     return {"documents_deleted": deleted}
@@ -128,30 +135,45 @@ def recover_schema_mismatch(state: dict) -> dict:
         rows, local_state = db.read_legacy_maps(cfg.db_path)
         db_path = Path(cfg.db_path)
         backup_path = db_path.with_name(db_path.name + f".corrupt-{datetime.now():%Y%m%d-%H%M%S}")
+        renamed = False
         if db_path.exists():
             db_path.rename(backup_path)  # unlink 대신 rename — 새 DB 오픈 실패 시 legacy 매핑 복구 경로 보존
-        for suffix in ("-wal", "-shm"):
-            Path(str(cfg.db_path) + suffix).unlink(missing_ok=True)  # 열린 커넥션 없음(conn is None)
-        conn = db.open_db(cfg.db_path)
-        read_conn = db.open_db(cfg.db_path)
-        for sid, para_path, summary_path in rows:
-            conn.execute("INSERT OR REPLACE INTO para_map(source_id, para_path, summary_path) VALUES (?,?,?)",
-                         (sid, para_path, summary_path))
-        files = dict(local_state.get("files", {})) if isinstance(local_state, dict) else {}
-        for sid, _para, _summary in rows:
-            # 상태가 유실됐어도 para_map에 있는 sid는 상태에 남긴다 — run_sync의 prior_map은 files 키로
-            # 만들어지므로, 비어 있으면 prior=None → _place가 해시 접미사 중복 md를 만든다 (스펙 §10 C1).
-            # 센티널은 실제 (mtime, size)와 결코 일치하지 않아 재요약을 강제한다(md 재사용 아님) —
-            # 정확한 시그니처를 잃었으니 안전 쪽으로 재요약을 택한다.
-            files.setdefault(sid, list(RETRY_SENTINEL))
-        if files or local_state:
-            indexer.set_sync_state(conn, "local_docs", {**(local_state or {}), "files": files})
-        set_marker(conn)
-        conn.commit()
+            renamed = True
+            logger.info("손상된 index.db 백업: %s", backup_path)
+        conn = read_conn = None
+        try:
+            for suffix in ("-wal", "-shm"):
+                Path(str(cfg.db_path) + suffix).unlink(missing_ok=True)  # 열린 커넥션 없음(conn is None)
+            conn = db.open_db(cfg.db_path)
+            read_conn = db.open_db(cfg.db_path)
+            for sid, para_path, summary_path in rows:
+                conn.execute("INSERT OR REPLACE INTO para_map(source_id, para_path, summary_path) VALUES (?,?,?)",
+                             (sid, para_path, summary_path))
+            files = dict(local_state.get("files", {})) if isinstance(local_state, dict) else {}
+            for sid, _para, _summary in rows:
+                # 상태가 유실됐어도 para_map에 있는 sid는 상태에 남긴다 — run_sync의 prior_map은 files 키로
+                # 만들어지므로, 비어 있으면 prior=None → _place가 해시 접미사 중복 md를 만든다 (스펙 §10 C1).
+                # 센티널은 실제 (mtime, size)와 결코 일치하지 않아 재요약을 강제한다(md 재사용 아님) —
+                # 정확한 시그니처를 잃었으니 안전 쪽으로 재요약을 택한다.
+                files.setdefault(sid, list(RETRY_SENTINEL))
+            if files or local_state:
+                indexer.set_sync_state(conn, "local_docs", {**(local_state or {}), "files": files})
+            set_marker(conn)
+            conn.commit()
+        except BaseException:
+            # 새 index.db가 실제로 열리는 것을 증명하기 전에 실패 — 백업을 원위치로 되돌려 legacy 매핑을
+            # 다음 시도에서도 회수 가능하게 한다. state는 건드리지 않는다(conn은 여전히 None으로 남는다).
+            for c in (conn, read_conn):
+                if c is not None:
+                    c.close()
+            for suffix in ("", "-wal", "-shm"):
+                Path(str(cfg.db_path) + suffix).unlink(missing_ok=True)
+            if renamed:
+                backup_path.rename(db_path)
+            raise
         state["conn"], state["read_conn"] = conn, read_conn
         state["schema_mismatch"] = None
         state["force_reindex_local_docs"] = True
-    logger.info("손상된 index.db 백업: %s", backup_path)
     if not rows:
         logger.warning("legacy 매핑을 회수하지 못함 — local_docs 전량 재요약 (요약 API 소모)")
     return {"legacy_maps_recovered": len(rows), "documents_deleted": 0, "backup": str(backup_path)}
