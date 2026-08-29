@@ -877,6 +877,37 @@ def test_chat_export_replaces_stale_filename_on_title_change(tmp_path: Path):
     assert "## Q1." in path_b.read_text(encoding="utf-8")
 
 
+def test_chat_export_write_failure_preserves_existing_file(tmp_path: Path, monkeypatch):
+    """리뷰 발견: 이전 이름 파일 정리를 새 파일 쓰기보다 먼저 하면, 쓰기(os.replace)가 실패할 때
+    직전까지 유효했던 export가 사라져 세션의 export가 0개가 된다 — 정리는 쓰기 성공 후에만
+    해야 크래시-세이프하다."""
+    import llmsearch.web.app as app_module
+
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]
+    path_a = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    client.post("/api/chat", json={"question": "쓰기 실패 재현 질의", "session_id": sid})
+    exports = client.app.state.llmsearch["config"].exports_dir
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app_module.os, "replace", boom)
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 500
+    assert path_a.exists()  # 실패한 새 파일 쓰기 때문에 기존 export가 지워지면 안 된다
+    assert sorted(p.name for p in exports.iterdir()) == [path_a.name]
+
+    monkeypatch.undo()
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 200
+    path_b = Path(r.json()["path"])
+    assert path_b != path_a
+    assert not path_a.exists()
+    assert sorted(p.name for p in exports.iterdir()) == [path_b.name]
+
+
 def test_chat_export_deterministic_and_overwrites(tmp_path: Path):
     client = make_app(tmp_path)
     client.post("/api/sync/notes")

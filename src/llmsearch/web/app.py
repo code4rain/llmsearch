@@ -560,9 +560,21 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             target.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 (CLAUDE.md)
         except ValueError:
             raise HTTPException(500, "내보내기 실패: 경로 검증")
-        # 제목이 바뀌면(기본 "새 대화" → 첫 질문 자동 제목 등) 파일명 slug도 바뀐다 — 같은
-        # session_id의 이전 이름 파일이 orphan으로 남지 않도록 새 이름과 다른 것들을 정리한다
-        # (리뷰 발견: 세션당 파일 1개 보장이 이름이 바뀌면 깨졌었다).
+        try:
+            tmp = target.with_name(target.name + ".tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, target)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+        except Exception as exc:
+            raise HTTPException(500, f"내보내기 실패: {type(exc).__name__}")
+        # 새 파일이 성공적으로 쓰인 뒤에만 이전 이름 파일을 정리한다 — 쓰기 실패 시 직전까지
+        # 유효했던 export가 사라지면 안 된다 (리뷰 발견: 정리를 먼저 하면 쓰기 실패 시 파일이
+        # 0개가 되는 크래시-세이프티 문제가 있었다). 제목이 바뀌면(기본 "새 대화" → 첫 질문
+        # 자동 제목 등) 파일명 slug도 바뀌므로, 같은 session_id의 이전 이름 파일이 orphan으로
+        # 남지 않도록 새 이름과 다른 것들을 정리한다.
         for old in exports_dir.glob(f"chat-{session_id}-*.md"):
             if old.name == target.name:
                 continue
@@ -574,16 +586,6 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 old.unlink()
             except OSError as exc:
                 _logger.warning("내보내기 이전 파일 정리 실패: %s (%s)", old.name, type(exc).__name__)
-        try:
-            tmp = target.with_name(target.name + ".tmp")
-            try:
-                tmp.write_text(text, encoding="utf-8")
-                os.replace(tmp, target)
-            except Exception:
-                tmp.unlink(missing_ok=True)
-                raise
-        except Exception as exc:
-            raise HTTPException(500, f"내보내기 실패: {type(exc).__name__}")
         return {"ok": True, "path": str(target)}
 
     @app.get("/api/eval/golden")
