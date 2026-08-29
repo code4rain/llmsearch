@@ -30,8 +30,11 @@ class UsageTracker:
         self._data: dict[str, dict[str, int]] = {}
         if path.exists():
             try:
-                self._data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(loaded, dict) or not all(isinstance(v, dict) for v in loaded.values()):
+                    raise ValueError("usage.json 형태가 잘못됨: dict-of-dicts 필요")
+                self._data = loaded
+            except (ValueError, OSError, UnicodeDecodeError):
                 logger.warning("usage.json 파싱 실패 — 카운터를 새로 시작합니다: %s", path)
                 self._data = {}
 

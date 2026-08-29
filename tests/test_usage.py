@@ -73,6 +73,36 @@ def test_corrupt_file_starts_fresh(tmp_path: Path):
     assert t.today_total() == 1
 
 
+def test_wrong_shape_list_starts_fresh(tmp_path: Path):
+    """유효한 JSON이지만 리스트 형태면 새로 시작한다."""
+    path = tmp_path / "usage.json"
+    path.write_text(json.dumps([]), encoding="utf-8")
+    t = UsageTracker(path)
+    assert t.today_total() == 0
+    t.record("embed")
+    assert t.today_total() == 1
+
+
+def test_wrong_shape_null_starts_fresh(tmp_path: Path):
+    """유효한 JSON이지만 null이면 새로 시작한다."""
+    path = tmp_path / "usage.json"
+    path.write_text(json.dumps(None), encoding="utf-8")
+    t = UsageTracker(path)
+    assert t.today_total() == 0
+    t.record("embed")
+    assert t.today_total() == 1
+
+
+def test_wrong_shape_dict_with_int_values_starts_fresh(tmp_path: Path):
+    """유효한 JSON이지만 dict 값이 dict가 아니면 새로 시작한다."""
+    path = tmp_path / "usage.json"
+    path.write_text(json.dumps({"2026-08-29": 5}), encoding="utf-8")
+    t = UsageTracker(path)
+    assert t.today_total() == 0
+    t.record("embed")
+    assert t.today_total() == 1
+
+
 def test_counting_embedder_records_and_delegates(tmp_path: Path):
     from llmsearch.embeddings import FakeEmbeddings
     from llmsearch.usage import CountingEmbedder
