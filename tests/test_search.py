@@ -149,3 +149,34 @@ def test_date_to_bare_date_includes_full_day(tmp_path: Path):
 
     excluded = search.search(conn, EMB, "프로젝트C", date_to="2026-08-14")
     assert all(h.source_id != "afternoon.md" for h in excluded)
+
+
+def test_snippet_strips_header_and_caps(tmp_path: Path):
+    conn = setup_index(tmp_path)
+    hits = search.search(conn, EMB, "프로젝트A 킥오프 회의록")
+    top = hits[0]
+    assert top.source_id == "kickoff.md"
+    assert top.snippet and not top.snippet.startswith("[")  # 청크 헤더 제거
+    assert top.snippet.startswith("프로젝트A 킥오프 회의록")
+    assert len(top.snippet) <= search.SNIPPET_CAP
+    assert "\n" not in top.snippet  # 공백 정규화
+
+
+def test_snippet_header_with_brackets_and_pipes(tmp_path: Path):
+    conn = db.open_db(tmp_path / "b.db")
+    indexer.index_documents(conn, [
+        Document("jira", "PROJ-1", "[PROJ-1] 검색 | 버그 수정", "재현 절차: 검색창에 입력 시 500. " * 20,
+                 "https://jira/PROJ-1", datetime(2026, 8, 12)),
+    ], EMB)
+    hit = search.search(conn, EMB, "검색 500 재현")[0]
+    assert hit.snippet.startswith("재현 절차")
+    assert search._snippet("[t | 2026-01-01] 본문", "t", "2026-01-01T10:00:00") == "본문"
+    assert search._snippet("헤더 없음", "t", "2026-01-01") == "헤더 없음"
+    assert len(search._snippet("[t | 2026-01-01] " + "가 " * 500, "t", "2026-01-01")) == search.SNIPPET_CAP
+
+
+def test_hit_positional_constructor_compat():
+    from llmsearch.models import Hit
+
+    h = Hit("notes", "a.md", "제목", "/n/a.md", "2026-08-01", True, 1.0, "본문")
+    assert h.snippet == ""

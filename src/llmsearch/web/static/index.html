@@ -11,6 +11,7 @@
               white-space: pre-wrap; overflow-y: auto; max-height: 60vh; }
   .msg-q { font-weight: bold; margin-top: 1rem; }
   .src { background: #f4f4f4; border-radius: 6px; padding: .5rem; margin: .3rem 0; font-size: .9rem; }
+  .snip { color:#666; font-size:.85em; white-space:normal; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
   #question { width: 80%; padding: .5rem; } table { border-collapse: collapse; }
   td, th { border: 1px solid #ccc; padding: .4rem .8rem; }
 </style>
@@ -260,6 +261,7 @@ async function ask(e) {
             ? ` <button onclick="resummarize(this.dataset.s)" data-s="${esc(h.source_id)}">재요약</button>` : '';
           answerDiv.insertAdjacentHTML('beforeend',
             `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
+            `${h.snippet ? `<div class="snip">${esc(h.snippet)}</div>` : ''}` +
             `<code>${esc(h.url_or_path)}</code> ` +
             `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button>${resum}</div>`);
         }
