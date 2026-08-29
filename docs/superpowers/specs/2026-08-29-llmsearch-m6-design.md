@@ -1,107 +1,137 @@
 # llmsearch M6 — 운영 완성 설계 (스펙 잔여 P1)
 
-> 상위 스펙: `2026-08-17-llmsearch-design.md` §8 §9 §10. 로드맵: `2026-08-29-llmsearch-roadmap-m6-m9.md`.
-> 목표: 상위 스펙에 명시됐지만 미구현인 운영 기능 4개를 채운다 — rules.md GUI 편집, 재요약 버튼, rebuild, 사용량 GUI 표시. 새 외부 의존성 없음.
+> 상위 스펙: `2026-08-17-llmsearch-design.md` §3 §8 §9 §10. 로드맵: `2026-08-29-llmsearch-roadmap-m6-m9.md`.
+> 목표: 상위 스펙에 명시됐지만 미구현인 운영 기능을 채운다. 새 외부 의존성 없음.
+> 3관점 리뷰(2026-08-29) 반영본 — Critical 4·Important 11·Minor 10 전부 반영. 리뷰가 잡은 핵심: 초안은 기존 코드의 `prior_map`/`_place`/삭제 판정을 오독해 "요약 md 재사용"을 정반대로(중복 생성·삭제·전량 재요약) 동작시킬 뻔했다.
 
-## 1. 범위
+## 1. 범위와 분할
 
-| 기능 | 근거 | 산출물 |
+한 계획으로는 과대(실 태스크 12개)라 **두 계획으로 나눈다**. M6a는 단독으로 유용하고 위험이 낮다. M6b에 위험(인덱스 초기화·요약 md 보존)이 집중되므로 리뷰 밀도를 높인다. 로드맵의 "M9는 M6 rebuild에 의존"은 M6b에만 걸린다.
+
+| 계획 | 기능 | 근거 |
 |---|---|---|
-| 설정 탭 — rules.md 편집 | §9 "GUI 설정 탭에서 편집하는 마크다운 파일 하나" | `GET/PUT /api/rules`, 설정 탭 UI, 답변기 규칙 즉시 반영, rules.md notes 인덱싱 |
-| 재요약 (문서별/전체) | §9 "문서별/전체 '재요약' 수동 버튼" | `POST /api/resummarize`, `GET /api/resummarize/count`, 출처 카드·설정 탭 버튼 |
-| rebuild | §8 "`rebuild` 명령으로 전체 재구축 — 기존 요약 md는 재사용", 스키마 불일치 안내 | `POST /api/rebuild`, CLI `--rebuild`, 스키마 불일치 배너, local_docs `force_reindex` |
-| 사용량 GUI 표시 | §10 "GUI 표시는 추후" | `GET /api/usage`, 소스 탭 상단 표시, `UsageTracker.recent_days` |
+| **M6a** | 설정 탭 rules.md 편집(+요약 규칙 주입, notes 인덱싱), 재요약(문서별/전체), 사용량 GUI 표시, 상태 변경 API의 로컬 오리진 검사 | §9, §10 |
+| **M6b** | rebuild(제자리 초기화 + 요약 md 재사용), 스키마 불일치 기동·배너·복구, CLI `--rebuild` | §8, §3 "인덱스는 소모품, 요약 md는 보존" |
 
-범위 밖: 사용량 차트, rules.md 문법 검증, 재요약 진행률(동기식이라 불필요), 요약 모델 선택 UI, 부분 rebuild(소스별).
+범위 밖: 사용량 차트, rules.md 문법 검증, 재요약 진행률, 요약 모델 선택 UI, 소스별 부분 rebuild, local_docs의 미스 카운터(보수적 삭제 판정 — 별도 과제로 기록).
 
-## 2. 설정 탭 — rules.md 편집
+## 2. 공통 — 상태 변경 API 보호 (M6a)
+
+`/api/rebuild`·`/api/resummarize`는 인증 없이 실비용·인덱스 초기화를 일으키므로, 임의 웹페이지의 `fetch(..., {mode:'no-cors'})` 단순 요청으로 원격 트리거되면 안 된다(기존 `/api/sync`·`/api/archive`도 같은 노출). 공통 FastAPI 의존성 `_local_origin_only`:
+- `Content-Type: application/json` 요구(없으면 415) — 단순 요청 차단
+- `Origin` 또는 `Referer` 헤더가 있으면 `http://127.0.0.1[:port]`·`http://localhost[:port]`만 허용, 아니면 403
+- 적용: 상태를 바꾸는 모든 POST/PUT/DELETE — `/api/sync/{source}`, `/api/archive`, `/api/atlassian/register`·`registrations(DELETE)`, `/api/rules(PUT)`, `/api/resummarize`, `/api/rebuild`. `/api/open`·`/api/chat`은 기존 방어 유지(chat은 JSON 요구만 추가).
+- 프런트 `fetch`는 이미 JSON 헤더를 보내는 곳이 대부분이라 `syncNow`/`removeReg`에만 헤더 추가. E2E의 `page.request.post`도 JSON 헤더 유지.
+
+## 3. 설정 탭 — rules.md 편집 (M6a)
 
 **API**
-- `GET /api/rules` → `{"text": str, "path": str, "sections": [str]}` — 파일 없으면 `text`는 4개 섹션 헤더(`## 용어집`, `## 분류 규칙`, `## 요약 규칙`, `## 답변 규칙`)만 있는 템플릿, `sections`는 `load_rules_md` 결과의 키 목록.
-- `PUT /api/rules` `{"text": str}` → 원자적 저장(tmp + `os.replace`, UTF-8). 응답 `{"ok": true, "sections": [...]}`. 본문이 str이 아니면 400. 크기 상한 256KB(400).
+- `GET /api/rules` → `{"text": str, "path": str, "sections": [str]}`. 파일이 없으면 `text`는 템플릿(첫 줄 `# 규칙 (rules.md)` H1 + `## 용어집`·`## 분류 규칙`·`## 요약 규칙`·`## 답변 규칙` 빈 섹션). `sections`는 **반환하는 `text`를 `load_rules_md`와 같은 파서로 파싱한 키 목록**(파일 유무와 무관하게 일관).
+- `PUT /api/rules` `{"text": str}` → `text`가 str이 아니면 400; UTF-8 인코딩 바이트가 256KB 초과면 400(파일 크기 방어 목적 — 본문은 이미 파싱된 뒤라 메모리 보호는 아님). 원자적 저장(`.tmp` + `os.replace`). 응답 `{"ok": true, "sections": [...]}`.
+- 저장 성공 후 `state["answerer"].update_rules(load_rules_md(path))` 호출.
 
 **즉시 반영**
-- 동기화 경로는 이미 `run_sync`마다 `load_rules_md`를 다시 읽는다 — 변경 없음.
-- 답변기: `Answerer` Protocol에 `update_rules(sections: dict[str, str]) -> None` 추가. `ClaudeAnswerer`는 `answer_rules`/`glossary`를 갱신, `FakeAnswerer`는 마지막 값을 `self.rules`에 보관(테스트 관찰용). `PUT` 성공 후 `state["answerer"].update_rules(load_rules_md(path))` 호출. 재시작 불필요.
-- `create_app`의 answerer 기본 생성 시 rules.md 읽는 기존 코드는 유지 (기동 시 초기값).
+- `Answerer` Protocol에 `update_rules(sections: dict[str, str]) -> None` 추가. `ClaudeAnswerer`는 `answer_rules`·`glossary` 갱신, `FakeAnswerer`는 `self.rules = sections` 보관(테스트 관찰용). 커스텀 answerer는 코드베이스에 없음(전부 `FakeAnswerer`) — 호환 위험 없음.
+- 동기화 경로는 이미 `run_sync`마다 `load_rules_md`를 다시 읽는다(app.py:146) — 변경 없음.
+- **요약 규칙 주입 (상위 스펙 §9 표 준수)**: 현재 `## 요약 규칙`은 소비처가 없다(run_sync는 용어집·분류 규칙만 전달, `_SUMMARY_PROMPT`의 `rules` 자리에 분류 규칙이 들어감). `Summarizer.summarize_and_classify`에 `summary_rules: str = ""` 키워드 인자를 추가하고 `GeminiSummarizer._SUMMARY_PROMPT`에 `## 요약 규칙` 블록을 별도 주입, `FakeSummarizer`·`CountingSummarizer`(`*args, **kwargs` 위임이라 무변경)·`sync_local_docs`(`summary_rules` 인자 추가)·`run_sync`(`rules_md.get("요약 규칙", "")` 전달)까지 연결. GUI 템플릿의 4개 섹션이 전부 실제 소비처를 갖게 된다.
 
 **notes 인덱싱 (§9 "rules.md는 notes로 취급되어 인덱싱됨")**
-- `sync_notes(folders, excludes, state, extra_files: list[Path] = ())` — `extra_files` 중 존재하는 파일을 폴더 스캔 결과에 합쳐 같은 파이프라인으로 처리(source_id = 절대경로, 제목 = 첫 `#` 헤더 또는 파일명). `run_sync("notes")`가 `extra_files=[cfg.rules_md_path]`를 넘긴다. 파일이 없으면 무시.
+- `sync_notes(folders, excludes, state, extra_files: Sequence[Path] = ())` — 존재하는 `extra_files`를 폴더 스캔 결과와 합쳐 같은 파이프라인으로 처리. sid(절대경로) 기준 dedupe(`notes_folders`가 `data_dir`을 포함해 이미 수집된 경우 중복 임베딩 방지). `is_excluded`는 동일 적용. 제목은 `_title_of`(첫 `#` 줄) — 템플릿의 H1 `# 규칙 (rules.md)` 덕에 "용어집"이 제목이 되는 문제 없음.
+- `run_sync("notes")`가 `extra_files=[cfg.rules_md_path]` 전달.
 
-**UI** — 새 `설정` 탭: textarea(높이 60vh, 고정폭 글꼴) + "저장" 버튼 + 저장 결과 한 줄(감지된 섹션 목록). 탭 진입 시 `GET`으로 로드. 설정 탭에 §3의 "전체 재요약"·§4의 "인덱스 재구축" 버튼도 둔다 (운영 조작 집약).
+**UI** — 새 `설정` 탭: textarea(높이 60vh, 고정폭) + 저장 버튼 + 결과 한 줄(섹션 목록). **본문은 `.value`로, 경로·섹션 목록은 `textContent`로만 주입**(innerHTML 금지 — `</textarea><script>` XSS). 탭 진입 시 GET. 설정 탭에 §4 "전체 재요약"과 (M6b) "인덱스 재구축" 버튼을 둔다.
 
-## 3. 재요약
+## 4. 재요약 (M6a)
 
-**원리** — local_docs 동기화 상태 `files[sid] = [mtime, size]`에서 항목을 제거하면 다음 동기화가 그 파일을 변경된 것으로 보고 다시 요약한다. `para_map`은 유지하므로 `prior_category` 힌트가 살아 분류가 안정적이고, `_place`가 기존 요약 md를 덮어쓴다.
+**원리** — local_docs 상태 `files[sid]`를 **제거하지 않고 `[0.0, 0]`(`local_docs._RETRY_SENTINEL`과 같은 값)로 치환**한다. sid가 `prev`에 남으므로 (a) `run_sync`가 `prev["files"]` 키로 만드는 `prior_map`이 유지되어 `prior_category` 힌트와 `_place`의 `is_ours` 판정이 살아 **기존 요약 md를 덮어쓴다**(제거하면 `prior=None` → 해시 접미사 중복본 + 원본 복사본 재생성 + 분류 흔들림), (b) 실파일 시그니처와 결코 일치하지 않아 재요약이 강제되고, (c) 파일이 그 사이 삭제됐어도 `deleted` 판정이 정상 동작한다.
 
 **API**
-- `GET /api/resummarize/count` → `{"count": n}` — local_docs 상태의 파일 수 (전체 재요약 confirm용).
-- `POST /api/resummarize` `{"source_id": str}` 또는 `{"all": true}`:
-  1. `sync_lock` 안에서 local_docs 상태를 읽어 대상 항목 제거 후 저장. 문서별인데 `source_id`가 상태에 없으면 404.
-  2. 락 해제 후 `run_sync(state, "local_docs")` 호출(내부에서 다시 락) — 일일 상한 게이트·오류 격리·로그 기록이 그대로 적용된다.
-  3. 응답 = run_sync entry에 `"reset": n` 추가.
-- 동기식(기존 `/api/sync`와 동일). 전체 재요약은 파일 수만큼 요약 API를 소모하므로 UI가 건수와 함께 confirm한다.
+- `GET /api/resummarize/count` → `{"count": n}` — local_docs 상태 `files` 키 수.
+- `POST /api/resummarize` `{"source_id": str}` 또는 `{"all": true}` (§2 보호 적용):
+  1. `sync_lock` 안에서 상태를 읽어 대상 항목을 센티널로 치환 후 `set_sync_state`. 문서별인데 sid가 `files`에 없으면 404.
+  2. 락 해제 후 `run_sync(state, "local_docs")` — 일일 상한 게이트·오류 격리·로그가 그대로 적용.
+  3. 응답 = run_sync entry + `"reset": n`. `indexed == 0`이면 UI가 "0건 — 파일이 이미 없거나 상한/오류(로그 확인)"로 표시.
+- 동기식(기존 `/api/sync`와 동일). 중복 실행 방지: `state["resummarizing"]` 플래그로 진행 중이면 409, UI 버튼 disable.
 
 **UI**
-- 채팅 출처 카드: `source_type == "local_docs"`인 카드에 "재요약" 버튼 → confirm → `POST {source_id: url_or_path}` → 결과 alert(indexed 건수 또는 error).
-- 설정 탭: "전체 재요약" 버튼 → `GET count` → confirm(`n건을 다시 요약합니다. 요약 API를 n회 호출합니다.`) → `POST {all: true}`.
+- 채팅 출처 카드: `source_type == "local_docs"`에 "재요약" 버튼 → confirm → `POST {source_id: h.source_id}`(`url_or_path`가 아니라 `source_id` — `Hit`에 존재) → 결과 alert.
+- 설정 탭 "전체 재요약": `GET count` → confirm(`n건을 다시 요약합니다. 요약 API를 최소 n회(비전 문서는 +1) 호출합니다.`) → `POST {all: true}`.
 
-## 4. rebuild — 인덱스 재구축
+## 5. 사용량 GUI 표시 (M6a)
 
-**의미** — 인덱스는 소모품(상위 스펙 §3), 요약 md·Atlassian 등록·usage.json·rules.md는 비용 산출물/설정이라 보존. **local_docs는 요약 md를 LLM 호출 없이 재사용**해 재인덱싱한다.
+- `UsageTracker.recent_days(n) -> list[tuple[str, int]]` — 최근 n일(오늘 포함) `(날짜, 합계)` 오름차순, 기록 없는 날 제외, 락 안에서 계산.
+- `GET /api/usage` → `{"today": {kind: n}, "total": n(오늘 합계), "limit": n, "indexing_allowed": bool, "days": [{"date", "total"}] (최근 7일)}`.
+- UI: 소스 탭 표 위 `<div id="usageLine">` — 종류 순서 고정 `embed · summary · vision · answer`: "오늘 API 호출 12건 (embed 9 · summary 1 · vision 1 · answer 1) · 일일 상한 없음"; `limit>0`이면 "12 / 50건"; `indexing_allowed=false`면 "⚠️ 상한 도달 — 요약·인덱싱 일시정지 (검색·답변은 계속)". `loadSources()`가 함께 갱신. 값은 `textContent`.
 
-**절차** (`POST /api/rebuild`, `sync_lock` 보유 + `state["rebuilding"] = True`):
-1. 스냅샷: local_docs `sync_state`와 `para_map` 전체를 `data_dir/rebuild_snapshot.json`에 기록 (스키마 불일치로 DB를 못 여는 경우엔 스냅샷 단계 생략 — 기존 스냅샷 파일이 있으면 그것을 사용).
-2. `state["conn"]`·`state["read_conn"]` close → `index.db`, `index.db-wal`, `index.db-shm` 삭제 → `db.open_db` 2회로 재오픈 → `state`에 교체. **엔드포인트·search_fn은 클로저 변수가 아니라 `state["read_conn"]`/`state["conn"]`을 호출 시점에 조회하도록 수정한다** (현재 `read_conn` 클로저 캡처가 6곳).
-3. 복원: 스냅샷의 `para_map` 행 삽입, local_docs `sync_state` 복원. `state["force_reindex_local_docs"] = True`.
-4. 락 해제 후 전 소스(`SOURCES` 순서)에 대해 `run_sync` 실행. local_docs는 이 1회에 한해 `force_reindex=True`로 호출되고 플래그를 지운다. 다른 소스는 `sync_state`가 비었으므로 전량 재수집(메일은 기존 롤링 윈도우 콜드스타트 구조로 재개 가능).
-5. 응답 `{"ok": bool, "entries": [run_sync entry ...]}`. 스냅샷 파일은 성공 시 삭제, 실패 시 보존(재시도용).
+## 6. rebuild — 인덱스 재구축 (M6b)
 
-**`sync_local_docs(..., force_reindex: bool = False)`** — `force_reindex`이면 `prev[sid] == sig`인 파일도 건너뛰지 않고, `prior_map[sid]`의 `summary_path`가 존재하면 그 md 본문으로 `Document`를 만든다(`para_path`=prior category, `content_indexed`는 md에 DRM 표식(`🔒 DRM`)이 없으면 True). 요약 md가 없거나 시그니처가 바뀐 파일은 정상 요약 경로(LLM 호출). 검증 지표: rebuild 전후 `usage.json`의 `summary`/`vision` 카운트가 불변이어야 한다(요약 재사용 증명), `embed`만 증가.
+**의미** — 인덱스는 소모품, **요약 md·para_map·local_docs 동기화 상태·Atlassian 등록·usage.json·rules.md는 보존**. local_docs는 요약 md를 LLM 호출 없이 재사용한다.
 
-**동시성** — `state["rebuilding"]`이 True인 동안 `/api/chat`·`/api/sync/*`·`/api/resummarize`·`/api/archive`는 503 `{"detail": "인덱스 재구축 중입니다"}`. 개인용 단일 사용자 도구이므로 락 계층 추가 대신 플래그로 단순화. 스케줄러 루프는 `rebuilding`이면 그 라운드를 건너뛴다.
+**정상 경로 = 제자리 초기화 (파일 삭제 없음)** — `rebuild.reset_index(state) -> dict`:
+0. 사전 검사(아무것도 바꾸기 전): `state["usage"].indexing_allowed()`가 False면 409 "일일 API 상한 도달 — 상한이 초기화된 뒤 실행하세요"(초기화 후 게이트에 막히면 빈 인덱스로 자정까지 고착); `cfg.watch_folders`·`cfg.notes_folders` 중 존재하지 않는 폴더가 있으면 409 + 폴더 목록(미마운트 드라이브 상태의 재구축 방지); `state["resummarizing"]`/진행 중 rebuild면 409.
+1. `sync_lock` 안, 단일 트랜잭션: `documents` 전 행을 `indexer._delete_doc_rows`로 순회 삭제(fts5 external-content·vec0 삭제를 이미 정확히 처리하는 검증된 경로), `sync_state`에서 local_docs **제외** 전부 삭제, `meta`에 `rebuild_in_progress='1'` 기록. `para_map`·local_docs `sync_state`는 건드리지 않는다 → 스냅샷 파일 불필요. 커넥션 유지 → 클로저 캡처·WAL 삭제·경쟁 창 문제 없음(리더는 WAL 스냅샷 격리로 커밋 전/후 상태만 봄).
+2. `state["force_reindex_local_docs"] = True`.
+3. 응답 `{"ok": true, "phase": "resync", "targets": [...]}` — `ok`는 초기화 성공을 뜻한다. **재수집은 백그라운드 스레드**(`threading.Thread(daemon=True)`)에서 `_scheduled_sources(state)` 순서로 `run_sync` 실행(등록 없는 소스 스킵 정책과 일관). 수천 문서·메일 1년치는 수십 분이 걸리므로 HTTP 요청 안에서 기다리지 않는다. 진행은 소스 탭 문서 수·로그 탭으로 관찰. 전 소스 완료 후 `meta.rebuild_in_progress` 삭제.
 
-**스키마 불일치 기동** — 현재 `open_db`가 `SchemaMismatchError`를 던져 기동이 실패한다. 변경: `create_app`이 예외를 잡아 `state["conn"] = state["read_conn"] = None`, `state["schema_mismatch"] = 메시지`. 이 상태에서 `/api/sources`는 `doc_count` 0에 `schema_mismatch` 필드 포함, 동기화/채팅은 503(메시지 안내). UI는 상단 배너 "index.db 스키마 불일치 — 재구축이 필요합니다 [재구축]". rebuild 절차 1단계에서 DB를 못 열므로 스냅샷은 기존 파일이 있을 때만 사용(없으면 local_docs 전량 재요약 — 배너에 이 비용을 명시).
+**`sync_local_docs(..., force_reindex: bool = False)`**
+- `force_reindex`이면 `prev[sid] == sig`인 파일도 건너뛰지 않는다. `prior_map[sid]`의 `summary_path`가 존재하고 읽히면(`read_text` 실패 = OSError/UnicodeDecodeError → 정상 요약 경로 폴백) 그 md 본문으로 `Document` 생성: `source_type="local_docs"`, `source_id=sid`, `title=path.name`, `text=본문`, `url_or_path=sid`, `updated_at=파일 mtime`, `content_indexed = DRM_MARKER not in 본문`, `extra={"para_path": prior[0], "summary_path": prior[1]}` — `summary_path`는 필수(run_sync의 `set_para_map` 조건과 `archive_project`의 접두사 치환이 이 키에 의존). `_place`는 호출하지 않는다(원본 복사본 재복사 불필요; 따라서 `para_overrides`도 재평가하지 않음 — 결정 기록). `seen[sid] = sig`.
+- 요약 md가 없거나 시그니처가 바뀐 파일은 정상 요약 경로(LLM).
+- **삭제 판정을 수행하지 않는다** (`deleted=[]`, `_cleanup` 미호출) — 재구축은 복원이지 정리가 아니다. 감시 폴더 미마운트 시 전 문서가 deleted로 판정되어 요약 md가 unlink되는 사고 차단. 정리는 다음 정상 동기화가 담당.
+- `DRM_MARKER = "🔒 DRM/암호화로 내용 미인덱싱"` 상수를 `local_docs`에 두고 생성·판정 양쪽이 사용.
+- 플래그 해제 시점: `run_sync`는 `sync_local_docs`가 **정상 반환한 뒤에만** `force_reindex_local_docs`를 지운다(게이트·예외로 커넥터에 도달 못 하면 유지).
+- 검증 지표: 재구축 전후 `usage.json`의 `summary`·`vision` 불변(재사용 경로는 summarizer를 호출하지 않음), `embed`만 증가.
 
-**CLI** — `python -m llmsearch --config ... --rebuild`: `create_app` 뒤 서버 기동 전에 rebuild 함수를 직접 호출하고 결과를 로그로 출력한 뒤 정상 기동. rebuild 로직은 `web/app.py`가 아니라 `src/llmsearch/rebuild.py`에 두고 웹·CLI가 공유한다: `rebuild_index(state, run_sync) -> dict`.
+**중단 재개** — 기동 시 `meta.rebuild_in_progress='1'`이면 `state["force_reindex_local_docs"]=True` + 배너 "이전 재구축이 완료되지 않았습니다 [재개]"(= 재수집 스레드 시작 버튼). 이 마커 덕에 재수집 도중 프로세스가 죽어도 "sync_state는 최신인데 documents는 빈" 고착이 생기지 않는다.
 
-## 5. 사용량 GUI 표시
+**스키마 불일치 경로 (M9의 임베딩 차원 변경 시 실제로 타는 경로)**
+- `db.read_legacy_maps(path) -> (para_rows, local_docs_state)`: 버전 검사·확장 로드 없이 `sqlite3.connect`로 열어 `para_map` 전체와 `sync_state(local_docs)`만 읽고 닫는다(테이블 부재는 빈 결과). 이 두 테이블은 스키마 변경 대상이 아니다.
+- `create_app`: `open_db`의 `SchemaMismatchError`를 잡아 `state["conn"]=state["read_conn"]=None`, `state["schema_mismatch"]=메시지`. 기동은 성공.
+- 가드: `_require_db()` 헬퍼(없으면 503 `schema_mismatch` 메시지)를 DB를 만지는 모든 엔드포인트 진입부에 둔다 — `/api/para/projects`·`/api/open`·`/api/chat`·`/api/archive`·`/api/resummarize`·`/api/sync`. `/api/sources`만 예외: `doc_count` 0 + `schema_mismatch` 필드로 정상 응답(배너 표시용). `run_sync`는 게이트 검사 **이전**에 `conn is None`이면 `entry.error`로 기록 후 반환(예외 금지). `scheduler_loop`의 `to_thread` 호출은 `try/except`+로그로 감싸 어떤 예외에도 루프가 죽지 않게 한다(기존 취약점 동시 해소). 엔드포인트·`search_fn`은 `state["read_conn"]`/`state["conn"]`을 호출 시점에 조회한다(현재 `read_conn` 클로저 캡처 7곳 + `/api/archive`의 `conn` 1곳; `run_sync`의 `conn` 획득도 락 내부로 이동).
+- rebuild(스키마 불일치 상태): `read_legacy_maps`로 매핑 확보 → `index.db`·`-wal`·`-shm` 삭제(열린 커넥션 없음) → `open_db` 2회 → `para_map`·local_docs `sync_state` 복원 → `rebuild_in_progress` 기록 → `state` 커넥션 교체, `schema_mismatch` 제거 → 백그라운드 재수집(정상 경로와 동일). `read_legacy_maps`마저 실패한 경우에만 "local_docs 전량 재요약(요약 API n회)" 경고를 배너·confirm에 표시.
+- UI 배너: "index.db 스키마 불일치 — 재구축이 필요합니다 [재구축]". 재구축 confirm에는 대상 문서 수·예상 호출 수(embed 청크 수는 미상이므로 "문서 n건, 요약 재사용")를 표시.
 
-- `UsageTracker.recent_days(n: int) -> list[tuple[str, int]]` — 최근 n일 `(날짜, 합계)`를 날짜 오름차순으로, 기록 없는 날은 제외 (락 안에서 계산).
-- `GET /api/usage` → `{"today": {kind: n}, "total": n, "limit": n, "indexing_allowed": bool, "days": [{"date": "YYYY-MM-DD", "total": n}]}` (최근 7일).
-- UI: 소스 탭 표 위에 한 줄 `<div id="usageLine">` — "오늘 API 호출 12건 (embed 9 · summary 1 · vision 1 · answer 1) · 일일 상한 없음". `limit > 0`이면 "12 / 50건", `indexing_allowed`가 false면 "⚠️ 상한 도달 — 요약·인덱싱 일시정지 (검색·답변은 계속)". `loadSources()`가 함께 갱신.
+**CLI** — `python -m llmsearch --config ... --rebuild [--yes]`: `create_app` 뒤 서버 기동 전에 `rebuild.reset_index` → 재수집을 **동기로** 실행(헤드리스)하고 소스별 결과를 로그 출력 후 정상 기동. `--yes`가 없으면 대상 문서 수·경고를 출력하고 확인 프롬프트. `rebuild.py`는 `web/app.py`를 import하지 않는다 — `SOURCES` 상수를 `llmsearch/sources.py`로 옮기고 `run_sync`·`_scheduled_sources`는 인자로 주입.
 
-## 6. 오류 처리 요약
+## 7. 오류 처리 요약
 
 | 상황 | 동작 |
 |---|---|
-| rules PUT 본문 비정상/과대 | 400, 파일 미변경 |
-| 재요약 source_id 미존재 | 404 |
-| 재요약/rebuild 중 일일 상한 도달 | run_sync 게이트가 entry.error로 안내, 나머지 소스 계속 |
-| rebuild 중 DB 삭제 실패(잠금 등) | 503 + 로그, `rebuilding` 해제, 스냅샷 보존, 기존 커넥션 재오픈 시도 |
-| rebuild 중 다른 요청 | 503 "인덱스 재구축 중입니다" |
-| 스키마 불일치 | 기동은 성공, 배너 + 503, rebuild로 복구 |
+| 비로컬 Origin/비JSON 상태 변경 요청 | 403/415, 부작용 없음 |
+| rules PUT 본문 비정상/256KB 초과 | 400, 파일 미변경 |
+| 재요약 sid 미존재 / 진행 중 중복 | 404 / 409 |
+| 재요약·재수집 중 일일 상한 도달 | run_sync 게이트가 entry.error로 안내, 나머지 소스 계속. 재구축은 1회 실행으로 상한을 초과할 수 있음(게이트는 소스 진입 시점만 검사) — confirm에 명시 |
+| rebuild 사전 검사 실패(상한 도달·폴더 미존재·진행 중) | 409 + 사유, DB 무변경 |
+| 재수집 도중 프로세스 종료 | `rebuild_in_progress` 마커로 재기동 시 배너 [재개] |
+| 스키마 불일치 | 기동 성공, 배너 + DB 엔드포인트 503, rebuild로 복구 |
+| 스키마 불일치 + legacy 읽기 실패 | 전량 재요약 경고 후 진행 |
 
-## 7. 테스트
+## 8. 테스트
 
-- 단위(Fake 주입, TestClient `base_url="http://127.0.0.1"`): rules GET 템플릿/PUT 저장·섹션 파싱·크기 상한/답변기 `update_rules` 호출 확인; notes `extra_files`로 rules.md 인덱싱; resummarize 문서별·전체·404·상태 리셋 후 요약 재호출(usage `summary` 증가); `force_reindex` 요약 md 재사용(summary 카운트 불변, 문서 수 복원, DRM 표식 문서의 `content_indexed=False`); rebuild 스냅샷 생성·복원·`rebuilding` 중 503·성공 시 스냅샷 삭제; 스키마 불일치 기동(메타 버전을 강제로 바꾼 index.db) → 배너 필드·503·rebuild 복구; `recent_days`·`/api/usage`.
-- E2E(`tools/e2e/verify.py` 확장, 기존 45건 무변경): 설정 탭 로드→편집→저장→재로드 일치; 사용량 한 줄 표시; 출처 카드 "재요약" → usage summary +1; 설정 탭 "전체 재요약" confirm 건수; "인덱스 재구축" → 소스 문서 수 복원 + usage summary/vision 불변. 데모 서버 일일 상한 50 예산 안에서 성립하도록 가드 유지(필요 시 데모 상한 상향).
+**M6a 단위** (Fake 주입, `TestClient(base_url="http://127.0.0.1")`): 로컬 오리진 의존성(외부 Origin 403, 비JSON 415, 정상 통과); rules GET 템플릿·sections 일관성, PUT 저장·원자성·400(비str/256KB)·`FakeAnswerer.rules` 갱신; 요약 규칙이 `GeminiSummarizer` 프롬프트에 주입됨(프롬프트 조립 함수 단위)·`sync_local_docs`→summarizer로 전달; notes `extra_files` 인덱싱·dedupe·제외 적용; resummarize 문서별(센티널 치환·prior 유지·요약 md 경로 불변·usage summary +1)·전체·404·409·삭제된 파일의 `deleted` 판정 유지; `recent_days`·`/api/usage`.
 
-## 8. 데이터 폴더 변경
+**M6b 단위**: `force_reindex` 요약 md 재사용(summary/vision 불변, 문서 수 복원, `extra.summary_path` 존재, DRM 문서 `content_indexed=False`, md 읽기 실패 폴백, 삭제 판정 없음, 미마운트 폴더 409); `reset_index` 트랜잭션(documents 0, para_map 유지, local_docs 상태 유지, 다른 sync_state 삭제, 마커 기록)·상한 도달 409·플래그 해제 시점; 재개 마커 기동; `read_legacy_maps`; 스키마 불일치 기동(meta 버전 강제 변경 DB) → `/api/sources` 필드·503 가드·run_sync entry.error·rebuild 복구; scheduler 예외 격리; CLI `--rebuild --yes` 헤드리스.
 
-```
-llmsearch-data/
-├─ rules.md                # 설정 탭에서 편집 (신규 아님 — GUI 진입점 추가)
-├─ rebuild_snapshot.json   # rebuild 진행 중에만 존재 (성공 시 삭제)
-└─ usage.json              # M5 — /api/usage가 읽음
-```
+**E2E** (`tools/e2e/verify.py`, 기존 45건 무변경): 신규 시나리오는 **9단계(사용량 카운터)와 10단계(상한 소진 루프) 사이**에 삽입한다 — 10단계 이후엔 게이트에 막혀 성립하지 않는다. 예산: 기존 ≈12건 + 재요약(summary 1·vision 1·embed 1) + 재구축(embed ≈8) ≈ 24건 < 50, `MAX_ROUNDS=40` 충분 — 데모 상한 상향 불필요.
+- M6a: 설정 탭 로드→편집→저장→재로드 일치(H1 템플릿 확인) / 소스 탭 사용량 한 줄 표시 / 출처 카드 "재요약" → usage `summary +1`·`vision +1`(데모 pptx는 비전 경로) / 설정 탭 "전체 재요약" confirm 문구에 건수.
+- M6b: "인덱스 재구축" → 사전 검사 통과 → 재수집 완료 대기(문서 수 폴링) → **`notes`·`local_docs`·`outlook_mail`·`outlook_cal` 문서 수 복원**(confluence/jira는 등록 상태에 종속이라 제외) + 직전·직후 usage 스냅샷에서 `summary`·`vision` 불변.
 
-## 9. 결정 기록
+## 9. 데이터 폴더·스키마 변경
+
+- `rules.md` — 설정 탭 진입점 추가(파일 신규 아님)
+- `meta.rebuild_in_progress` — 재구축 중에만 존재하는 마커 행 (스키마 버전 불변 — meta는 key/value)
+- 스냅샷 파일 없음(초안의 `rebuild_snapshot.json` 폐기)
+
+## 10. 결정 기록
 
 | 결정 | 근거 |
 |---|---|
-| 재요약·rebuild는 동기식 | 기존 수동 동기화와 동일한 모델, 진행률 UI 불필요, 개인용 단일 사용자 |
-| rebuild 중 503 플래그 | 커넥션 교체를 안전하게 하는 최소 장치 — 락 계층 추가 대비 단순 |
-| 요약 md 재사용은 `force_reindex` 1회 플래그 | 상시 "md 존재 시 재사용" 경로는 파일 변경 감지와 충돌 — rebuild 직후에만 필요 |
-| rebuild 로직을 `rebuild.py`로 분리 | 웹·CLI 공유, `web/app.py` 비대화 방지 |
-| 스키마 불일치를 기동 실패가 아닌 배너로 | M9 임베딩 차원 변경 시 GUI에서 복구 가능해야 함 |
+| 재요약은 상태 항목 제거가 아닌 센티널 치환 | 제거하면 prior_map 소실 → 요약 md 중복 생성·분류 흔들림·삭제 감지 상실 (리뷰 C1) |
+| rebuild는 파일 삭제가 아닌 제자리 행 삭제 | 커넥션 유지로 경쟁 창·WAL 삭제 실패·클로저 수정·스냅샷 파일이 전부 소멸 (리뷰 I2) |
+| force_reindex는 삭제 판정 생략 | 미마운트 폴더 상태의 재구축이 요약 md를 지우는 사고 차단 (리뷰 C2) |
+| 스키마 불일치는 legacy 읽기로 매핑 회수 | M9 차원 변경이 이 경로를 타므로 전량 재요약은 상위 스펙 §3 위반 (리뷰 C3) |
+| 재수집은 백그라운드, 재요약은 동기 | 재구축은 수 시간 가능, 재요약 1건은 짧다 (리뷰 I10) |
+| 상한 도달 상태 rebuild 거부 | 초기화 후 게이트에 막히면 빈 인덱스로 자정까지 고착 (리뷰 C4) |
+| 요약 규칙 주입을 M6a에 포함 | GUI가 소비처 없는 섹션을 노출하면 안 됨 — 상위 스펙 §9 표 준수 (리뷰 I8) |
+| 상태 변경 API 로컬 오리진 검사 | CSRF로 rebuild/전체 재요약 원격 트리거 차단 (리뷰 I9) |
+| 재사용 경로는 `_place`·`para_overrides` 미적용 | 파일 재복사 불필요; 오버라이드 변경 반영은 재요약 버튼의 역할 |
+| M6a/M6b 분할 | 실 태스크 12개, 위험 집중 부분의 리뷰 밀도 확보 (리뷰 I11) |
