@@ -32,8 +32,8 @@
   CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
   ```
   `AUTOINCREMENT`는 rowid 재사용을 막는다 — 삭제한 세션의 id가 새 세션에 재배정되어 남은 메시지가 "부활"하는 경로 차단.
-- 열기 순서: 테이블 생성 → `SELECT value FROM meta WHERE key='schema_version'` → **행이 없으면 `'1'` 삽입·커밋**, 있는데 `'1'`이 아니면 `RuntimeError`(`db.open_db`와 동형).
-- API(파이썬): `create_session(title="새 대화") -> int`; `set_title(session_id, title) -> None`(없으면 `KeyError`, `updated_at` 갱신); `list_sessions(limit=50) -> [{id,title,created_at,updated_at,message_count}]`(updated_at 내림차순); `get_session(id) -> {id,title,created_at,updated_at,messages:[{id,role,content,sources,filters,created_at}]}`(없으면 `KeyError`); `append(session_id, role, content, sources=None, filters=None) -> int`(세션 `updated_at` 갱신; 없으면 `KeyError`); `history(session_id, limit=20, max_chars=40_000) -> [{role,content}]`(Claude 컨텍스트용 — `sources` 제외; 마지막 `limit`개를 취한 뒤 **선두가 `assistant`면 버린다**(Messages API는 첫 메시지가 `user`여야 함), 누적 `content` 길이가 `max_chars`를 넘으면 오래된 쌍부터 제외); `delete_session(id) -> bool`(cascade에 의존하지 않고 같은 트랜잭션에서 `DELETE FROM messages WHERE session_id=?` → `DELETE FROM sessions WHERE id=?` 2계층); `export_markdown(id) -> str`; `close()`(`create_app`의 shutdown 핸들러가 호출).
+- 열기 순서: 테이블 생성 → `SELECT value FROM meta WHERE key='schema_version'` → **행이 없으면 `'1'` 삽입·커밋**, 있는데 `'1'`이 아니면 `RuntimeError`(절차는 `db.open_db`와 동일, 예외 클래스만 다름 — C2의 광역 예외 폴백이 잡는다).
+- API(파이썬): `create_session(title="새 대화") -> int`; `set_title(session_id, title) -> None`(없으면 `KeyError`, `updated_at` 갱신; 자동 제목용 내부 API — 사용자 수동 개명 엔드포인트/UI는 범위 밖); `list_sessions(limit=50) -> [{id,title,created_at,updated_at,message_count}]`(updated_at 내림차순); `get_session(id) -> {id,title,created_at,updated_at,messages:[{id,role,content,sources,filters,created_at}]}`(없으면 `KeyError`); `append(session_id, role, content, sources=None, filters=None) -> int`(세션 `updated_at` 갱신; 없으면 `KeyError`); `history(session_id, limit=20, max_chars=40_000) -> [{role,content}]`(Claude 컨텍스트용 — `sources` 제외; 마지막 `limit`개를 취한 뒤 **선두가 `assistant`면 버린다**(Messages API는 첫 메시지가 `user`여야 함), 누적 `content` 길이가 `max_chars`를 넘으면 **가장 오래된 메시지부터 role 무관하게 2건씩** 제거하고, 제거 후에도 선두 `assistant` 규칙을 다시 적용한다 — 저장 실패로 alternation이 깨진 세션(연속 `user`는 Messages API가 허용)에서도 결정적); `delete_session(id) -> bool`(cascade에 의존하지 않고 같은 트랜잭션에서 `DELETE FROM messages WHERE session_id=?` → `DELETE FROM sessions WHERE id=?` 2계층); `export_markdown(id) -> str`; `close()`(`create_app`의 shutdown 핸들러가 호출).
 - 제목: 공백 정규화 후 60자 절단(빈 문자열이면 "새 대화"). `POST /api/chats`의 `title`은 200자 초과 시 400.
 - `sources`는 `Hit` dict 목록(`asdict`, `excerpt` ≤ 6000자 포함 — 미리보기·복원용). 메시지당 최대 12건이라 개인 규모에서 수용; 긴 세션의 `GET /api/chats/{id}`는 수 MB가 될 수 있다(페이지네이션은 M9 후보).
 - **기동 격리**: `create_app`은 `ChatStore` 생성의 **모든 예외(`Exception`)**를 잡아 `state["chat_store"]=None`, `state["chat_store_error"]=type(exc).__name__`로 보관하고 기동을 계속한다(경로·예외 문자열은 로그에만). 세션 API는 503, 채팅은 세션 없이(무저장) 계속 동작. 배너는 범위 밖.
@@ -48,7 +48,7 @@
 
 **`/api/chat` 세션 통합**
 - 페이로드 `session_id: int|null` 추가. 검증(`_validate_filters` 직후, `record("answer")` 이전): **`bool`을 제외한 `int`**(`isinstance(v, int) and not isinstance(v, bool)`)가 아니거나 존재하지 않는 세션이면 404 "세션을 찾을 수 없습니다"; `chat_store`가 None인데 `session_id`가 오면 503.
-- 순서: ① `session_id`가 있으면 **`hist = store.history(session_id)`를 먼저 확정**(현재 질문이 이력에 중복 포함되지 않게) — 페이로드 `history`는 무시(진실 원천 단일화); 없으면 페이로드 `history` 사용(무저장 — 테스트·`page.request` 호환). ② 스트림 시작 전에 `append(session_id, "user", question, filters=filters)`; 세션 제목이 "새 대화"면 `set_title(첫 질문)`. ③ assistant 저장은 `event_stream`의 **`try/finally`**에서 수행 — 정상 종료·클라이언트 중단(`GeneratorExit`) 모두 부분 답변이라도 보존한다. `finally` 안에서는 절대 `yield`하지 않는다. `answer_text`는 `text` 이벤트 누적, `error` 이벤트는 `"\n⚠️ "+message`로 본문에 합침. `sources`는 `sources` 이벤트의 hits(`asdict`). 저장 실패는 로그(클래스명)만.
+- 순서: ① `session_id`가 있으면 **`hist = store.history(session_id)`를 먼저 확정**(현재 질문이 이력에 중복 포함되지 않게) — 페이로드 `history`는 무시(진실 원천 단일화); 없으면 페이로드 `history` 사용(무저장 — 테스트·`page.request` 호환). ② 스트림 시작 전에 `append(session_id, "user", question, filters=filters)`; 세션 제목이 "새 대화"면 `set_title(첫 질문)`. ③ assistant 저장은 `event_stream`의 **`try/finally`**에서 수행 — 정상 종료·클라이언트 중단(`GeneratorExit`) 모두 부분 답변이라도 보존한다. `finally` 안에서는 절대 `yield`하지 않는다. `answer_text`는 `text` 이벤트 누적, `error` 이벤트는 `"\n⚠️ "+message`로 본문에 합침. `sources`는 `sources` 이벤트의 hits(`asdict`). **`answer_text`가 비어 있으면(첫 토큰 전 중단) `"(답변 없음 — 응답 전 중단)"`을 저장**한다 — Messages API는 빈 text 블록을 거부하므로 빈 assistant 행이 세션의 후속 질문을 전부 400으로 만들지 않게. 저장 실패는 로그(클래스명)만. 주의: 클라이언트 중단 시 `GeneratorExit`는 Starlette의 ASGI 계약이 아니라 CPython 참조 카운팅으로 버려진 제너레이터가 닫힐 때 전달된다 — 실제로는 즉시에 가깝지만 보장된 즉시성은 아니다.
 - `event: saved\ndata: {"session_id": N}`는 **정상 종료 경로에서만** `done` 앞에 보낸다 — UI가 목록을 갱신할 신호.
 
 **내보내기**
@@ -88,7 +88,7 @@
 | `session_id` 비정상(bool 포함)/미존재 | 404, answer 미계상 |
 | `POST /api/chats` title 비문자열/200자 초과 | 400 |
 | `chats.db` 스키마 불일치/손상/권한 오류 | 기동 성공, 세션 API 503(클래스명), 채팅은 무저장 폴백 |
-| 스트림 중 클라이언트 중단 | user 메시지는 이미 저장, assistant 부분 답변 `finally`에서 저장, `saved` 이벤트 없음 |
+| 스트림 중 클라이언트 중단 | user 메시지는 이미 저장, assistant 부분 답변 `finally`에서 저장(첫 토큰 전이면 자리표시 문구), `saved` 이벤트 없음 |
 | 저장 실패(디스크 등) | 스트림은 정상, `saved` 이벤트 없음, 로그 클래스명 |
 | export 대상 없음 / 경로 검증 실패 / 쓰기 실패 | 404 / 500 / 500(클래스명) |
 | 비로컬 Origin | 403 (POST/DELETE 전부) |
