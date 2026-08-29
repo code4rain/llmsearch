@@ -28,6 +28,13 @@
 </nav>
 
 <div id="chat" class="tab active">
+  <div id="sessionBar">
+    <select id="sessionSelect" onchange="selectSession()"><option value="">— 새 대화 —</option></select>
+    <button id="newChatBtn" onclick="newChat()">새 대화</button>
+    <button id="deleteChatBtn" onclick="deleteChat()">삭제</button>
+    <button id="exportChatBtn" onclick="exportChat()">내보내기</button>
+    <span id="chatNote"></span>
+  </div>
   <div id="messages"></div>
   <form onsubmit="ask(event)">
     <input id="question" placeholder="질문을 입력하세요" autocomplete="off">
@@ -79,6 +86,7 @@ const history = [];
 function show(id) {
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  if (id === 'chat') loadSessions();
   if (id === 'sources') { loadSources(); loadRegistrations(); loadProjects(); }
   if (id === 'log') loadLog();
   if (id === 'settings') { loadRules(); loadGolden(); }
@@ -291,6 +299,76 @@ function filtersLabel(f) {
   if (f.sender) parts.push('발신자=' + f.sender);
   return parts.length ? '필터(첫 검색 기준): ' + parts.join(' · ') + ' — 답변 근거는 Claude의 추가 검색으로 넓어질 수 있습니다' : '';
 }
+let sessionId = null;
+function opt(value, text) { const o = document.createElement('option'); o.value = value; o.textContent = text; return o; }
+async function loadSessions() {
+  const sel = document.getElementById('sessionSelect');
+  const r = await fetch('/api/chats');
+  if (!r.ok) {
+    const d = await r.json().catch(() => ({}));
+    document.getElementById('chatNote').textContent = '대화 저장 불가: ' + (d.detail || ('HTTP ' + r.status));
+    return;
+  }
+  const list = await r.json();
+  document.getElementById('chatNote').textContent = '';
+  sel.replaceChildren(opt('', '— 새 대화 —'), ...list.map(s => opt(String(s.id), s.title)));
+  sel.value = sessionId === null ? '' : String(sessionId);
+}
+function clearConversation() { document.getElementById('messages').replaceChildren(); history.length = 0; }
+function newChat() { sessionId = null; clearConversation(); document.getElementById('sessionSelect').value = ''; }
+async function selectSession() {
+  const v = document.getElementById('sessionSelect').value;
+  if (!v) { newChat(); return; }
+  const r = await fetch('/api/chats/' + encodeURIComponent(v));
+  if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || '세션을 불러올 수 없습니다'); return; }
+  const s = await r.json();
+  sessionId = s.id; clearConversation();
+  const box = document.getElementById('messages');
+  for (const m of s.messages) {
+    if (m.role === 'user') {
+      const q = document.createElement('div'); q.className = 'msg-q'; q.textContent = 'Q. ' + m.content; box.appendChild(q);
+      const label = m.filters ? filtersLabel(m.filters) : '';
+      if (label) { const n = document.createElement('div'); n.className = 'filters-note'; n.textContent = label; box.appendChild(n); }
+    } else {
+      const a = document.createElement('div'); a.className = 'msg-a'; a.textContent = m.content; box.appendChild(a);
+      renderSources(a, m.sources || []);
+    }
+  }
+  box.scrollTop = box.scrollHeight;
+}
+async function deleteChat() {
+  if (sessionId === null || !confirm('이 대화를 삭제할까요?')) return;
+  const r = await fetch('/api/chats/' + sessionId, {method: 'DELETE'});
+  if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.detail || '삭제 실패'); return; }
+  newChat(); loadSessions();
+}
+async function exportChat() {
+  if (sessionId === null) { alert('저장된 대화가 없습니다 — 질문을 먼저 보내세요'); return; }
+  const r = await fetch('/api/chats/' + sessionId + '/export', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  const d = await r.json().catch(() => ({}));
+  alert(r.ok ? '내보내기 완료: ' + d.path : (d.detail || '내보내기 실패'));
+}
+function renderSources(answerDiv, hits) {
+  answerDiv._hits = hits;  // 미리보기용 — excerpt는 SSE/세션 응답에 이미 포함
+  hits.forEach((h, i) => {
+    const lock = h.content_indexed ? '' : ' 🔒';
+    const resum = h.source_type === 'local_docs'
+      ? ` <button onclick="resummarize(this.dataset.s)" data-s="${esc(h.source_id)}">재요약</button>` : '';
+    answerDiv.insertAdjacentHTML('beforeend',
+      `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
+      `${h.snippet ? `<div class="snip">${esc(h.snippet)}</div>` : ''}` +
+      `<code>${esc(h.url_or_path)}</code> ` +
+      `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button> ` +
+      `<button onclick="previewHit(this)" data-i="${i}">미리보기</button>${resum}</div>`);
+  });
+}
+function previewHit(btn) {
+  const h = btn.closest('.msg-a')._hits[Number(btn.dataset.i)];
+  document.getElementById('previewTitle').textContent = h.title;
+  document.getElementById('previewMeta').textContent = `${h.source_type} · ${h.updated_at} · ${h.url_or_path}`;
+  document.getElementById('previewBody').textContent = h.excerpt || '(본문 없음)';
+  document.getElementById('preview').showModal();
+}
 async function ask(e) {
   e.preventDefault();
   const q = document.getElementById('question').value.trim();
@@ -306,9 +384,15 @@ async function ask(e) {
   const answerDiv = document.createElement('div');
   answerDiv.className = 'msg-a';
   box.appendChild(answerDiv);
+  if (sessionId === null) {
+    const cr = await fetch('/api/chats', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    if (cr.ok) { sessionId = (await cr.json()).id; document.getElementById('chatNote').textContent = ''; }
+    else { const d = await cr.json().catch(() => ({})); document.getElementById('chatNote').textContent = '대화 저장 불가: ' + (d.detail || ('HTTP ' + cr.status)); }
+  }
+  const payload = sessionId === null ? {question: q, history, filters} : {question: q, session_id: sessionId, filters};
   const resp = await fetch('/api/chat', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({question: q, history, filters}),
+    body: JSON.stringify(payload),
   });
   if (!resp.ok) {  // 400(필터 검증)·503(스키마 불일치) — 무증상 실패·history 오염 방지
     let d = {}; try { d = await resp.json(); } catch {}
@@ -331,24 +415,20 @@ async function ask(e) {
       const data = (block.match(/^data: (.+)$/m) || [])[1];
       if (ev === 'text') { answerText += JSON.parse(data); answerDiv.textContent = answerText; }
       else if (ev === 'error') { answerDiv.textContent += '\n⚠️ ' + JSON.parse(data); }
-      else if (ev === 'sources') {
-        for (const h of JSON.parse(data)) {
-          const lock = h.content_indexed ? '' : ' 🔒';
-          const resum = h.source_type === 'local_docs'
-            ? ` <button onclick="resummarize(this.dataset.s)" data-s="${esc(h.source_id)}">재요약</button>` : '';
-          answerDiv.insertAdjacentHTML('beforeend',
-            `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
-            `${h.snippet ? `<div class="snip">${esc(h.snippet)}</div>` : ''}` +
-            `<code>${esc(h.url_or_path)}</code> ` +
-            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button>${resum}</div>`);
-        }
-      }
+      else if (ev === 'sources') { renderSources(answerDiv, JSON.parse(data)); }
+      else if (ev === 'saved') { loadSessions(); }
       box.scrollTop = box.scrollHeight;
     }
   }
-  history.push({role: 'user', content: q}, {role: 'assistant', content: answerText});
+  if (sessionId === null) history.push({role: 'user', content: q}, {role: 'assistant', content: answerText});
 }
 loadStatus();
+loadSessions();
 </script>
+<dialog id="preview" style="max-width:800px">
+  <h3 id="previewTitle"></h3><small id="previewMeta"></small>
+  <pre id="previewBody" style="white-space:pre-wrap;max-height:60vh;overflow:auto"></pre>
+  <button id="previewClose" onclick="document.getElementById('preview').close()">닫기</button>
+</dialog>
 </body>
 </html>

@@ -669,6 +669,13 @@ def test_golden_ui_in_index(tmp_path: Path):
         assert needle in html, needle
 
 
+def test_session_ui_in_index(tmp_path: Path):
+    html = make_app(tmp_path).get("/").text
+    for needle in ('id="sessionSelect"', 'id="newChatBtn"', 'id="exportChatBtn"', '<dialog id="preview"',
+                   'id="previewBody"', "renderSources(", "loadSessions();"):
+        assert needle in html, needle
+
+
 def _sse_events(body: str) -> list[str]:
     return [l[len("event: "):] for l in body.splitlines() if l.startswith("event: ")]
 
