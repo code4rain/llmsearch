@@ -85,6 +85,27 @@ async function openItem(p) {
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url_or_path: p})})).json();
   if (!r.ok) alert(r.error);
 }
+function resumMessage(r, d) {
+  if (!r.ok) return d.detail || '실패';
+  if (!d.ok) return d.error;
+  return `재요약 완료: ${d.indexed}건` + (d.indexed === 0 ? ' (파일이 이미 없거나 상한/오류 — 로그 탭 확인)' : '');
+}
+async function resummarize(sid) {
+  if (!confirm('이 문서를 다시 요약할까요? 요약 API를 호출합니다.')) return;
+  const r = await fetch('/api/resummarize', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({source_id: sid})});
+  alert(resumMessage(r, await r.json()));
+}
+async function resummarizeAll() {
+  const c = (await (await fetch('/api/resummarize/count')).json()).count;
+  if (!confirm(`${c}건을 다시 요약합니다. 요약 API를 최소 ${c}회(비전 문서는 +1) 호출합니다.`)) return;
+  const btn = document.getElementById('resumAllBtn'); btn.disabled = true;
+  try {
+    const r = await fetch('/api/resummarize', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({all: true})});
+    alert(resumMessage(r, await r.json()));
+  } finally { btn.disabled = false; }
+}
 async function loadRegistrations() {
   const regs = await (await fetch('/api/atlassian/registrations')).json();
   document.getElementById('atlList').innerHTML = regs.map(r =>
@@ -173,10 +194,12 @@ async function ask(e) {
       else if (ev === 'sources') {
         for (const h of JSON.parse(data)) {
           const lock = h.content_indexed ? '' : ' 🔒';
+          const resum = h.source_type === 'local_docs'
+            ? ` <button onclick="resummarize(this.dataset.s)" data-s="${esc(h.source_id)}">재요약</button>` : '';
           answerDiv.insertAdjacentHTML('beforeend',
             `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
             `<code>${esc(h.url_or_path)}</code> ` +
-            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button></div>`);
+            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button>${resum}</div>`);
         }
       }
       box.scrollTop = box.scrollHeight;

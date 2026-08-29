@@ -369,3 +369,92 @@ def test_settings_tab_in_index(tmp_path: Path):
     client = make_app(tmp_path)
     html = client.get("/").text
     assert 'id="settings"' in html and 'id="rulesText"' in html and "설정" in html
+
+
+def make_app_with_docs(tmp_path: Path, monkeypatch) -> TestClient:
+    """local_docs 감시 폴더 1개(pptx 스텁) — markitdown 대신 짧은 본문 스텁."""
+    from llmsearch.connectors import local_docs
+
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: f"{p.stem} 본문. 프로젝트A 관련 내용 " * 10)
+    watch = tmp_path / "watch"; watch.mkdir()
+    (watch / "설계.pptx").write_bytes(b"x")
+    (watch / "회의록.pptx").write_bytes(b"y")
+    cfg = Config(data_dir=tmp_path / "data", watch_folders=[watch], projects=["프로젝트A"])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    return TestClient(app, base_url="http://127.0.0.1")
+
+
+def test_resummarize_one_overwrites_summary_without_duplicates(tmp_path: Path, monkeypatch):
+    """스펙 M6 §4: 센티널 치환 → prior_map 유지 → 기존 요약 md 덮어쓰기(중복본 없음)."""
+    from llmsearch import indexer
+
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    assert client.post("/api/sync/local_docs").json()["indexed"] == 2
+    state = client.app.state.llmsearch
+    sid = str((tmp_path / "watch" / "설계.pptx").resolve())
+    before_map = indexer.get_para_map(state["read_conn"], sid)
+    summary_before = state["usage"].today_by_kind()["summary"]
+
+    r = client.post("/api/resummarize", json={"source_id": sid})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["indexed"] == 1 and body["reset"] == 1
+    assert state["usage"].today_by_kind()["summary"] == summary_before + 1
+    assert indexer.get_para_map(state["read_conn"], sid) == before_map  # 같은 요약 md 경로에 덮어씀
+    md_files = list((tmp_path / "data" / "summaries").rglob("설계*.md"))
+    assert len(md_files) == 1, md_files  # 해시 접미사 중복본이 생기지 않는다
+    files = indexer.get_sync_state(state["read_conn"], "local_docs")["files"]
+    assert files[sid] != [0.0, 0]  # 재요약 후 실제 시그니처로 복귀
+
+
+def test_resummarize_all_and_count(tmp_path: Path, monkeypatch):
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    assert client.get("/api/resummarize/count").json() == {"count": 2}
+    state = client.app.state.llmsearch
+    summary_before = state["usage"].today_by_kind()["summary"]
+    body = client.post("/api/resummarize", json={"all": True}).json()
+    assert body["reset"] == 2 and body["indexed"] == 2
+    assert state["usage"].today_by_kind()["summary"] == summary_before + 2
+
+
+def test_resummarize_unknown_and_foreign_origin(tmp_path: Path, monkeypatch):
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    assert client.post("/api/resummarize", json={"source_id": "/없음.pptx"}).status_code == 404
+    assert client.post("/api/resummarize", json={}).status_code == 404
+    assert client.post("/api/resummarize", json={"all": True},
+                       headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_resummarize_deleted_file_is_detected(tmp_path: Path, monkeypatch):
+    """센티널 치환은 sid를 prev에 남기므로 그 사이 삭제된 파일의 deleted 판정이 살아 있다."""
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    sid = str((tmp_path / "watch" / "설계.pptx").resolve())
+    (tmp_path / "watch" / "설계.pptx").unlink()
+    body = client.post("/api/resummarize", json={"source_id": sid}).json()
+    assert body["indexed"] == 0 and body["deleted"] == 1
+    assert client.get("/api/resummarize/count").json() == {"count": 1}
+
+
+def test_resummarize_rejects_concurrent_run(tmp_path: Path, monkeypatch):
+    """스펙 M6 §4·§8: 진행 중이면 409 — 더블클릭으로 요약 비용이 2배가 되지 않게."""
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    state = client.app.state.llmsearch
+    state["resummarize_lock"].acquire()  # 진행 중 상황 재현
+    try:
+        assert client.post("/api/resummarize", json={"all": True}).status_code == 409
+    finally:
+        state["resummarize_lock"].release()
+
+
+def test_resummarize_respects_daily_limit_gate(tmp_path: Path, monkeypatch):
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    state = client.app.state.llmsearch
+    state["usage"].daily_limit = 1  # 이미 초과 상태
+    body = client.post("/api/resummarize", json={"all": True}).json()
+    assert body["ok"] is False and "일일 API 호출 상한" in body["error"] and body["reset"] == 2

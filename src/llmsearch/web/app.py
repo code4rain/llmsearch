@@ -23,7 +23,7 @@ from ..atlassian.registry import Registry
 from ..config import Config
 from ..connectors.confluence import sync_confluence
 from ..connectors.jira import sync_jira
-from ..connectors.local_docs import sync_local_docs
+from ..connectors.local_docs import RETRY_SENTINEL, sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
@@ -359,6 +359,44 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         sections = parse_rules_md(text)
         state["answerer"].update_rules(sections)  # 동기화 경로는 run_sync마다 파일을 다시 읽는다
         return {"ok": True, "sections": list(sections)}
+
+    @app.get("/api/resummarize/count")
+    def resummarize_count():
+        _require_db()
+        files = indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {})
+        return {"count": len(files)}
+
+    @app.post("/api/resummarize", dependencies=[Depends(local_origin_only)])
+    def resummarize(payload: dict):
+        """문서별/전체 재요약 (스펙 §9, M6 §4).
+
+        상태 항목을 제거하지 않고 RETRY_SENTINEL로 치환한다 — sid가 prev에 남아야 run_sync의
+        prior_map이 유지되어 기존 요약 md를 덮어쓰고(제거하면 해시 접미사 중복본 생성),
+        실제 시그니처와 불일치해 재요약이 강제되며, 그 사이 삭제된 파일의 deleted 판정도 산다.
+        """
+        _require_db()
+        if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
+            raise HTTPException(409, "재요약이 이미 진행 중입니다")
+        state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
+        try:
+            with state["sync_lock"]:
+                st = indexer.get_sync_state(state["conn"], "local_docs")
+                files = dict(st.get("files", {}))
+                if payload.get("all") is True:
+                    targets = list(files)
+                else:
+                    sid = str(payload.get("source_id", ""))
+                    if sid not in files:
+                        raise HTTPException(404, "local_docs 인덱스에 없는 문서입니다")
+                    targets = [sid]
+                for sid in targets:
+                    files[sid] = list(RETRY_SENTINEL)
+                indexer.set_sync_state(state["conn"], "local_docs", {**st, "files": files})
+            entry = run_sync(state, "local_docs")  # 상한 게이트·오류 격리·로그 그대로 적용
+            return {**entry, "reset": len(targets)}
+        finally:
+            state["resummarizing"] = False
+            state["resummarize_lock"].release()
 
     @app.post("/api/atlassian/register", dependencies=[Depends(local_origin_only)])
     def atlassian_register(payload: dict):
