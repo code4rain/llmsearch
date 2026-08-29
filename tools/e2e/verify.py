@@ -256,7 +256,11 @@ with sync_playwright() as p:
     # 9.11 M7 — 골든 평가 GUI: 적중 1 + 확정 미스 1 → 50% (1/2) ❌ (스펙 M7 §4)
     page.click("nav >> text=설정")
     page.wait_for_selector("#goldenText")
-    page.wait_for_function("document.getElementById('goldenStatus').textContent.endsWith('건')", timeout=10000)  # loadGolden() 완료 대기
+    # loadGolden() 완료 대기 — goldenStatus 텍스트 비교는 이전 탭 방문에서 이미 "N건"이 찍혀 있으면
+    # 즉시 통과해버려 이번 fetch 완료를 보장하지 못한다(경쟁: fill 후 늦게 도착한 응답이 textarea를 덮어씀).
+    # 서버가 지금 들고 있는 text와 textarea 값이 같아질 때까지 기다려 결정적으로 완료를 확인한다.
+    expected_text = page.request.get(f"{BASE}/api/eval/golden").json()["text"]
+    page.wait_for_function("t => document.getElementById('goldenText').value === t", arg=expected_text, timeout=10000)
     page.fill("#goldenText", "- question: 프로젝트A 킥오프 언제?\n  expect_source_id: kickoff.md\n"
                              "- question: 존재하지 않는 주제 XYZQW\n  expect_source_id: none.md\n")
     page.click("#saveGoldenBtn")
