@@ -5,6 +5,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 from llmsearch.atlassian.registry import Registry
+from llmsearch.web import app as app_module
 from llmsearch.web.app import SOURCES, _scheduled_sources
 
 from llmsearch.atlassian.client import FakeAtlassianClient
@@ -132,14 +133,18 @@ def test_registry_dedups_by_page_id_across_different_url_forms(tmp_path: Path):
     assert len(registry.list()) == 1
 
 
-def test_scheduled_sources_skips_confluence_jira_when_registry_empty(tmp_path: Path):
+def test_scheduled_sources_skips_confluence_jira_when_registry_empty(tmp_path: Path, monkeypatch):
     """registry에 등록이 하나도 없으면 스케줄러는 confluence/jira를 건너뛴다 — 30분마다
     무의미한 인증 오류 로그가 쌓이는 것을 방지한다."""
+    # outlook_client 미주입 + 비-Windows에서는 outlook_*도 스케줄러가 스킵한다 (WSL 지원,
+    # 브리프 A3) — 의도된 변경으로 기대값에 outlook_* 제외를 반영. IS_WINDOWS를 명시적으로
+    # False 고정해 실행 OS(Windows 포함)와 무관하게 결정적으로 만든다.
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)
     state = {"registry": Registry(tmp_path / "atlassian.json")}
     scheduled = _scheduled_sources(state)
     assert "confluence" not in scheduled
     assert "jira" not in scheduled
-    assert set(scheduled) == set(SOURCES) - {"confluence", "jira"}
+    assert set(scheduled) == set(SOURCES) - {"confluence", "jira", "outlook_mail", "outlook_cal"}
 
 
 def test_scheduled_sources_includes_confluence_jira_when_registered(tmp_path: Path):

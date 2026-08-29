@@ -36,6 +36,11 @@ from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
+IS_WINDOWS = os.name == "nt"
+WINDOWS_ONLY_SOURCES = ("outlook_mail", "outlook_cal")
+_WINDOWS_ONLY_MSG = (
+    "Outlook 동기화는 Windows에서만 지원됩니다 (WSL은 개발·테스트용 — Fake 클라이언트 주입 시에만 동작)"
+)
 RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
 _RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
 GOLDEN_TEMPLATE = (
@@ -248,12 +253,21 @@ def _get_atlassian_client(state, service: str):
     return state[key]
 
 
+def _outlook_available(state: dict) -> bool:
+    """Outlook은 실제 Windows에서만 COM으로 동작한다. WSL은 개발·테스트용이므로 기본은
+    불가능 — 단, 테스트·데모 서버가 FakeOutlookClient를 주입한 경우에는 WSL에서도 동작한다."""
+    return state.get("outlook_client") is not None or IS_WINDOWS
+
+
 def _scheduled_sources(state: dict) -> list[str]:
     """스케줄러가 이번 라운드에 실제로 동기화할 소스 목록.
 
     confluence/jira는 atlassian registry에 등록된 게 하나도 없으면 매 라운드(기본
-    30분)마다 의미 없는 오류 로그만 쌓이므로 스킵한다. 수동 동기화(/api/sync/{source})는
-    이 필터를 거치지 않는다 — 등록 직후 사용자가 바로 확인해 보는 경우를 막지 않기 위해서다.
+    30분)마다 의미 없는 오류 로그만 쌓이므로 스킵한다. outlook_mail/outlook_cal은
+    Windows가 아니고 Fake 클라이언트도 주입되지 않았으면 스킵한다 — WSL에서 매 라운드
+    win32com ImportError 트레이스백만 쌓이는 것을 방지한다. 수동 동기화
+    (/api/sync/{source})는 이 필터를 거치지 않는다 — 등록 직후 사용자가 바로 확인해 보는
+    경우를 막지 않기 위해서다.
     """
     registry = state["registry"]
     out = []
@@ -261,6 +275,8 @@ def _scheduled_sources(state: dict) -> list[str]:
         if source == "confluence" and not registry.confluence_page_ids():
             continue
         if source == "jira" and not registry.jira_keys():
+            continue
+        if source in WINDOWS_ONLY_SOURCES and not _outlook_available(state):
             continue
         out.append(source)
     return out
@@ -278,6 +294,15 @@ def run_sync(state: dict, source: str) -> dict:
             entry["ok"] = False
             entry["error"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다"
             _logger.error("%s 동기화 건너뜀(DB 없음): %s", source, entry["error"])
+            state["log"].insert(0, entry)
+            del state["log"][200:]
+            return entry
+        if source in WINDOWS_ONLY_SOURCES and not _outlook_available(state):
+            # WSL은 개발·테스트용 — win32com이 없어 COM 트레이스백만 쌓이므로 조용히 거절한다.
+            # 수동 동기화(/api/sync/outlook_*)도 이 게이트를 거친다 (스케줄러 필터와 별개).
+            entry["ok"] = False
+            entry["error"] = _WINDOWS_ONLY_MSG
+            _logger.info("%s 동기화 건너뜀(Windows 전용): %s", source, entry["error"])
             state["log"].insert(0, entry)
             del state["log"][200:]
             return entry
@@ -492,6 +517,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 entry["doc_count"] = row[0]
                 if source == "outlook_mail":
                     entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
+            if source in WINDOWS_ONLY_SOURCES and not _outlook_available(state):
+                entry["unsupported"] = _WINDOWS_ONLY_MSG
             out.append(entry)
         return out
 
@@ -661,7 +688,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 "rebuild_in_progress": read_conn is not None and rebuild.marker_present(read_conn),
                 "rebuilding": bool(state.get("rebuilding")),
                 "resummarizing": bool(state.get("resummarizing")),
-                "evaluating": bool(state.get("evaluating"))}
+                "evaluating": bool(state.get("evaluating")),
+                "windows": IS_WINDOWS}
 
     @app.post("/api/rebuild", dependencies=[Depends(local_origin_only)])
     def rebuild_index(payload: dict):

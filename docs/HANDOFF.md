@@ -1,7 +1,7 @@
 # llmsearch 작업 인수인계 지시서
 
 > 이 repo를 clone한 뒤 다른 Claude 세션에서 작업을 이어가기 위한 문서.
-> 마지막 갱신: 2026-08-29 (M8 머지 완료 — 다음: M9 로컬 임베딩 스파이크)
+> 마지막 갱신: 2026-08-30 (WSL 개발·테스트 지원 정리 머지 완료 — 다음: M9 로컬 임베딩 스파이크)
 
 ## 1. 현재 상태
 
@@ -16,9 +16,10 @@
 | M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |
 | M7 검색 품질·평가 | ✅ 머지 | 채팅 필터(선검색 강제·툴 기본값·Claude 고지), 툴 스키마 현행화, 출처 발췌, 골든 평가 GUI |
 | M8 채팅 UX | ✅ 머지 | 세션 저장/복원(chats.db)·내보내기(export_to_notes)·출처 미리보기 |
+| WSL 개발·테스트 지원 정리 | ✅ 머지 | Windows 전용 Outlook 소스(`IS_WINDOWS`/`_outlook_available`) 스케줄러 자동 제외·수동 동기화 안내 메시지·소스 탭 "Windows 전용" 표시, 환경별 README |
 
-- 테스트 기준: **371 passed** (`./.venv/bin/pytest`)
-- E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가)
+- 테스트 기준: **376 passed** (`./.venv/bin/pytest`)
+- E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가; WSL 지원 변경은 Fake 주입 경로만 건드려 E2E 시나리오 수 불변)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
 ## 2. 환경 셋업 (clone 직후)
@@ -26,7 +27,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 371 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 376 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```
@@ -100,3 +101,4 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 - 일시 장애 vs 삭제 구분: `_RETRY_SENTINEL`(local_docs), 미스 카운터+safe-round(confluence/jira) — 이 패턴을 깨면 데이터 소실.
 - 웹 테스트의 TestClient는 `base_url="http://127.0.0.1"` 필수 (TrustedHostMiddleware).
 - chunking.py/embeddings.py 2개 파일만 레거시 탭 들여쓰기 — 나머지는 4칸 공백.
+- WSL은 개발·테스트 전용 — Outlook 소스는 자동 제외(`_outlook_available`), 데모/테스트는 Fake 주입으로 동작.
