@@ -297,3 +297,23 @@ def test_read_conn_is_looked_up_at_call_time(tmp_path: Path):
     state["read_conn"] = fresh
     r = client.get("/api/sources")
     assert next(s for s in r.json() if s["source"] == "notes")["doc_count"] == 1
+
+
+def test_mutating_endpoints_reject_foreign_origin(tmp_path: Path):
+    """스펙 M6 §2: 임의 웹페이지의 CSRF(no-cors POST)로 동기화·아카이브·등록이 트리거되면 안 된다."""
+    client = make_app(tmp_path)
+    evil = {"Origin": "http://evil.example"}
+    assert client.post("/api/sync/notes", headers=evil).status_code == 403
+    assert client.post("/api/archive", json={"project": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/atlassian/register", json={"url": "x"}, headers=evil).status_code == 403
+    assert client.request("DELETE", "/api/atlassian/registrations", json={"url": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/sync/notes", headers={"Origin": "null"}).status_code == 403
+    assert client.post("/api/sync/notes", headers={"Referer": "https://evil.example/page"}).status_code == 403
+
+
+def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
+    client = make_app(tmp_path)
+    assert client.post("/api/sync/notes").status_code == 200  # curl/CLI — Origin 없음
+    assert client.post("/api/sync/notes", headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
+    assert client.post("/api/sync/notes", headers={"Origin": "http://localhost:8642"}).status_code == 200
+    assert client.post("/api/sync/notes", headers={"Referer": "http://127.0.0.1:8642/"}).status_code == 200

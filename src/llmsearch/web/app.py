@@ -8,9 +8,10 @@ import traceback
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -35,6 +36,23 @@ _AUTH_EXPIRED_MSG = (
     "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
 )
 _logger = logging.getLogger(__name__)
+
+
+def _is_local_origin(value: str) -> bool:
+    parts = urlsplit(value)
+    return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost")
+
+
+def local_origin_only(request: Request) -> None:
+    """상태 변경 API의 CSRF 방어 (스펙 M6 §2).
+
+    브라우저는 크로스오리진 POST/PUT/DELETE(no-cors 단순 요청 포함)에 항상 Origin을 붙이므로,
+    Origin(없으면 Referer)이 로컬이 아니면 거부한다. 헤더가 둘 다 없는 요청(curl·CLI·TestClient)은
+    브라우저가 아니므로 통과. "null" Origin(샌드박스·file://)도 거부된다.
+    """
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if origin and not _is_local_origin(origin):
+        raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
 
 
 def _get_outlook_client(state):
@@ -304,7 +322,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             out.append(entry)
         return out
 
-    @app.post("/api/sync/{source}")
+    @app.post("/api/sync/{source}", dependencies=[Depends(local_origin_only)])
     def manual_sync(source: str):
         _require_db()
         if source not in SOURCES:
@@ -315,7 +333,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def log():
         return state["log"]
 
-    @app.post("/api/atlassian/register")
+    @app.post("/api/atlassian/register", dependencies=[Depends(local_origin_only)])
     def atlassian_register(payload: dict):
         try:
             return state["registry"].add(str(payload.get("url", "")))
@@ -326,7 +344,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def atlassian_registrations():
         return state["registry"].list()
 
-    @app.delete("/api/atlassian/registrations")
+    @app.delete("/api/atlassian/registrations", dependencies=[Depends(local_origin_only)])
     def atlassian_deregister(payload: dict):
         if not state["registry"].remove(str(payload.get("url", ""))):
             raise HTTPException(404, "등록되지 않은 URL")
@@ -346,7 +364,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 out.append({"name": p.name, "doc_count": row[0]})
         return out
 
-    @app.post("/api/archive")
+    @app.post("/api/archive", dependencies=[Depends(local_origin_only)])
     def archive(payload: dict):
         name = str(payload.get("project", ""))
         _require_db()
@@ -358,7 +376,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             except ValueError as exc:
                 raise HTTPException(400, str(exc))
 
-    @app.post("/api/open")
+    @app.post("/api/open", dependencies=[Depends(local_origin_only)])
     def open_item(payload: dict):
         target = str(payload.get("url_or_path", ""))
         _require_db()
@@ -400,7 +418,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    @app.post("/api/chat")
+    @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
         _require_db()
         state["usage"].record("answer")
