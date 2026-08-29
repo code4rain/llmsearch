@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import traceback
 from dataclasses import asdict
@@ -26,11 +27,13 @@ from ..connectors.local_docs import sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
-from ..rules import load_rules_md
+from ..rules import load_rules_md, parse_rules_md
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
+RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
+_RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
 _AUTH_EXPIRED_MSG = (
     "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
     "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
@@ -332,6 +335,29 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.get("/api/log")
     def log():
         return state["log"]
+
+    @app.get("/api/rules")
+    def rules_get():
+        path = config.rules_md_path
+        text = path.read_text(encoding="utf-8") if path.exists() else RULES_TEMPLATE
+        return {"text": text, "path": str(path), "sections": list(parse_rules_md(text))}
+
+    @app.put("/api/rules", dependencies=[Depends(local_origin_only)])
+    def rules_put(payload: dict):
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "text는 문자열이어야 합니다")
+        data = text.encode("utf-8")
+        if len(data) > _RULES_MAX_BYTES:
+            raise HTTPException(400, f"rules.md는 {_RULES_MAX_BYTES // 1024}KB 이하여야 합니다")
+        path = config.rules_md_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)  # 원자적 교체 — 저장 중 크래시로 규칙 파일이 절단되지 않게
+        sections = parse_rules_md(text)
+        state["answerer"].update_rules(sections)  # 동기화 경로는 run_sync마다 파일을 다시 읽는다
+        return {"ok": True, "sections": list(sections)}
 
     @app.post("/api/atlassian/register", dependencies=[Depends(local_origin_only)])
     def atlassian_register(payload: dict):

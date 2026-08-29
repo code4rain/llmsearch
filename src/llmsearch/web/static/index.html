@@ -21,6 +21,7 @@
   <button onclick="show('chat')">채팅</button>
   <button onclick="show('sources')">소스</button>
   <button onclick="show('log')">로그</button>
+  <button onclick="show('settings')">설정</button>
 </nav>
 
 <div id="chat" class="tab active">
@@ -46,6 +47,15 @@
 
 <div id="log" class="tab"><pre id="logBody"></pre></div>
 
+<div id="settings" class="tab">
+  <h3>규칙 (rules.md) <small id="rulesPath"></small></h3>
+  <p><small>섹션 헤더가 주입 위치를 정한다: ## 용어집(모든 LLM 호출) · ## 분류 규칙 · ## 요약 규칙 · ## 답변 규칙. 규칙 변경은 신규 문서부터 적용 — 기존 문서는 아래 재요약으로.</small></p>
+  <textarea id="rulesText" style="width:100%;height:60vh;font-family:monospace"></textarea><br>
+  <button id="saveRulesBtn" onclick="saveRules()">저장</button> <span id="rulesStatus"></span>
+  <h3>운영</h3>
+  <button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>
+</div>
+
 <script>
 const history = [];
 function show(id) {
@@ -53,6 +63,7 @@ function show(id) {
   document.getElementById(id).classList.add('active');
   if (id === 'sources') { loadSources(); loadRegistrations(); loadProjects(); }
   if (id === 'log') loadLog();
+  if (id === 'settings') loadRules();
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -114,6 +125,19 @@ async function archiveProject(name) {
 async function loadLog() {
   const data = await (await fetch('/api/log')).json();
   document.getElementById('logBody').textContent = JSON.stringify(data, null, 2);
+}
+async function loadRules() {
+  const r = await (await fetch('/api/rules')).json();
+  document.getElementById('rulesText').value = r.text;  // .value — innerHTML 금지 (</textarea> XSS)
+  document.getElementById('rulesPath').textContent = r.path;
+  document.getElementById('rulesStatus').textContent = '섹션: ' + (r.sections.join(', ') || '(없음)');
+}
+async function saveRules() {
+  const r = await fetch('/api/rules', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: document.getElementById('rulesText').value})});
+  const data = await r.json();
+  document.getElementById('rulesStatus').textContent =
+    r.ok ? '저장됨 · 섹션: ' + (data.sections.join(', ') || '(없음)') : (data.detail || '저장 실패');
 }
 async function ask(e) {
   e.preventDefault();

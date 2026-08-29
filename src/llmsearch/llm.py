@@ -33,8 +33,16 @@ _SEARCH_TOOL = {
 class Answerer(Protocol):
     def answer_stream(self, question: str, history: list[dict], search_fn: SearchFn) -> Iterator[dict]: ...
 
+    def update_rules(self, sections: dict[str, str]) -> None: ...
+
 
 class FakeAnswerer:
+    def __init__(self):
+        self.rules: dict[str, str] = {}  # 마지막 update_rules 값 — 테스트 관찰용
+
+    def update_rules(self, sections: dict[str, str]) -> None:
+        self.rules = dict(sections)
+
     def answer_stream(self, question, history, search_fn) -> Iterator[dict]:
         hits = search_fn(question)
         if not hits:
@@ -63,6 +71,11 @@ class ClaudeAnswerer:
         self.active_projects = active_projects or []
         self.answer_rules = answer_rules
         self.glossary = glossary
+
+    def update_rules(self, sections: dict[str, str]) -> None:
+        """설정 탭 저장 즉시 반영 — 재시작 없이 다음 답변부터 새 규칙 사용 (스펙 M6 §3)."""
+        self.answer_rules = sections.get("답변 규칙", "")
+        self.glossary = sections.get("용어집", "")
 
     def _system(self) -> str:
         parts = [

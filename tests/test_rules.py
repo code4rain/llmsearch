@@ -58,3 +58,12 @@ def test_match_override_case_sensitive():
     overrides = [{"match": "path:**/Reports/**", "target": "Area/Reports"}]
     assert match_override("/docs/reports/x.pptx", None, overrides) is None  # "reports" != "Reports"
     assert match_override("/docs/Reports/x.pptx", None, overrides) == "Area/Reports"
+
+
+def test_parse_rules_md_matches_load(tmp_path):
+    from llmsearch.rules import load_rules_md, parse_rules_md
+
+    text = "# 규칙\n\n## 용어집\nPJA = 프로젝트A\n\n## 답변 규칙\n두괄식\n"
+    p = tmp_path / "rules.md"
+    p.write_text(text, encoding="utf-8")
+    assert parse_rules_md(text) == load_rules_md(p) == {"용어집": "PJA = 프로젝트A", "답변 규칙": "두괄식"}

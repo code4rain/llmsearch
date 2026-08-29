@@ -321,3 +321,41 @@ def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
     assert client.post("/api/sync/notes", headers={"Referer": "http://127.0.0.1:8642/"}).status_code == 200
     assert client.post("/api/chat", json={"question": "오리진 검사 통과 질의", "history": []},
                        headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
+
+
+def test_rules_get_template_when_missing(tmp_path: Path):
+    client = make_app(tmp_path)
+    r = client.get("/api/rules")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["text"].startswith("# 규칙 (rules.md)")
+    assert body["sections"] == ["용어집", "분류 규칙", "요약 규칙", "답변 규칙"]
+    assert body["path"].endswith("rules.md")
+
+
+def test_rules_put_saves_and_updates_answerer(tmp_path: Path):
+    client = make_app(tmp_path)
+    text = "# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n\n## 답변 규칙\n두괄식\n"
+    r = client.put("/api/rules", json={"text": text})
+    assert r.status_code == 200 and r.json() == {"ok": True, "sections": ["용어집", "답변 규칙"]}
+    path = client.app.state.llmsearch["config"].rules_md_path
+    assert path.read_text(encoding="utf-8") == text
+    assert not path.with_name(path.name + ".tmp").exists()  # 원자적 저장 — tmp 잔재 없음
+    assert client.app.state.llmsearch["answerer"].rules["답변 규칙"] == "두괄식"
+    assert client.get("/api/rules").json()["text"] == text
+
+
+def test_rules_put_rejects_bad_input(tmp_path: Path):
+    client = make_app(tmp_path)
+    assert client.put("/api/rules", json={"text": 123}).status_code == 400
+    assert client.put("/api/rules", json={}).status_code == 400
+    big = "가" * (90 * 1024)  # UTF-8 3바이트 × 90K = 270KB > 256KB
+    assert client.put("/api/rules", json={"text": big}).status_code == 400
+    assert not client.app.state.llmsearch["config"].rules_md_path.exists()  # 파일 미변경
+    assert client.put("/api/rules", json={"text": "x"}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_settings_tab_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    assert 'id="settings"' in html and 'id="rulesText"' in html and "설정" in html
