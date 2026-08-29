@@ -22,6 +22,7 @@ VISION_MIN_CHARS = 200  # pptx 추출 텍스트가 이 미만이면 이미지 �
 # 재처리되게 한다. 동시에 seen에는 남아 있으므로 이번 실행에서 "삭제됨"으로
 # 오판되지 않아 기존 요약본/복사본/색인이 지워지지 않는다.
 RETRY_SENTINEL = [0.0, 0]
+DRM_MARKER = "🔒 DRM/암호화로 내용 미인덱싱"  # DRM 폴백 본문 표식 — 재사용 경로가 content_indexed 판정에 씀
 
 
 def extract_text(path: Path) -> str:
@@ -121,12 +122,34 @@ def _cleanup(prior: tuple[str, str] | None) -> None:
         copy.unlink()
 
 
+def _reuse_summary(path: Path, sid: str, st, prior: tuple[str, str] | None) -> Document | None:
+    """rebuild 재인덱싱: 기존 요약 md 본문으로 Document를 만든다 — summarizer 미호출 (스펙 M6 §6).
+
+    md가 없거나 읽히지 않으면 None → 호출자가 정상 요약 경로로 폴백한다. _place는 호출하지 않는다
+    (원본 재복사 불필요; para_overrides 재평가도 생략 — 반영은 재요약 버튼의 역할).
+    """
+    if not prior:
+        return None
+    summary_path = Path(prior[1])
+    try:
+        body = summary_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    return Document(
+        source_type="local_docs", source_id=sid, title=path.name, text=body, url_or_path=sid,
+        updated_at=datetime.fromtimestamp(st.st_mtime),
+        content_indexed=DRM_MARKER not in body,
+        extra={"para_path": prior[0], "summary_path": prior[1]},
+    )
+
+
 def sync_local_docs(
     folders: list[Path], excludes: list[str], overrides: list[dict],
     summarizer: Summarizer, summaries_dir: Path,
     projects: list[str], areas: list[str], glossary: str, class_rules: str,
     state: dict, prior_map: dict[str, tuple[str, str]],
     renderer: SlideRenderer | None = None, summary_rules: str = "",
+    force_reindex: bool = False,
 ) -> SyncResult:
     prev: dict[str, list] = dict(state.get("files", {}))
     seen: dict[str, list] = {}
@@ -145,11 +168,18 @@ def sync_local_docs(
                 seen[sid] = list(RETRY_SENTINEL)  # 삭제 오판 방지 + 다음 라운드 재시도
                 continue
             sig = [st.st_mtime, st.st_size]
-            if prev.get(sid) == sig:
+            if prev.get(sid) == sig and not force_reindex:
                 seen[sid] = sig  # 변경 없음 — 이미 처리된 파일로 유지
                 continue
 
             prior = prior_map.get(sid)
+            if force_reindex and prev.get(sid) == sig:
+                reused = _reuse_summary(path, sid, st, prior)
+                if reused is not None:
+                    documents.append(reused)
+                    seen[sid] = sig
+                    continue
+                # 요약 md 소실/손상 → 정상 요약 경로로 폴백 (아래)
             try:
                 content_indexed = True
                 try:
@@ -176,7 +206,7 @@ def sync_local_docs(
                     category = prior[0] if prior else "Resources/미분류"
                     body = (
                         f"# {path.name}\n\n## 요약\n{desc}\n\n"
-                        f"(🔒 DRM/암호화로 내용 미인덱싱 — 파일명 기반)\n\n"
+                        f"({DRM_MARKER} — 파일명 기반)\n\n"
                         f"## 키워드\n{path.stem.replace('_', ' ').replace('-', ' ')}\n"
                     )
                 override = match_override(sid, None, overrides)
@@ -203,6 +233,13 @@ def sync_local_docs(
                 seen[sid] = list(RETRY_SENTINEL)
                 continue
 
+    if force_reindex:
+        # 재구축은 복원이지 정리가 아니다 — 미마운트 폴더 상태에서 전 문서가 deleted로 판정되어
+        # 요약 md가 unlink되는 사고를 막는다. 관측 못 한 sid는 센티널로 남겨 prior_map을 보존하고
+        # 다음 정상 동기화가 재처리·삭제 판정을 담당하게 한다 (스펙 M6 §6).
+        for sid in prev:
+            seen.setdefault(sid, list(RETRY_SENTINEL))
+        return SyncResult(documents=documents, deleted_ids=[], state={"files": seen})
     deleted = [sid for sid in prev if sid not in seen]
     for sid in deleted:
         _cleanup(prior_map.get(sid))
