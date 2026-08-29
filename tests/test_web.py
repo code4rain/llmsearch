@@ -206,3 +206,54 @@ def test_archive_api_unknown_project_404(tmp_path):
     client = TestClient(app, base_url="http://127.0.0.1")  # TrustedHost 통과
     assert client.post("/api/archive", json={"project": "없음"}).status_code == 404
     assert client.post("/api/archive", json={"project": ".."}).status_code == 400
+
+
+def test_sync_paused_at_daily_limit_but_chat_still_works(tmp_path):
+    """스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지, 검색·답변은 유지."""
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app, run_sync
+
+    notes = tmp_path / "notes"
+    notes.mkdir()
+    (notes / "a.md").write_text("# 메모\n프로젝트A 내용", encoding="utf-8")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes], daily_api_call_limit=1)
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    state = app.state.llmsearch
+
+    entry1 = run_sync(state, "notes")  # 인덱싱 1회 → embed 1건 기록 → 상한(1) 도달
+    assert entry1["ok"] is True and entry1["indexed"] == 1
+
+    entry2 = run_sync(state, "notes")  # 이제 게이트에 걸림
+    assert entry2["ok"] is False and entry2["indexed"] == 0
+    assert "일일 API 호출 상한" in entry2["error"] and "검색" in entry2["error"]
+    assert state["log"][0]["error"] == entry2["error"]  # 로그 탭에 노출
+
+    client = TestClient(app, base_url="http://127.0.0.1")
+    r = client.post("/api/chat", json={"question": "프로젝트A 뭐였지?", "history": []})
+    assert r.status_code == 200
+    assert "event: done" in r.text  # 상한 도달 후에도 채팅 스트림 정상 완료
+
+
+def test_chat_records_answer_usage(tmp_path):
+    from fastapi.testclient import TestClient
+
+    from llmsearch.config import Config
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.llm import FakeAnswerer
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.web.app import create_app
+
+    app = create_app(Config(data_dir=tmp_path / "data"), embedder=FakeEmbeddings(),
+                     summarizer=FakeSummarizer(), answerer=FakeAnswerer(),
+                     enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    client.post("/api/chat", json={"question": "q", "history": []})
+    tracker = app.state.llmsearch["usage"]
+    today = tracker._data.get(tracker._today(), {})
+    assert today.get("answer", 0) >= 1

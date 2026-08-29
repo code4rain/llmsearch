@@ -2,6 +2,7 @@
 
 사용: ./.venv/bin/python tools/e2e/demo_server.py   (127.0.0.1:8642)
 데이터: <repo>/.e2e-data/ (gitignore, 기동 시 초기화)
+daily_api_call_limit=50 — 기존 시나리오(동기화 6종+채팅 1회)는 도달하지 않고, 채팅 반복으로는 도달 가능한 값.
 """
 import shutil
 from datetime import datetime, timedelta
@@ -74,7 +75,7 @@ atlassian = FakeAtlassianClient(
 renderer = FakeSlideRenderer(images={"프로젝트A_아키텍처.pptx": [b"png1", b"png2"]})
 
 cfg = Config(data_dir=BASE / "data", notes_folders=[NOTES], watch_folders=[WATCH],
-             projects=["프로젝트A"])
+             projects=["프로젝트A"], daily_api_call_limit=50)
 app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
                  answerer=FakeAnswerer(), outlook_client=outlook,
                  atlassian_client=atlassian, slide_renderer=renderer,

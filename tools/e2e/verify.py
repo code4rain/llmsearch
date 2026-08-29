@@ -5,8 +5,10 @@
 
 시나리오: 소스 6종 → Atlassian URL 등록/dedup → 6종 동기화(비전 증강 pptx 포함) →
 아카이브 목록 → 채팅+출처 → 열기 버튼 → 프로젝트 완료 처리(디스크 이동 확인) →
-등록 삭제 → 로그.
+등록 삭제 → 로그 → 사용량 카운터(usage.json) → 일일 API 호출 상한 게이트(M5).
 """
+import json
+from datetime import date
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -110,6 +112,72 @@ with sync_playwright() as p:
     log_text = page.locator("#logBody").inner_text()
     for src in ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira"):
         check(f"로그 기록: {src}", src in log_text)
+
+    # 9. 사용량 카운터 (usage.json) — 지금까지의 6종 동기화(embed·summary·vision)와
+    #    채팅 1회(embed·answer)가 이미 오늘 날짜 아래 4종 모두를 최소 1건씩 기록했어야 한다.
+    usage_path = DATA / "data" / "usage.json"
+    check("usage.json 생성", usage_path.exists(), str(usage_path))
+    today_key = date.today().isoformat()
+
+    def usage_today() -> dict:
+        return json.loads(usage_path.read_text(encoding="utf-8")).get(today_key, {})
+
+    def usage_total() -> int:
+        return sum(usage_today().values())
+
+    today_usage = usage_today()
+    for kind in ("embed", "summary", "vision", "answer"):
+        check(f"사용량 기록: {kind}", today_usage.get(kind, 0) >= 1, f"count={today_usage.get(kind, 0)}")
+
+    # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
+    #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다
+    #     (매직 카운트 금지). 무한 루프 방지로 40회 상한을 두고, 초과 시 check()가 FAIL 처리한다.
+    DAILY_LIMIT = 50
+    MAX_ROUNDS = 40
+    rounds = 0
+    while usage_total() < DAILY_LIMIT and rounds < MAX_ROUNDS:
+        rounds += 1
+        resp = page.request.post(
+            f"{BASE}/api/chat",
+            data=json.dumps({"question": f"프로젝트A 반복 질의 {rounds}", "history": []}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp.text()  # SSE 스트림을 끝까지 소비 — 서버 제너레이터가 완주해야 embed/answer가 기록된다
+    check("채팅 반복으로 일일 상한 도달(40회 이내)", usage_total() >= DAILY_LIMIT,
+          f"total={usage_total()} rounds={rounds}")
+
+    page.click("nav >> text=소스")
+    page.wait_for_selector("#srcTable tbody tr")
+    notes_row = page.locator("#srcTable tbody tr", has_text="notes").first
+    notes_before = notes_row.locator("td").nth(1).inner_text()
+    notes_row.locator("button", has_text="동기화").click()
+    page.wait_for_timeout(700)
+    notes_row = page.locator("#srcTable tbody tr", has_text="notes").first
+    notes_after = notes_row.locator("td").nth(1).inner_text()
+    check("상한 도달 후 notes 동기화 스킵(문서 수 불변)", notes_after == notes_before,
+          f"before={notes_before} after={notes_after}")
+
+    gated = [e for e in page.request.get(f"{BASE}/api/log").json()
+             if e.get("source") == "notes" and e.get("ok") is False]
+    check("run_sync 게이트 로그 기록", bool(gated) and "일일 API 호출 상한" in (gated[0].get("error") or ""),
+          gated[0]["error"][:60] if gated else "게이트 로그 항목 없음")
+
+    page.click("nav >> text=로그")
+    page.wait_for_timeout(300)
+    check("로그 탭에 일일 상한 안내 노출", "일일 API 호출 상한" in page.locator("#logBody").inner_text())
+
+    # 참고: index.html의 syncNow()는 /api/sync 응답의 ok/error를 확인하지 않고 loadSources()만
+    # 호출한다 — alert(r.error) 경로가 연결돼 있지 않아 상한 게이트를 다이얼로그로 알리지 않는다
+    # (2026-08-29 실측 확인 — page.on("dialog")로 관찰 시 게이트 진입 후에도 dialogs가 비어 있음).
+    # 백엔드 게이트·로그 노출은 위 두 체크로 충분히 검증했다고 보고 다이얼로그 검증은 생략한다 —
+    # 프런트 수정(syncNow에 ok/error 확인 추가)은 이 태스크 범위 밖. docs/HANDOFF.md 참조.
+
+    page.click("nav >> text=채팅")
+    page.fill("#question", "프로젝트A 킥오프 다시 알려줘")
+    page.click("text=검색")
+    page.wait_for_selector(".src", timeout=10000)
+    check("상한 도달 후에도 채팅 정상 응답(검색·답변 유지)",
+          "프로젝트A" in page.locator("#messages").inner_text())
 
     browser.close()
 

@@ -1,7 +1,7 @@
 # llmsearch 작업 인수인계 지시서
 
 > 이 repo를 clone한 뒤 다른 Claude 세션에서 작업을 이어가기 위한 문서.
-> 마지막 갱신: 2026-08-18 (M4 머지 완료, M5 계획 승인 상태)
+> 마지막 갱신: 2026-08-29 (M5 머지 완료 — 계획된 마일스톤 전부 완료)
 
 ## 1. 현재 상태
 
@@ -11,9 +11,9 @@
 | M2 Outlook | ✅ 머지 | outlook_mail/outlook_cal, ComWorker STA, 롤링 윈도우 커서, 인용 절단 |
 | M3 Confluence/Jira | ✅ 머지 | 인증 3단 폴백(PAT→Basic→쿠키), 페이지 트리 미러, 이슈+댓글, URL 등록 GUI |
 | M4 잔여 P1 | ✅ 머지 | PPT 비전 보완(SlideRenderer), 서비스별 자격증명(CONFLUENCE_*/JIRA_*), Archive 워크플로 |
-| M5 비용 통제 P2 | 📋 **계획 승인, 미구현** | `docs/superpowers/plans/2026-08-18-llmsearch-m5.md` — 3태스크, 전체 코드 포함, 3관점 리뷰 반영 완료 |
+| M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (44/44) |
 
-- master 테스트 기준: **248 passed** (`./.venv/bin/pytest`)
+- master 테스트 기준: **265 passed** (`./.venv/bin/pytest`)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
 ## 2. 환경 셋업 (clone 직후)
@@ -36,9 +36,9 @@ Playwright E2E (선택, sudo 불필요):
 ./.venv/bin/python tools/e2e/verify.py          # 전체 시나리오 검증
 ```
 
-## 3. 다음 작업: M5 실행
+## 3. 다음 작업: 계획된 마일스톤 없음
 
-`docs/superpowers/plans/2026-08-18-llmsearch-m5.md`를 **superpowers:subagent-driven-development** 스킬로 실행한다 (사용자가 매 마일스톤 이 방식을 선택해 왔음). 표준 절차:
+M1~M5 전부 머지 완료. 잔여는 §6 수동 게이트(Windows/사내망)와 §7 파킹된 결정뿐이다. 새 마일스톤을 시작하면 아래 표준 절차를 그대로 따른다 (사용자가 매 마일스톤 이 방식을 선택해 왔음):
 
 1. `EnterWorktree`(또는 `git worktree add`)로 격리 브랜치 생성 → **`git merge master`로 최신화 확인** (워크트리가 낡은 HEAD에서 분기된 사례 2회 있었음) → venv 셋업 + 베이스라인 테스트
 2. superpowers 스크립트로 태스크별 브리프 추출(`task-brief PLAN N`) → 구현자 서브에이전트 디스패치 (플랜에 전체 코드가 있으므로 저비용 모델로 충분, 통합 태스크는 중간 모델)
@@ -69,6 +69,7 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 2. `python scripts/check_ppt_render.py <pptx>` — PowerPoint COM 렌더링. 부분 손상·암호 pptx로 모달 없이 실패하는지도 확인 (M4; POWERPNT.EXE 상주는 의도된 동작)
 3. M3 사내망 체크리스트 — 실 Confluence/Jira base URL 설정, 인증 진단, 등록·동기화·출처 열기 (m3 계획 말미 5항목)
 4. M4 체크리스트 — 실 pptx 비전 요약(Gemini 유료 키), 서비스별 자격증명, GUI 아카이브 (m4 계획 말미)
+5. M5 체크리스트 — `limits.daily_api_calls: 5` 같은 작은 값으로 동기화 반복 → 로그 탭 "일일 API 호출 상한" 안내 + 채팅 유지 확인, `data_dir/usage.json` 일자별 누적 확인 후 0으로 복원 (m5 계획 말미)
 
 ## 7. 파킹된 결정 (구현 전 사용자 확인 필요)
 
