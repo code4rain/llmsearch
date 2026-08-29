@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import date
 from pathlib import Path
@@ -44,9 +45,11 @@ class UsageTracker:
             for old in sorted(self._data)[:-_KEEP_DAYS]:
                 del self._data[old]
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp_path.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=1), encoding="utf-8"
             )
+            os.replace(tmp_path, self.path)
             total = sum(self._data.get(self._today(), {}).values())
         logger.info(
             "API 사용량 +%d(%s) — 오늘 누적 %d건, 일일 상한 %s",
