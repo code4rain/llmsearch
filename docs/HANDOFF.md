@@ -11,9 +11,9 @@
 | M2 Outlook | ✅ 머지 | outlook_mail/outlook_cal, ComWorker STA, 롤링 윈도우 커서, 인용 절단 |
 | M3 Confluence/Jira | ✅ 머지 | 인증 3단 폴백(PAT→Basic→쿠키), 페이지 트리 미러, 이슈+댓글, URL 등록 GUI |
 | M4 잔여 P1 | ✅ 머지 | PPT 비전 보완(SlideRenderer), 서비스별 자격증명(CONFLUENCE_*/JIRA_*), Archive 워크플로 |
-| M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (44/44) |
+| M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (45/45), 이연 Minor 정리 후속 반영 |
 
-- master 테스트 기준: **265 passed** (`./.venv/bin/pytest`)
+- master 테스트 기준: **271 passed** (`./.venv/bin/pytest`)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
 ## 2. 환경 셋업 (clone 직후)
@@ -21,7 +21,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 248 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 271 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```

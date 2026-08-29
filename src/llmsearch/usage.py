@@ -5,6 +5,9 @@
 웹 계층의 run_sync 진입 게이트이고, 트래커와 카운팅 래퍼 자신은 절대 차단하지 않는다.
 그래야 검색(쿼리 임베딩)·채팅 답변이 상한 도달 후에도 계속 동작한다 (스펙 §10:
 "상한 도달 시 요약·인덱싱만 일시정지, 검색은 유지").
+단일 앱 인스턴스를 전제한다 — 기동 시 1회 로드 후 매 record()마다 전체 dict를 덮어써서
+저장하므로, 동일 파일을 공유하는 다중 프로세스 인스턴스나 실행 중 수동 편집은 카운트가
+유실될 수 있다.
 """
 from __future__ import annotations
 
@@ -14,6 +17,11 @@ import os
 import threading
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .embeddings import EmbeddingProvider
+    from .summarize import Summarizer
 
 logger = logging.getLogger(__name__)
 
@@ -42,18 +50,23 @@ class UsageTracker:
         return date.today().isoformat()
 
     def record(self, kind: str, count: int = 1) -> None:
+        if not isinstance(kind, str):
+            raise TypeError(f"kind는 문자열이어야 함: {type(kind).__name__}")
+        if count < 1:
+            raise ValueError(f"count는 1 이상이어야 함: {count}")
         with self._lock:
-            day_data = self._data.setdefault(self._today(), {})
+            today = self._today()
+            day_data = self._data.setdefault(today, {})
             day_data[kind] = day_data.get(kind, 0) + count
             for old in sorted(self._data)[:-_KEEP_DAYS]:
                 del self._data[old]
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp_path = self.path.with_name(self.path.name + ".tmp")
             tmp_path.write_text(
                 json.dumps(self._data, ensure_ascii=False, indent=1), encoding="utf-8"
             )
             os.replace(tmp_path, self.path)
-            total = sum(self._data.get(self._today(), {}).values())
+            total = sum(self._data.get(today, {}).values())
         logger.info(
             "API 사용량 +%d(%s) — 오늘 누적 %d건, 일일 상한 %s",
             count, kind, total,
@@ -64,14 +77,23 @@ class UsageTracker:
         with self._lock:
             return sum(self._data.get(self._today(), {}).values())
 
+    def today_by_kind(self) -> dict[str, int]:
+        """오늘 종류별 카운트 복사본 — 반환값을 변경해도 내부 상태에 영향 없음."""
+        with self._lock:
+            return dict(self._data.get(self._today(), {}))
+
     def indexing_allowed(self) -> bool:
         return self.daily_limit <= 0 or self.today_total() < self.daily_limit
 
 
 class CountingEmbedder:
-    """EmbeddingProvider 래퍼 — 배치 호출 1건당 record("embed"). 차단하지 않는다."""
+    """EmbeddingProvider 래퍼 — 배치 호출 1건당 record("embed"). 차단하지 않는다.
 
-    def __init__(self, inner, tracker: UsageTracker):
+    기록이 위임(inner 호출)보다 먼저 일어나므로 inner가 예외를 던져도 카운트는 남는다 —
+    실패한 호출도 API 예산을 소모했다고 보수적으로 취급하려는 의도다.
+    """
+
+    def __init__(self, inner: EmbeddingProvider, tracker: UsageTracker):
         self.inner = inner
         self.tracker = tracker
 
@@ -81,9 +103,13 @@ class CountingEmbedder:
 
 
 class CountingSummarizer:
-    """Summarizer 래퍼 — 요약·파일명 설명은 "summary", 비전 설명은 "vision"으로 기록."""
+    """Summarizer 래퍼 — 요약·파일명 설명은 "summary", 비전 설명은 "vision"으로 기록.
 
-    def __init__(self, inner, tracker: UsageTracker):
+    기록이 위임(inner 호출)보다 먼저 일어나므로 inner가 예외를 던져도 카운트는 남는다 —
+    실패한 호출도 API 예산을 소모했다고 보수적으로 취급하려는 의도다.
+    """
+
+    def __init__(self, inner: Summarizer, tracker: UsageTracker):
         self.inner = inner
         self.tracker = tracker
 

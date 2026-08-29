@@ -43,11 +43,11 @@ class Config:
 
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    para = raw.get("para", {})
-    rules = raw.get("rules", {})
-    outlook = raw.get("outlook", {})
-    atlassian = raw.get("atlassian", {})
-    limits = raw.get("limits", {})
+    para = raw.get("para") or {}
+    rules = raw.get("rules") or {}
+    outlook = raw.get("outlook") or {}
+    atlassian = raw.get("atlassian") or {}
+    limits = raw.get("limits") or {}
     return Config(
         data_dir=Path(raw["data_dir"]),
         watch_folders=[Path(p) for p in raw.get("watch_folders", [])],

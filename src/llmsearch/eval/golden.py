@@ -42,6 +42,8 @@ def main():
 	args = parser.parse_args()
 	cfg = load_config(args.config)
 	from ..embeddings import GeminiEmbeddings
+	# GeminiEmbeddings를 직접 생성해 쓴다 — usage.py의 CountingEmbedder를 거치지 않으므로
+	# 이 도구의 호출은 usage.json 카운팅·일일 API 상한 게이트 바깥에서 실제 API 예산을 소모한다.
 
 	conn = db.open_db(cfg.db_path)
 	cases = yaml.safe_load(args.golden.read_text(encoding="utf-8"))
