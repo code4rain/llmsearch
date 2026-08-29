@@ -154,7 +154,7 @@ def _reuse_summary(path: Path, sid: str, st, prior: tuple[str, str] | None) -> D
     )
 ```
 
-`sync_local_docs` 시그니처 끝에 `force_reindex: bool = False` 추가. 루프의 시그니처 비교 블록을 다음으로 교체:
+`sync_local_docs` 시그니처 끝에 `force_reindex: bool = False` 추가. 루프에서 `sig = [st.st_mtime, st.st_size]`부터 `prior = prior_map.get(sid)`까지(현재 147~152행)를 다음으로 교체:
 
 ```python
             sig = [st.st_mtime, st.st_size]
@@ -226,7 +226,6 @@ def test_read_legacy_maps_ignores_schema_version(tmp_path):
     indexer.set_sync_state(conn, "notes", {"files": {}})
     conn.execute("UPDATE meta SET value='0' WHERE key='schema_version'")
     conn.commit(); conn.close()
-    import pytest
     with pytest.raises(db.SchemaMismatchError):
         db.open_db(path)  # 버전 불일치는 여전히 기동을 막는다
     rows, state = db.read_legacy_maps(path)
@@ -240,7 +239,6 @@ def test_read_legacy_maps_ignores_schema_version(tmp_path):
 `tests/test_rebuild.py` 신규:
 
 ```python
-import json
 from pathlib import Path
 
 import pytest
@@ -285,7 +283,9 @@ def test_marker_roundtrip(tmp_path: Path, monkeypatch):
     assert rebuild.marker_present(conn) is False
     rebuild.set_marker(conn); conn.commit()
     assert rebuild.marker_present(conn) is True
-    assert rebuild.marker_present(db.open_db(state["config"].db_path)) is True  # 커밋됨 — 다른 커넥션에서 보임
+    other = db.open_db(state["config"].db_path)
+    assert rebuild.marker_present(other) is True  # 커밋됨 — 다른 커넥션에서 보임
+    other.close()
     rebuild.clear_marker(conn); conn.commit()
     assert rebuild.marker_present(conn) is False
 
@@ -369,6 +369,7 @@ def read_legacy_maps(path: Path) -> tuple[list[tuple[str, str, str]], dict]:
     if not path.exists():
         return [], {}
     try:
+        # 확장(sqlite_vec) 미로드 커넥션 — vec0 가상 테이블은 건드리지 않는다 (SELECT * 금지)
         conn = sqlite3.connect(path)
     except sqlite3.Error:
         return [], {}
@@ -486,7 +487,7 @@ git commit -m "feat: rebuild 핵심 — 마커·사전 검사·제자리 초기�
 
 **Interfaces:**
 - Consumes: Task 1 `force_reindex`, Task 2 `precheck`/`reset_index`/마커/`read_legacy_maps`
-- Produces: `rebuild.start_resync(state, run_sync, sources) -> threading.Thread` (`state["rebuilding"]`, `state["rebuild_thread"]`); `rebuild.recover_schema_mismatch(state) -> dict`; `create_app`이 `SchemaMismatchError`를 잡아 `state["schema_mismatch"]`(정상 시 None)로 보관하고 기동 시 마커가 있으면 `state["force_reindex_local_docs"]=True`; `run_sync`가 local_docs에 `force_reindex` 전달 + 성공 시 플래그 해제·마커 삭제; `scheduler_loop`는 `rebuilding` 중 라운드 스킵; `GET /api/status` → `{schema_mismatch, rebuild_in_progress, rebuilding, resummarizing}`; `POST /api/rebuild {force?}` → `{ok, phase:"resync", targets, documents_deleted|legacy_maps_recovered}` 또는 409 `{detail, missing_folders}`; `POST /api/rebuild/resume` → `{ok, phase, targets}`. Task 4 CLI와 Task 5 UI/E2E가 사용.
+- Produces: `rebuild.claim(state)`/`rebuild.release(state)` (rebuilding 원자적 선점/해제), `rebuild.start_resync(state, run_sync, sources) -> threading.Thread` (`state["rebuild_thread"]`, 종료 시 release); `rebuild.recover_schema_mismatch(state) -> dict`; `create_app`이 `SchemaMismatchError`를 잡아 `state["schema_mismatch"]`(정상 시 None)로 보관하고 기동 시 마커가 있으면 `state["force_reindex_local_docs"]=True`; `run_sync`가 local_docs에 `force_reindex` 전달 + 성공 시 플래그 해제·마커 삭제; `scheduler_loop`는 `rebuilding` 중 라운드 스킵; `GET /api/status` → `{schema_mismatch, rebuild_in_progress, rebuilding, resummarizing}`; `POST /api/rebuild {force?}` → `{ok, phase:"resync", targets, documents_deleted|legacy_maps_recovered}` 또는 409 `{detail, missing_folders}`; `POST /api/rebuild/resume` → `{ok, phase, targets}`. Task 4 CLI와 Task 5 UI/E2E가 사용.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -552,6 +553,19 @@ def test_rebuild_refusals_and_force(tmp_path: Path, monkeypatch):
     wait_resync(state)
     assert doc_count(state["read_conn"], "notes") == 1
     assert client.post("/api/rebuild", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_resummarize_and_second_rebuild_refused_while_rebuilding(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    client.post("/api/sync/local_docs")
+    state["rebuilding"] = True  # 재수집 스레드가 도는 중이라고 가정
+    try:
+        assert client.post("/api/resummarize", json={"all": True}).status_code == 409
+        assert client.post("/api/rebuild", json={}).status_code == 409
+        assert client.post("/api/rebuild/resume", json={}).status_code == 409
+    finally:
+        state["rebuilding"] = False
 
 
 def test_marker_survives_until_local_docs_succeeds(tmp_path: Path, monkeypatch):
@@ -639,14 +653,29 @@ Expected: FAIL — `/api/rebuild` 404, `AttributeError: start_resync`, 스키마
 `src/llmsearch/rebuild.py`에 추가:
 
 ```python
+def claim(state: dict) -> None:
+    """precheck 통과 직후 rebuilding을 원자적으로 선점 — 동시 POST 두 건이 둘 다 초기화하는 것을 막는다.
+
+    선점 후 초기화·start_resync가 실패하면 호출자가 release()로 되돌린다.
+    """
+    with state["sync_lock"]:
+        if state.get("rebuilding"):
+            raise RebuildRefused("재구축이 이미 진행 중입니다")
+        state["rebuilding"] = True
+
+
+def release(state: dict) -> None:
+    state["rebuilding"] = False
+
+
 def start_resync(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequence[str]) -> threading.Thread:
     """백그라운드 재수집 — 수천 문서·메일 1년치는 수십 분이 걸리므로 HTTP 요청 안에서 기다리지 않는다.
 
+    호출자가 claim()으로 rebuilding을 이미 선점한 상태여야 한다(선점 안 됐으면 여기서 선점).
     마커는 여기서 지우지 않는다 — local_docs run_sync가 force_reindex 플래그를 소비할 때 지운다.
     """
-    if state.get("rebuilding"):
-        raise RebuildRefused("재구축이 이미 진행 중입니다")
-    state["rebuilding"] = True
+    if not state.get("rebuilding"):
+        claim(state)
     targets = list(sources)
 
     def target():
@@ -655,11 +684,15 @@ def start_resync(state: dict, run_sync: Callable[[dict, str], dict], sources: Se
                 entry = run_sync(state, source)
                 logger.info("재수집 %s: ok=%s indexed=%s", source, entry["ok"], entry["indexed"])
         finally:
-            state["rebuilding"] = False
+            release(state)
 
     thread = threading.Thread(target=target, name="llmsearch-rebuild", daemon=True)
     state["rebuild_thread"] = thread
-    thread.start()
+    try:
+        thread.start()
+    except BaseException:
+        release(state)  # start 실패로 영구 "진행 중"이 되지 않게
+        raise
     return thread
 
 
@@ -675,8 +708,14 @@ def recover_schema_mismatch(state: dict) -> dict:
         for sid, para_path, summary_path in rows:
             conn.execute("INSERT OR REPLACE INTO para_map(source_id, para_path, summary_path) VALUES (?,?,?)",
                          (sid, para_path, summary_path))
-        if local_state:
-            indexer.set_sync_state(conn, "local_docs", local_state)
+        files = dict(local_state.get("files", {})) if isinstance(local_state, dict) else {}
+        for sid, _para, _summary in rows:
+            # 상태가 유실됐어도 para_map에 있는 sid는 상태에 남긴다 — run_sync의 prior_map은 files 키로
+            # 만들어지므로, 비어 있으면 prior=None → _place가 해시 접미사 중복 md를 만든다 (스펙 §10 C1).
+            # 센티널은 시그니처와 결코 일치하지 않아 재요약(또는 md 재사용)은 그대로 강제된다.
+            files.setdefault(sid, [0.0, 0])
+        if files or local_state:
+            indexer.set_sync_state(conn, "local_docs", {**(local_state or {}), "files": files})
         set_marker(conn)
         conn.commit()
         state["conn"], state["read_conn"] = conn, read_conn
@@ -688,6 +727,13 @@ def recover_schema_mismatch(state: dict) -> dict:
 ```
 
 `src/llmsearch/web/app.py`:
+
+`/api/resummarize`의 상한 사전 게이트 옆에 재구축 중 거부를 추가한다(재구축 대기 중 전체 재요약이 상태를 센티널로 바꾸면 재수집이 요약 md 재사용 대신 전량 LLM 요약을 하게 된다):
+
+```python
+        if state.get("rebuilding"):
+            raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 재요약하세요")
+```
 
 import에 `from .. import db, indexer, rebuild, search`, `from fastapi.responses import FileResponse, JSONResponse, StreamingResponse`.
 
@@ -744,11 +790,16 @@ import에 `from .. import db, indexer, rebuild, search`, `from fastapi.responses
         force = payload.get("force") is True
         try:
             rebuild.precheck(state, force=force)
+            rebuild.claim(state)  # 여기부터 rebuilding=True — 동시 POST는 409
+        except rebuild.RebuildRefused as exc:
+            return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": exc.missing_folders})
+        try:
             info = rebuild.recover_schema_mismatch(state) if state.get("schema_mismatch") else rebuild.reset_index(state)
             targets = _scheduled_sources(state)
             rebuild.start_resync(state, run_sync, targets)
-        except rebuild.RebuildRefused as exc:
-            return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": exc.missing_folders})
+        except Exception:
+            rebuild.release(state)
+            raise
         return {"ok": True, "phase": "resync", "targets": targets, **info}
 
     @app.post("/api/rebuild/resume", dependencies=[Depends(local_origin_only)])
@@ -757,10 +808,15 @@ import에 `from .. import db, indexer, rebuild, search`, `from fastapi.responses
         if not rebuild.marker_present(state["read_conn"]):
             raise HTTPException(409, "재개할 재구축이 없습니다")
         try:
-            targets = _scheduled_sources(state)
-            rebuild.start_resync(state, run_sync, targets)
+            rebuild.claim(state)
         except rebuild.RebuildRefused as exc:
             raise HTTPException(409, exc.detail)
+        try:
+            targets = _scheduled_sources(state)
+            rebuild.start_resync(state, run_sync, targets)
+        except Exception:
+            rebuild.release(state)
+            raise
         return {"ok": True, "phase": "resync", "targets": targets}
 ```
 
@@ -786,7 +842,7 @@ git commit -m "feat: rebuild 웹 통합 — 백그라운드 재수집·마커 �
 - Test: `tests/test_rebuild.py` (추가)
 
 **Interfaces:**
-- Produces: `rebuild.run_cli(state, run_sync, sources, yes=False, input_fn=input, out=print) -> int` (종료코드: 0 성공, 2 거부/취소); `python -m llmsearch --config C --rebuild [--yes]`.
+- Produces: `rebuild.run_cli(state, run_sync, sources, yes=False, force=False, input_fn=input, out=print) -> int` (종료코드: 0 성공, 2 거부/취소; precheck를 프롬프트 전에 수행); `python -m llmsearch --config C --rebuild [--yes] [--force]`. `__main__`이 `web.app`의 `_scheduled_sources`(프라이빗)를 import하는 것은 스펙 §6 `sources.py` 분리를 생략한 의도된 결합.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -825,12 +881,13 @@ def test_main_parses_rebuild_flags(monkeypatch, tmp_path: Path):
     calls = {}
     monkeypatch.setattr(m, "load_config", lambda p: Config(data_dir=tmp_path / "data"))
     monkeypatch.setattr(m, "create_app", lambda cfg: type("A", (), {"state": type("S", (), {"llmsearch": {"x": 1}})()})())
-    monkeypatch.setattr(m, "run_cli", lambda state, run_sync, sources, yes: calls.update(yes=yes, state=state) or 0)
+    monkeypatch.setattr(m, "load_dotenv", lambda *a, **k: None)  # 실 .env가 os.environ에 새지 않게
+    monkeypatch.setattr(m, "run_cli", lambda state, run_sync, sources, yes, force: calls.update(yes=yes, force=force, state=state) or 0)
     monkeypatch.setattr(m, "_scheduled_sources", lambda state: ["notes"])
     monkeypatch.setattr(m.uvicorn, "run", lambda *a, **k: calls.update(served=True))
-    monkeypatch.setattr("sys.argv", ["llmsearch", "--config", "c.yaml", "--rebuild", "--yes"])
+    monkeypatch.setattr("sys.argv", ["llmsearch", "--config", "c.yaml", "--rebuild", "--yes", "--force"])
     m.main()
-    assert calls == {"yes": True, "state": {"x": 1}, "served": True}
+    assert calls == {"yes": True, "force": True, "state": {"x": 1}, "served": True}
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -844,9 +901,14 @@ Expected: FAIL — `AttributeError: run_cli`, `argparse` unrecognized `--rebuild
 
 ```python
 def run_cli(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequence[str],
-            yes: bool = False, input_fn: Callable[[str], str] = input,
+            yes: bool = False, force: bool = False, input_fn: Callable[[str], str] = input,
             out: Callable[[str], None] = print) -> int:
     """헤드리스 재구축 — 서버 기동 전에 동기로 초기화·재수집. 0=성공, 2=거부/취소."""
+    try:
+        precheck(state, force=force)  # 확인 프롬프트 전에 거부 조건을 먼저 — 확인한 뒤 거부되면 혼란
+    except RebuildRefused as exc:
+        out(f"재구축 거부: {exc.detail}" + (" (--force로 건너뛰기 가능)" if exc.missing_folders else ""))
+        return 2
     conn = state.get("conn")
     if conn is None:
         out(f"index.db 스키마 불일치: {state.get('schema_mismatch')} — legacy 매핑을 회수해 재구축합니다")
@@ -859,16 +921,24 @@ def run_cli(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequenc
         out("취소됨")
         return 2
     try:
-        precheck(state)
+        claim(state)
         info = recover_schema_mismatch(state) if state.get("schema_mismatch") else reset_index(state)
     except RebuildRefused as exc:
         out(f"재구축 거부: {exc.detail}")
         return 2
+    except Exception:
+        release(state)
+        raise
     out(f"초기화 완료: {info}")
-    for source in sources:
-        entry = run_sync(state, source)
-        out(f"재수집 {source}: ok={entry['ok']} indexed={entry['indexed']}"
-            + (f" error={entry['error'].splitlines()[0]}" if entry["error"] else ""))
+    if info.get("legacy_maps_recovered") == 0:
+        out("⚠️ 요약 md 매핑을 회수하지 못했습니다 — local_docs가 전량 재요약됩니다(요약 API 소모)")
+    try:
+        for source in sources:
+            entry = run_sync(state, source)
+            out(f"재수집 {source}: ok={entry['ok']} indexed={entry['indexed']}"
+                + (f" error={entry['error'].splitlines()[0]}" if entry["error"] else ""))
+    finally:
+        release(state)
     return 0
 ```
 
@@ -893,12 +963,13 @@ def main():
     parser.add_argument("--port", type=int, default=8642)
     parser.add_argument("--rebuild", action="store_true", help="기동 전 인덱스 재구축 (요약 md 재사용)")
     parser.add_argument("--yes", action="store_true", help="--rebuild 확인 프롬프트 생략")
+    parser.add_argument("--force", action="store_true", help="--rebuild 시 미존재 폴더 경고 무시")
     args = parser.parse_args()
     load_dotenv()
     app = create_app(load_config(args.config))
     if args.rebuild:
         state = app.state.llmsearch
-        code = run_cli(state, run_sync, _scheduled_sources(state), yes=args.yes)
+        code = run_cli(state, run_sync, _scheduled_sources(state), yes=args.yes, force=args.force)
         if code != 0:
             sys.exit(code)
     uvicorn.run(app, host="127.0.0.1", port=args.port)  # 로컬 전용 (스펙 §10)
@@ -985,7 +1056,11 @@ async function rebuildIndex() {
     if (!confirm(`폴더를 찾을 수 없습니다:\n${d.missing_folders.join('\n')}\n\n건너뛰고 진행할까요? (해당 문서는 다음 동기화에서 재처리)`)) return;
     [r, d] = await postRebuild({force: true});
   }
-  alert(r.ok ? `재구축 시작 — 재수집 대상: ${d.targets.join(', ')}` : (d.detail || '재구축 실패'));
+  const msg = r.ok
+    ? `재구축 시작 — 재수집 대상: ${d.targets.join(', ')}` +
+      (d.legacy_maps_recovered === 0 ? '\n⚠️ 요약 md 매핑을 회수하지 못했습니다 — local_docs가 전량 재요약됩니다(요약 API 소모).' : '')
+    : (d.detail || '재구축 실패');
+  alert(msg);
   loadStatus(); loadSources();
 }
 async function resumeRebuild() {
@@ -1004,16 +1079,25 @@ async function resumeRebuild() {
 
 ```python
     # 9.9 M6b — 인덱스 재구축: 요약 md 재사용(summary/vision 불변), 문서 수 복원 (스펙 M6 §6)
+    # 9.5에서 만든 rules.md는 아직 notes 인덱스에 없다 — 먼저 반영해야 재구축 후 수가 일치한다 (notes 2→3)
+    page.request.post(f"{BASE}/api/sync/notes")
+    page.wait_for_timeout(300)
     before = usage_today()
     counts_before = {r["source"]: r["doc_count"] for r in page.request.get(f"{BASE}/api/sources").json()}
     dialogs.clear()
     page.click("nav >> text=설정")
     page.click("#rebuildBtn")  # confirm·alert는 dialog 핸들러가 accept
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(1000)
     check("재구축 시작 alert", any("재구축 시작" in m for m in dialogs), " / ".join(m[:40] for m in dialogs))
-    page.wait_for_function(
-        "fetch('/api/status').then(r => r.json()).then(s => !s.rebuilding && !s.rebuild_in_progress)",
-        timeout=30000, polling=500)
+    # 재수집은 백그라운드 스레드 — /api/status를 폴링해 기다린다. (wait_for_function에 Promise를 넘기면
+    # Playwright가 pending Promise를 truthy로 보고 즉시 반환하므로 쓰지 않는다.)
+    status = {"rebuilding": True, "rebuild_in_progress": True}
+    for _ in range(60):  # 0.5s × 60 = 30s
+        status = page.request.get(f"{BASE}/api/status").json()
+        if not status["rebuilding"] and not status["rebuild_in_progress"]:
+            break
+        page.wait_for_timeout(500)
+    check("재구축 재수집 완료", not status["rebuilding"] and not status["rebuild_in_progress"], str(status))
     counts_after = {r["source"]: r["doc_count"] for r in page.request.get(f"{BASE}/api/sources").json()}
     for src in ("notes", "local_docs", "outlook_mail", "outlook_cal"):
         check(f"재구축 후 문서 수 복원: {src}", counts_after[src] == counts_before[src],
@@ -1022,16 +1106,17 @@ async function resumeRebuild() {
     check("재구축: summary 불변(요약 md 재사용)", after.get("summary", 0) == before.get("summary", 0))
     check("재구축: vision 불변", after.get("vision", 0) == before.get("vision", 0))
     check("재구축: embed 증가", after.get("embed", 0) > before.get("embed", 0))
+    check("재구축: 미등록 jira는 재수집 대상 아님", counts_after["jira"] == 0, f"jira={counts_after['jira']}")
     page.click("nav >> text=소스")
     page.wait_for_timeout(300)
     check("재구축 후 배너 없음", page.locator("#banner").is_hidden())
 ```
 
-Run: 데모 서버 기동 → `./.venv/bin/python tools/e2e/verify.py` → `총 64건 전부 PASS` (55 + 9). 예산: 9.9 전 ≈20건 + embed ≈8(notes 2 + rules.md 1 + local 1 + mail 1 + cal 1 + confluence 2) ≈ 28 < 50.
+Run: 데모 서버 기동 → `./.venv/bin/python tools/e2e/verify.py` → `총 66건 전부 PASS` (55 + 11). 예산: 9.9 전 ≈20건 + notes 선동기화 embed 1 + 재구축 embed ≈9(notes 3 + local 1 + mail 1 + cal 1 + confluence 2 + …) ≈ 30 < 50.
 
 - [ ] **Step 5: HANDOFF·커밋**
 
-`docs/HANDOFF.md`: §1 표에 `| M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |`, 기준 테스트 수/E2E 64 갱신, §3 다음 작업 = M7(검색 품질·평가) 스펙 작성, §5 문서 지도에 m6b 계획, §6 수동 게이트에 "M6b: 실 데이터로 [인덱스 재구축] 1회 — summary/vision 카운트 불변 확인, `--rebuild --yes` 헤드리스 확인".
+`docs/HANDOFF.md`: §1 표에 `| M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |`, 기준 테스트 수/E2E 66 갱신, §3 다음 작업 = M7(검색 품질·평가) 스펙 작성, §5 문서 지도에 m6b 계획, §6 수동 게이트에 "M6b: 실 데이터로 [인덱스 재구축] 1회 — summary/vision 카운트 불변 확인, `--rebuild --yes` 헤드리스 확인".
 
 ```bash
 git add src/llmsearch/web/static/index.html tools/e2e/verify.py docs/HANDOFF.md README.md tests/test_web.py
