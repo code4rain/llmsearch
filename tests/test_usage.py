@@ -71,3 +71,44 @@ def test_corrupt_file_starts_fresh(tmp_path: Path):
     assert t.today_total() == 0
     t.record("embed")  # 손상 파일 위에도 정상 기록
     assert t.today_total() == 1
+
+
+def test_counting_embedder_records_and_delegates(tmp_path: Path):
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.usage import CountingEmbedder
+
+    t = UsageTracker(tmp_path / "usage.json")
+    e = CountingEmbedder(FakeEmbeddings(), t)
+    out = e.embed(["가", "나"])
+    assert len(out) == 2 and len(out[0]) > 0  # 위임 결과 그대로
+    e.embed(["다"])
+    assert t.today_total() == 2  # 호출 단위 기록 (텍스트 수 아님 — 배치 1회 = API 1회)
+
+
+def test_counting_embedder_records_even_at_limit(tmp_path: Path):
+    """래퍼는 차단하지 않는다 — 상한 도달 후에도 검색 쿼리 임베딩은 동작해야 한다."""
+    from llmsearch.embeddings import FakeEmbeddings
+    from llmsearch.usage import CountingEmbedder
+
+    t = UsageTracker(tmp_path / "usage.json", daily_limit=1)
+    e = CountingEmbedder(FakeEmbeddings(), t)
+    e.embed(["가"])
+    assert t.indexing_allowed() is False
+    assert len(e.embed(["나"])) == 1  # 차단 없이 정상 위임
+
+
+def test_counting_summarizer_records_by_kind(tmp_path: Path):
+    from llmsearch.summarize import FakeSummarizer
+    from llmsearch.usage import CountingSummarizer
+
+    t = UsageTracker(tmp_path / "usage.json")
+    s = CountingSummarizer(FakeSummarizer(), t)
+    r = s.summarize_and_classify(title="문서", text="프로젝트A 내용", projects=["프로젝트A"],
+                                 areas=[], existing_resources=[], prior_category=None,
+                                 glossary="", rules="")
+    assert r.category == "Projects/프로젝트A"  # 위임 결과 그대로
+    assert "파일명 기반" in s.describe_filename("보고서.pptx")
+    assert "2장" in s.describe_images("덱.pptx", [b"a", b"b"])
+    saved = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
+    today = date.today().isoformat()
+    assert saved[today] == {"summary": 2, "vision": 1}

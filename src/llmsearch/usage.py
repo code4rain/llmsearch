@@ -63,3 +63,35 @@ class UsageTracker:
 
     def indexing_allowed(self) -> bool:
         return self.daily_limit <= 0 or self.today_total() < self.daily_limit
+
+
+class CountingEmbedder:
+    """EmbeddingProvider 래퍼 — 배치 호출 1건당 record("embed"). 차단하지 않는다."""
+
+    def __init__(self, inner, tracker: UsageTracker):
+        self.inner = inner
+        self.tracker = tracker
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        self.tracker.record("embed")
+        return self.inner.embed(texts)
+
+
+class CountingSummarizer:
+    """Summarizer 래퍼 — 요약·파일명 설명은 "summary", 비전 설명은 "vision"으로 기록."""
+
+    def __init__(self, inner, tracker: UsageTracker):
+        self.inner = inner
+        self.tracker = tracker
+
+    def summarize_and_classify(self, *args, **kwargs):
+        self.tracker.record("summary")
+        return self.inner.summarize_and_classify(*args, **kwargs)
+
+    def describe_filename(self, filename: str) -> str:
+        self.tracker.record("summary")
+        return self.inner.describe_filename(filename)
+
+    def describe_images(self, title: str, images: list[bytes]) -> str:
+        self.tracker.record("vision")
+        return self.inner.describe_images(title, images)
