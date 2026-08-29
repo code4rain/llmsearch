@@ -1,0 +1,429 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "llmsearch 런타임 아키텍처",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/code4rain/llmsearch",
+      "revision": "41a4d16629dea51c04361183ea0343fcc35efa48"
+    },
+    "viewBox": [
+      1120,
+      540
+    ],
+    "views": [
+      {
+        "id": "chat-path",
+        "label": "질문→답변 경로",
+        "focus": [
+          "browser",
+          "api",
+          "answerer",
+          "claude",
+          "search",
+          "indexdb"
+        ],
+        "note": "브라우저 질문이 FastAPI → Claude 툴 루프 → 하이브리드 검색 → index.db로 이어지는 주 경로."
+      },
+      {
+        "id": "sync-path",
+        "label": "수집·인덱싱 경로",
+        "focus": [
+          "corp",
+          "connectors",
+          "sync",
+          "indexdb",
+          "gemini"
+        ],
+        "note": "스케줄러/수동 동기화가 커넥터로 수집하고 Gemini로 요약·임베딩해 index.db에 넣는다."
+      },
+      {
+        "id": "cost-control",
+        "label": "비용·신뢰 경계",
+        "focus": [
+          "usage",
+          "sync",
+          "gemini",
+          "claude"
+        ],
+        "note": "UsageTracker가 모든 API 호출을 세고 run_sync 진입 게이트 한 곳에서만 차단한다."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "브라우저 UI",
+      "sublabel": "static/index.html",
+      "pos": [
+        40,
+        170
+      ],
+      "size": [
+        150,
+        64
+      ],
+      "tag": "채팅·소스·로그·설정",
+      "sources": [
+        {
+          "path": "src/llmsearch/web/static/index.html"
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI 웹 계층",
+      "sublabel": "web/app.py · 127.0.0.1",
+      "pos": [
+        260,
+        170
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "TrustedHost · 로컬 오리진",
+      "sources": [
+        {
+          "path": "src/llmsearch/web/app.py"
+        }
+      ]
+    },
+    {
+      "id": "answerer",
+      "type": "backend",
+      "label": "ClaudeAnswerer",
+      "sublabel": "llm.py · 툴 ≤3회",
+      "pos": [
+        490,
+        170
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/llm.py"
+        }
+      ]
+    },
+    {
+      "id": "search",
+      "type": "backend",
+      "label": "하이브리드 검색",
+      "sublabel": "search.py · RRF 승격",
+      "pos": [
+        700,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/search.py"
+        }
+      ]
+    },
+    {
+      "id": "chatsdb",
+      "type": "database",
+      "label": "chats.db",
+      "sublabel": "세션·메시지 저장",
+      "pos": [
+        260,
+        30
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/chats.py"
+        }
+      ]
+    },
+    {
+      "id": "indexdb",
+      "type": "database",
+      "label": "index.db",
+      "sublabel": "FTS5 + sqlite-vec",
+      "pos": [
+        700,
+        450
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "소모품 — rebuild 대상",
+      "sources": [
+        {
+          "path": "src/llmsearch/db.py"
+        },
+        {
+          "path": "src/llmsearch/indexer.py"
+        }
+      ]
+    },
+    {
+      "id": "sync",
+      "type": "backend",
+      "label": "run_sync + 스케줄러",
+      "sublabel": "소스별 격리·게이트",
+      "pos": [
+        490,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/web/app.py",
+          "label": "run_sync"
+        }
+      ]
+    },
+    {
+      "id": "connectors",
+      "type": "backend",
+      "label": "커넥터 6종",
+      "sublabel": "6종 커넥터",
+      "pos": [
+        260,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/connectors/local_docs.py"
+        },
+        {
+          "path": "src/llmsearch/connectors/outlook_mail.py"
+        },
+        {
+          "path": "src/llmsearch/connectors/confluence.py"
+        }
+      ],
+      "tag": "notes·local_docs·outlook·atlassian"
+    },
+    {
+      "id": "usage",
+      "type": "security",
+      "label": "UsageTracker",
+      "sublabel": "usage.json · 일일 상한",
+      "pos": [
+        260,
+        450
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "카운팅 래퍼",
+      "sources": [
+        {
+          "path": "src/llmsearch/usage.py"
+        }
+      ]
+    },
+    {
+      "id": "corp",
+      "type": "external",
+      "label": "사내 소스",
+      "sublabel": "Outlook·Wiki·Jira·문서",
+      "pos": [
+        40,
+        310
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "gemini",
+      "type": "external",
+      "label": "Gemini API",
+      "sublabel": "임베딩·요약·비전",
+      "pos": [
+        920,
+        310
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "유료 티어"
+    },
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "Claude API",
+      "sublabel": "claude-opus-5 답변",
+      "pos": [
+        920,
+        170
+      ],
+      "size": [
+        160,
+        64
+      ],
+      "tag": "유료 티어"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "로컬 머신 127.0.0.1 — Windows 실사용 · WSL 개발/테스트",
+      "wraps": [
+        "browser",
+        "api",
+        "answerer",
+        "search",
+        "chatsdb",
+        "indexdb",
+        "sync",
+        "connectors",
+        "usage"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "외부 API 경계 — .env 키 전용 · 회사 데이터 전송",
+      "wraps": [
+        "gemini",
+        "claude"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "ask",
+      "from": "browser",
+      "to": "api",
+      "label": "질문 / SSE",
+      "variant": "emphasis"
+    },
+    {
+      "id": "answer-stream",
+      "from": "api",
+      "to": "answerer",
+      "label": "answer_stream",
+      "variant": "emphasis"
+    },
+    {
+      "id": "claude-call",
+      "from": "answerer",
+      "to": "claude",
+      "label": "messages.stream + 툴",
+      "variant": "emphasis"
+    },
+    {
+      "id": "search-fn",
+      "from": "answerer",
+      "to": "search",
+      "label": "search_fn (필터)",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "search-index",
+      "from": "search",
+      "to": "indexdb",
+      "label": "FTS5 + 벡터 30",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "query-embed",
+      "from": "search",
+      "to": "gemini",
+      "label": "질의 임베딩"
+    },
+    {
+      "id": "session-save",
+      "from": "api",
+      "to": "chatsdb",
+      "label": "세션 이력·저장",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "trigger-sync",
+      "from": "api",
+      "to": "sync",
+      "label": "수동/스케줄 동기화",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "collect",
+      "from": "sync",
+      "to": "connectors",
+      "label": "sync_*"
+    },
+    {
+      "id": "fetch",
+      "from": "connectors",
+      "to": "corp",
+      "label": "수집"
+    },
+    {
+      "id": "index-docs",
+      "from": "sync",
+      "to": "indexdb",
+      "label": "인덱싱 (요약·임베딩)",
+      "fromSide": "bottom",
+      "toSide": "left"
+    },
+    {
+      "id": "gate",
+      "from": "usage",
+      "to": "sync",
+      "label": "indexing_allowed",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "bottom"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "주 경로 — 질문에서 답변까지",
+      "items": [
+        "필터·session_id 검증 → record(answer) → chats.db 이력 → Claude 스트림",
+        "선검색은 필터 강제, 툴 검색은 빈 인자만 필터로 채움; 답변은 finally 저장(중단 시 부분 보존)"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "수집·인덱싱·data_dir",
+      "items": [
+        "notes · local_docs(요약·PARA) · outlook(ComWorker STA) · confluence · jira — 삭제 판정은 보수적",
+        "index.db(소모품, rebuild는 요약 md 재사용) · chats.db · usage.json · rules.md · summaries/ · exports/"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "비용·신뢰 경계",
+      "items": [
+        "모든 API 호출을 usage.json에 기록, 상한은 run_sync 게이트 한 곳 — 검색·답변은 계속",
+        "자격증명은 .env 전용; WSL은 Outlook 자동 제외 · PPT 렌더·파일 열기 비활성"
+      ]
+    }
+  ]
+}
