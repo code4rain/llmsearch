@@ -255,5 +255,4 @@ def test_chat_records_answer_usage(tmp_path):
     client = TestClient(app, base_url="http://127.0.0.1")
     client.post("/api/chat", json={"question": "q", "history": []})
     tracker = app.state.llmsearch["usage"]
-    today = tracker._data.get(tracker._today(), {})
-    assert today.get("answer", 0) >= 1
+    assert tracker.today_by_kind().get("answer", 0) >= 1

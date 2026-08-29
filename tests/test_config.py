@@ -83,3 +83,12 @@ def test_daily_api_call_limit_default_zero(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text("data_dir: /tmp/x\n", encoding="utf-8")
     assert load_config(p).daily_api_call_limit == 0
+
+
+def test_limits_key_present_but_empty_loads_zero(tmp_path):
+    """`limits:` 키만 있고 값이 없으면 YAML은 None을 준다 — AttributeError 없이 0으로 로드."""
+    from llmsearch.config import load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text("data_dir: /tmp/x\nlimits:\n", encoding="utf-8")
+    assert load_config(p).daily_api_call_limit == 0

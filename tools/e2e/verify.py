@@ -52,6 +52,29 @@ with sync_playwright() as p:
     page.wait_for_timeout(400)
     check("중복 등록 dedup", page.locator("#atlList li").count() == before == 2)
 
+    # usage.json 조회 헬퍼 — 이후 3단계(동기화 전 여유 확인)와 9~10단계(사용량 카운터·
+    # 일일 상한 게이트)에서 공용으로 쓴다.
+    usage_path = DATA / "data" / "usage.json"
+    today_key = date.today().isoformat()
+    DAILY_LIMIT = 50
+
+    def usage_today() -> dict:
+        return json.loads(usage_path.read_text(encoding="utf-8")).get(today_key, {})
+
+    def usage_total() -> int:
+        return sum(usage_today().values())
+
+    # 2.5. 동기화 시작 전 사용량 여유 확인 — 이 시나리오는 뒤(10단계)에서 일부러 채팅을
+    #      반복해 일일 상한까지 소진시킨다. 같은 usage.json을 여러 번 실행에 걸쳐 재사용하면
+    #      (또는 이전 실행이 비정상 종료해 파일이 남아있으면) 이번 실행이 이미 상한 근처에서
+    #      시작해 3단계 동기화 자체가 게이트에 막혀 실패할 수 있다 — 시나리오 순서와 예산이
+    #      결합돼 있음을 여기서 미리 단언해 원인을 명확히 한다. 파일이 아직 없으면 통과.
+    guard_exists = usage_path.exists()
+    guard_total = usage_total() if guard_exists else 0
+    check("동기화 시작 전 사용량 여유", not guard_exists or guard_total < DAILY_LIMIT,
+          f"exists={guard_exists} total={guard_total} limit={DAILY_LIMIT}"
+          " — 이전 실행 잔재로 이미 상한에 근접/도달했을 수 있음")
+
     # 3. 6종 동기화
     for src, expected in (("notes", "2"), ("local_docs", "1"), ("outlook_mail", "1"),
                           ("outlook_cal", "1"), ("confluence", "2"), ("jira", "1")):
@@ -115,15 +138,8 @@ with sync_playwright() as p:
 
     # 9. 사용량 카운터 (usage.json) — 지금까지의 6종 동기화(embed·summary·vision)와
     #    채팅 1회(embed·answer)가 이미 오늘 날짜 아래 4종 모두를 최소 1건씩 기록했어야 한다.
-    usage_path = DATA / "data" / "usage.json"
+    #    usage_path/today_key/usage_today()/usage_total()/DAILY_LIMIT는 2.5단계에서 정의.
     check("usage.json 생성", usage_path.exists(), str(usage_path))
-    today_key = date.today().isoformat()
-
-    def usage_today() -> dict:
-        return json.loads(usage_path.read_text(encoding="utf-8")).get(today_key, {})
-
-    def usage_total() -> int:
-        return sum(usage_today().values())
 
     today_usage = usage_today()
     for kind in ("embed", "summary", "vision", "answer"):
@@ -132,9 +148,12 @@ with sync_playwright() as p:
     # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
     #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다
     #     (매직 카운트 금지). 무한 루프 방지로 40회 상한을 두고, 초과 시 check()가 FAIL 처리한다.
-    DAILY_LIMIT = 50
     MAX_ROUNDS = 40
     rounds = 0
+    # UI 대신 page.request.post로 직접 호출한다 — 반복 40회를 매번 폼 채우기·클릭·렌더 대기로
+    # 하면 느리고 셀렉터 타이밍에 걸린 플래키 표면만 늘어난다. 게이트 통과 여부 자체는 이후
+    # usage_total() 재판독으로 검증하므로 UI 경유가 필요 없다 (게이트 이후 채팅 1회는 실제
+    # UI를 통해 별도로 검증한다).
     while usage_total() < DAILY_LIMIT and rounds < MAX_ROUNDS:
         rounds += 1
         resp = page.request.post(

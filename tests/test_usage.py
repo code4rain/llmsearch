@@ -1,6 +1,9 @@
 import json
+import threading
 from datetime import date
 from pathlib import Path
+
+import pytest
 
 from llmsearch import usage
 from llmsearch.usage import UsageTracker
@@ -125,6 +128,64 @@ def test_counting_embedder_records_even_at_limit(tmp_path: Path):
     e.embed(["가"])
     assert t.indexing_allowed() is False
     assert len(e.embed(["나"])) == 1  # 차단 없이 정상 위임
+
+
+def test_record_rejects_count_below_one(tmp_path: Path):
+    t = UsageTracker(tmp_path / "usage.json")
+    with pytest.raises(ValueError):
+        t.record("embed", 0)
+    with pytest.raises(ValueError):
+        t.record("embed", -1)
+    assert t.today_total() == 0  # 거부된 기록은 반영되지 않음
+
+
+def test_record_rejects_non_string_kind(tmp_path: Path):
+    t = UsageTracker(tmp_path / "usage.json")
+    with pytest.raises(TypeError):
+        t.record(123, 1)  # type: ignore[arg-type]
+
+
+def test_today_by_kind_returns_snapshot_copy(tmp_path: Path):
+    t = UsageTracker(tmp_path / "usage.json")
+    t.record("embed", 2)
+    t.record("summary")
+    snapshot = t.today_by_kind()
+    assert snapshot == {"embed": 2, "summary": 1}
+    snapshot["embed"] = 999  # 반환값 변경이 내부 상태에 영향 없어야 함
+    snapshot["new_kind"] = 1
+    assert t.today_by_kind() == {"embed": 2, "summary": 1}
+
+
+def test_record_works_with_extensionless_path(tmp_path: Path):
+    """확장자 없는 경로에서도 <name>.tmp 임시파일을 거쳐 정상 기록·재로드된다."""
+    path = tmp_path / "usage"
+    t1 = UsageTracker(path)
+    t1.record("embed", 3)
+    assert path.exists()
+    assert not (tmp_path / "usage.tmp").exists()  # 임시파일은 replace 후 남지 않음
+    t2 = UsageTracker(path)
+    assert t2.today_total() == 3
+
+
+def test_concurrent_record_is_serialized(tmp_path: Path):
+    """스레드 8개 × 각 50회 record — 락으로 직렬화되어 유실 없이 400건이 쌓인다."""
+    path = tmp_path / "usage.json"
+    t = UsageTracker(path)
+
+    def worker():
+        for _ in range(50):
+            t.record("embed")
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    assert t.today_total() == 400
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    today = date.today().isoformat()
+    assert saved[today]["embed"] == 400
 
 
 def test_counting_summarizer_records_by_kind(tmp_path: Path):
