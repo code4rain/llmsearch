@@ -481,3 +481,9 @@ def test_usage_endpoint_and_line(tmp_path: Path):
     assert u["days"][-1]["date"] == date.today().isoformat()
     assert u["days"][-1]["total"] == u["total"]
     assert 'id="usageLine"' in client.get("/").text
+
+
+def test_banner_and_rebuild_button_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    assert 'id="banner"' in html and 'id="rebuildBtn"' in html and "loadStatus()" in html

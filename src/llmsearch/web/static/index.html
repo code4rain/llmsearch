@@ -17,6 +17,7 @@
 </head>
 <body>
 <h1>llmsearch</h1>
+<div id="banner" style="display:none;background:#fff3cd;border:1px solid #e0c060;padding:.5rem;margin:.5rem 0"></div>
 <nav>
   <button onclick="show('chat')">채팅</button>
   <button onclick="show('sources')">소스</button>
@@ -55,6 +56,7 @@
   <button id="saveRulesBtn" onclick="saveRules()">저장</button> <span id="rulesStatus"></span>
   <h3>운영</h3>
   <button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>
+  <button id="rebuildBtn" onclick="rebuildIndex()">인덱스 재구축</button>
 </div>
 
 <script>
@@ -79,6 +81,7 @@ async function loadUsage() {
 }
 async function loadSources() {
   loadUsage();
+  loadStatus();
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
     `<tr><td>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
@@ -89,6 +92,53 @@ async function loadSources() {
 async function syncNow(source) {
   await fetch('/api/sync/' + source, {method: 'POST'});
   loadSources();
+}
+async function loadStatus() {
+  const s = await (await fetch('/api/status')).json();
+  const b = document.getElementById('banner');
+  b.replaceChildren();
+  let text = '', action = null;
+  if (s.schema_mismatch) {
+    text = 'index.db 스키마 불일치 — 재구축이 필요합니다 (요약 md는 재사용): ' + s.schema_mismatch;
+    action = ['재구축', rebuildIndex];
+  } else if (s.rebuilding) {
+    text = '재구축 진행 중 — 소스 탭 문서 수·로그 탭을 참조하세요 (메일은 백로그로 이어집니다)';
+  } else if (s.rebuild_in_progress) {
+    text = '이전 재구축이 완료되지 않았습니다';
+    action = ['재개', resumeRebuild];
+  }
+  if (!text) { b.style.display = 'none'; return; }
+  b.append(document.createTextNode(text + ' '));
+  if (action) { const btn = document.createElement('button'); btn.textContent = action[0]; btn.onclick = action[1]; b.append(btn); }
+  b.style.display = 'block';
+}
+async function postRebuild(body) {
+  const r = await fetch('/api/rebuild', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)});
+  return [r, await r.json()];
+}
+async function rebuildIndex() {
+  const srcs = await (await fetch('/api/sources')).json();
+  const total = srcs.reduce((a, s) => a + (s.doc_count || 0), 0);
+  if (!confirm(`인덱스를 초기화하고 전 소스를 다시 수집합니다 (현재 문서 ${total}건). 요약 md는 재사용되어 ` +
+               `변경된 파일만 요약 API를 호출하지만, 임베딩은 전량 다시 호출되어 일일 상한을 초과할 수 있습니다. 계속할까요?`)) return;
+  let [r, d] = await postRebuild({});
+  if (r.status === 409 && d.missing_folders && d.missing_folders.length) {
+    if (!confirm(`폴더를 찾을 수 없습니다:\n${d.missing_folders.join('\n')}\n\n건너뛰고 진행할까요? (해당 문서는 다음 동기화에서 재처리)`)) return;
+    [r, d] = await postRebuild({force: true});
+  }
+  const msg = r.ok
+    ? `재구축 시작 — 재수집 대상: ${d.targets.join(', ')}` +
+      (d.legacy_maps_recovered === 0 ? '\n⚠️ 요약 md 매핑을 회수하지 못했습니다 — local_docs가 전량 재요약됩니다(요약 API 소모).' : '')
+    : (d.detail || '재구축 실패');
+  alert(msg);
+  loadStatus(); loadSources();
+}
+async function resumeRebuild() {
+  const r = await fetch('/api/rebuild/resume', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+  const d = await r.json();
+  alert(r.ok ? `재수집 재개 — 대상: ${d.targets.join(', ')}` : (d.detail || '재개 실패'));
+  loadStatus();
 }
 async function openItem(p) {
   const r = await (await fetch('/api/open', {method: 'POST',
@@ -219,6 +269,7 @@ async function ask(e) {
   }
   history.push({role: 'user', content: q}, {role: 'assistant', content: answerText});
 }
+loadStatus();
 </script>
 </body>
 </html>
