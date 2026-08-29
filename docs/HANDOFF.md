@@ -1,7 +1,7 @@
 # llmsearch 작업 인수인계 지시서
 
 > 이 repo를 clone한 뒤 다른 Claude 세션에서 작업을 이어가기 위한 문서.
-> 마지막 갱신: 2026-08-29 (M6b 머지 완료 — 다음: M7 검색 품질·평가 스펙 작성)
+> 마지막 갱신: 2026-08-29 (M7 브랜치 완료 — 머지 대기, 다음: M8 채팅 UX 스펙 작성)
 
 ## 1. 현재 상태
 
@@ -14,9 +14,10 @@
 | M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (45/45), 이연 Minor 정리 후속 반영 |
 | M6a 운영 완성(설정·재요약·사용량) | ✅ 머지 | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |
 | M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |
+| M7 검색 품질·평가 | 🔀 브랜치 완료(머지 시 ✅로) | 채팅 필터(선검색 강제·툴 기본값·Claude 고지), 툴 스키마 현행화, 출처 발췌, 골든 평가 GUI |
 
-- 테스트 기준: **318 passed** (`./.venv/bin/pytest`)
-- E2E: **66/66** (`tools/e2e/verify.py` — 9.8단계와 10단계 사이에 M6b 인덱스 재구축 시나리오 11건 추가)
+- 테스트 기준: **342 passed** (`./.venv/bin/pytest`)
+- E2E: **73/73** (`tools/e2e/verify.py` — 9.9단계(M6b 인덱스 재구축)와 10단계 사이에 M7 채팅 필터·출처 발췌·골든 평가 GUI 시나리오 7건 추가)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
 ## 2. 환경 셋업 (clone 직후)
@@ -24,7 +25,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 318 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 342 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```
@@ -39,9 +40,9 @@ Playwright E2E (선택, sudo 불필요):
 ./.venv/bin/python tools/e2e/verify.py          # 전체 시나리오 검증
 ```
 
-## 3. 다음 작업: M7 스펙 작성 (검색 품질·평가)
+## 3. 다음 작업: M8 스펙 작성 (채팅 UX)
 
-M1~M6a 머지 완료, M6b는 브랜치 완료(머지 대기 — §6 M6b 수동 체크리스트 확인 후 머지). 그 외 잔여는 §6 수동 게이트(Windows/사내망)와 §7 파킹된 결정뿐이다. 다음은 M7(검색 품질·평가) 스펙 작성 — `docs/superpowers/specs/2026-08-29-llmsearch-roadmap-m6-m9.md` 로드맵 참조. 새 마일스톤을 시작하면 아래 표준 절차를 그대로 따른다 (사용자가 매 마일스톤 이 방식을 선택해 왔음):
+M1~M6b 머지 완료, M7은 브랜치 완료(머지 대기 — §6 M7 수동 체크리스트 확인 후 머지). 그 외 잔여는 §6 수동 게이트(Windows/사내망)와 §7 파킹된 결정뿐이다. 다음은 M8(채팅 UX) 스펙 작성 — `docs/superpowers/specs/2026-08-29-llmsearch-roadmap-m6-m9.md` 로드맵 참조. 새 마일스톤을 시작하면 아래 표준 절차를 그대로 따른다 (사용자가 매 마일스톤 이 방식을 선택해 왔음):
 
 1. `EnterWorktree`(또는 `git worktree add`)로 격리 브랜치 생성 → **`git merge master`로 최신화 확인** (워크트리가 낡은 HEAD에서 분기된 사례 2회 있었음) → venv 셋업 + 베이스라인 테스트
 2. superpowers 스크립트로 태스크별 브리프 추출(`task-brief PLAN N`) → 구현자 서브에이전트 디스패치 (플랜에 전체 코드가 있으므로 저비용 모델로 충분, 통합 태스크는 중간 모델)
@@ -64,6 +65,7 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 - 스펙(승인본): `docs/superpowers/specs/2026-08-17-llmsearch-design.md` — 결정 기록·M3/M4 구현 노트 포함
 - 계획: `docs/superpowers/plans/2026-08-17-llmsearch-m1.md` ~ `2026-08-18-llmsearch-m5.md` (각 계획 말미에 수동 체크리스트)
 - M6 스펙: `docs/superpowers/specs/2026-08-29-llmsearch-m6-design.md`, 로드맵: `docs/superpowers/specs/2026-08-29-llmsearch-roadmap-m6-m9.md`, 계획: `docs/superpowers/plans/2026-08-29-llmsearch-m6a.md`(말미에 M6a 수동 체크리스트), `docs/superpowers/plans/2026-08-29-llmsearch-m6b.md`(말미에 M6b 수동 체크리스트)
+- M7 스펙: `docs/superpowers/specs/2026-08-29-llmsearch-m7-design.md`, 계획: `docs/superpowers/plans/2026-08-29-llmsearch-m7.md`(말미에 M7 수동 체크리스트)
 - 프로젝트 규칙: `CLAUDE.md` (repo 루트 — 세션 자동 로드)
 - E2E: `tools/e2e/` (Fake 데모 서버 + 검증 스크립트)
 
@@ -76,6 +78,7 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 5. M5 체크리스트 — `limits.daily_api_calls: 5` 같은 작은 값으로 동기화 반복 → 로그 탭 "일일 API 호출 상한" 안내 + 채팅 유지 확인, `data_dir/usage.json` 일자별 누적 확인 후 0으로 복원 (m5 계획 말미)
 6. M6a 체크리스트 — 설정 탭 `## 답변 규칙` 변경 후 재시작 없이 채팅 문체 반영, `## 요약 규칙`에 "수치는 표로" 추가 후 재요약 시 요약 md에 표 생성(실 Gemini), 소스 탭 사용량 줄 동기화/채팅마다 갱신 및 `limits.daily_api_calls` 반영 확인 (m6a 계획 말미)
 7. M6b: 실 데이터로 [인덱스 재구축] 1회 — summary/vision 카운트 불변 확인, `--rebuild --yes` 헤드리스 확인
+8. M7: 실 Claude로 필터 질의 시 고지가 답변에 반영되는지, sender 필터로 메일만 나오는지, golden.yaml 실데이터 실행
 
 ## 7. 파킹된 결정 (구현 전 사용자 확인 필요)
 
