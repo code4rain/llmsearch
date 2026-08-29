@@ -228,11 +228,13 @@ llmsearch-data/            # 위치는 config로 지정 (예: D:\llmsearch-data\
 ├─ rules.md                # 자연어 규칙 — 용어집/분류/요약/답변 (§9, GUI 편집)
 ├─ .env                    # API 키 (gitignore 대상, keyring 사용 시 생략)
 ├─ index.db                # SQLite (FTS5 + sqlite-vec + SyncState + PARA 매핑 + schema_version)
+├─ chats.db                # 대화 세션 (M8 — 인덱스와 분리, rebuild 무관)
 ├─ summaries/              # PARA 구조: 요약 md + 원본 복사본
 │   ├─ Projects/<프로젝트>/  # 활성 프로젝트 (사용자 관리 닫힌 목록)
 │   ├─ Areas/<영역>/        # 지속 책임 영역 (사용자 관리 닫힌 목록)
 │   ├─ Resources/<주제>/    # 어디에도 안 맞는 참고자료 — 여기만 LLM 자유 분류
 │   └─ Archives/           # 완료 프로젝트 이동분 (검색 감쇠 적용)
+├─ exports/                # 내보낸 대화 md (chat.export_to_notes로 인덱싱 가능)
 ├─ confluence/<스페이스>/…  # 페이지 트리 미러 (md)
 ├─ jira/PROJ-123.md
 └─ notes/                  # 직접 작성 md (기존 폴더 등록도 가능)

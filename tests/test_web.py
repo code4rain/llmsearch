@@ -1,7 +1,10 @@
+import asyncio
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from llmsearch.config import Config
@@ -664,3 +667,331 @@ def test_golden_ui_in_index(tmp_path: Path):
     html = client.get("/").text
     for needle in ('id="goldenText"', 'id="runGoldenBtn"', 'id="goldenTable"', "loadGolden()"):
         assert needle in html, needle
+
+
+def test_session_ui_in_index(tmp_path: Path):
+    html = make_app(tmp_path).get("/").text
+    for needle in ('id="sessionSelect"', 'id="newChatBtn"', 'id="exportChatBtn"', '<dialog id="preview"',
+                   'id="previewBody"', "renderSources(", "loadSessions();"):
+        assert needle in html, needle
+
+
+def _sse_events(body: str) -> list[str]:
+    return [l[len("event: "):] for l in body.splitlines() if l.startswith("event: ")]
+
+
+def test_chats_crud(tmp_path: Path):
+    client = make_app(tmp_path)
+    assert client.get("/api/chats").json() == []
+    r = client.post("/api/chats", json={})
+    assert r.status_code == 200 and r.json()["title"] == "새 대화"
+    a = r.json()["id"]
+    b = client.post("/api/chats", json={"title": "  둘째   세션 "}).json()["id"]
+    assert [s["id"] for s in client.get("/api/chats").json()] == [b, a]
+    assert client.get("/api/chats").json()[0]["title"] == "둘째 세션"
+    assert client.post("/api/chats", json={"title": 5}).status_code == 400
+    assert client.post("/api/chats", json={"title": "x" * 201}).status_code == 400
+    assert client.get(f"/api/chats/{a}").json()["messages"] == []
+    assert client.get("/api/chats/999").status_code == 404
+    assert client.get("/api/chats/abc").status_code == 422
+    assert client.delete(f"/api/chats/{a}").json() == {"ok": True}
+    assert client.delete(f"/api/chats/{a}").status_code == 404
+    evil = {"Origin": "http://evil.example"}
+    assert client.post("/api/chats", json={}, headers=evil).status_code == 403
+    assert client.delete(f"/api/chats/{b}", headers=evil).status_code == 403
+
+
+def test_chats_503_when_store_unavailable_but_chat_works(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    state = client.app.state.llmsearch
+    state["chat_store"] = None
+    state["chat_store_error"] = "OperationalError"
+    r = client.get("/api/chats")
+    assert r.status_code == 503 and "OperationalError" in r.json()["detail"]
+    assert client.post("/api/chats", json={}).status_code == 503
+    assert client.post("/api/chat", json={"question": "저장소 없음 질의", "history": [], "session_id": 1}).status_code == 503
+    r = client.post("/api/chat", json={"question": "저장소 없음 무세션 질의", "history": []})
+    assert r.status_code == 200 and "event: done" in r.text and "event: saved" not in r.text
+
+
+def test_chat_with_session_saves_and_uses_server_history(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    state = client.app.state.llmsearch
+    sid = client.post("/api/chats", json={}).json()["id"]
+    r = client.post("/api/chat", json={"question": "세션 첫 질문 킥오프", "session_id": sid,
+                                       "history": [{"role": "user", "content": "무시되어야 함"}],
+                                       "filters": {"source_filter": ["notes"]}})
+    assert r.status_code == 200
+    assert _sse_events(r.text)[-2:] == ["saved", "done"]
+    assert state["answerer"].last_history == []  # 첫 질문: 서버 이력 비어 있음, 페이로드 history 무시
+    s = client.get(f"/api/chats/{sid}").json()
+    assert s["title"] == "세션 첫 질문 킥오프"  # "새 대화" → 첫 질문
+    assert [m["role"] for m in s["messages"]] == ["user", "assistant"]
+    assert s["messages"][0]["filters"]["source_filter"] == ["notes"]
+    assert s["messages"][1]["sources"] and s["messages"][1]["sources"][0]["source_type"] == "notes"
+    assert "excerpt" in s["messages"][1]["sources"][0] and s["messages"][1]["content"].startswith("[1]")
+    client.post("/api/chat", json={"question": "세션 둘째 질문", "session_id": sid})
+    assert [m["content"] for m in state["answerer"].last_history] == ["세션 첫 질문 킥오프", s["messages"][1]["content"]]
+    assert client.get(f"/api/chats/{sid}").json()["title"] == "세션 첫 질문 킥오프"  # 제목은 첫 질문 유지
+
+
+def test_chat_without_session_is_stateless(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    hist = [{"role": "user", "content": "이전"}, {"role": "assistant", "content": "답"}]
+    r = client.post("/api/chat", json={"question": "무세션 질의", "history": hist})
+    assert r.status_code == 200 and "event: saved" not in r.text
+    assert client.app.state.llmsearch["answerer"].last_history == hist
+    assert client.get("/api/chats").json() == []
+
+
+def test_chat_bad_session_id_404_and_no_answer_count(tmp_path: Path):
+    client = make_app(tmp_path)
+    before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
+    for bad in (True, 999, "1", 1.5, 10**30, -(10**30)):  # 10**30: sqlite INTEGER(64비트) 범위 밖
+        assert client.post("/api/chat", json={"question": "q", "session_id": bad}).status_code == 404, bad
+    sid = client.post("/api/chats", json={}).json()["id"]
+    assert client.post("/api/chat", json={"question": "  ", "session_id": sid}).status_code == 400  # 빈 질문
+    assert client.post("/api/chat", json={"question": {"a": 1}, "session_id": sid}).status_code == 400  # 비문자열
+    assert client.post("/api/chat", json={"question": [1], "session_id": sid}).status_code == 400  # 비문자열
+    assert client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0) == before
+
+
+def test_chats_get_delete_out_of_range_session_id_404(tmp_path: Path):
+    client = make_app(tmp_path)
+    huge = "1000000000000000000000"  # sqlite INTEGER(64비트) 범위 밖 — OverflowError 경로
+    assert client.get(f"/api/chats/{huge}").status_code == 404
+    assert client.delete(f"/api/chats/{huge}").status_code == 404
+
+
+def test_chat_user_presave_keyerror_returns_404(tmp_path: Path, monkeypatch):
+    """리뷰 발견: history()와 append() 사이 세션이 삭제되면 store.append()가 무가드 KeyError를
+    던져 record("answer") 이후 500이 됐다 — 404로 정규화됐는지 검증한다."""
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    sid = client.post("/api/chats", json={}).json()["id"]
+
+    def boom(*a, **k):
+        raise KeyError(1)
+
+    monkeypatch.setattr(state["chat_store"], "append", boom)
+    r = client.post("/api/chat", json={"question": "질문", "session_id": sid})
+    assert r.status_code == 404
+
+
+class _ExplodingAnswerer(FakeAnswerer):
+    """스트림 도중 예외 — finally 저장 경로 검증. (클라이언트 중단은 test_chat_client_abort_saves_partial이
+    aclose()로 검증; 이 클래스는 답변기 예외 경로.)"""
+
+    def __init__(self, after: int):
+        super().__init__()
+        self.after = after  # 이 개수의 text 이벤트 뒤에 폭발 (0이면 첫 토큰 전)
+
+    def answer_stream(self, question, history, search_fn, filters_note: str = ""):
+        self.last_history = list(history)
+        for i in range(self.after):
+            yield {"type": "text", "text": f"부분{i} "}
+        raise RuntimeError("stream broke")
+
+
+class _SlowAnswerer(FakeAnswerer):
+    """text 이벤트를 여러 번 나눠 내보내 클라이언트 중단(aclose) 타이밍을 재현한다."""
+
+    def answer_stream(self, question, history, search_fn, filters_note: str = ""):
+        self.last_history = list(history)
+        for i in range(5):
+            yield {"type": "text", "text": f"부분{i} "}
+        yield {"type": "sources", "hits": search_fn(question)}
+
+
+class _ErrorAnswerer(FakeAnswerer):
+    """error 이벤트 저장 축약 검증용 — 콜론 뒤에 민감정보가 있다고 가정한다."""
+
+    def answer_stream(self, question, history, search_fn, filters_note: str = ""):
+        yield {"type": "error", "message": "답변 생성 실패: secret sk-123"}
+        yield {"type": "sources", "hits": []}
+
+
+def _app_with_answerer(tmp_path: Path, answerer) -> TestClient:
+    notes = tmp_path / "notes"; notes.mkdir()
+    (notes / "kick.md").write_text("# 킥오프\n내용", encoding="utf-8")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=answerer, enable_scheduler=False)
+    return TestClient(app, base_url="http://127.0.0.1", raise_server_exceptions=False)
+
+
+def test_chat_partial_answer_saved_in_finally(tmp_path: Path):
+    # raise_server_exceptions=False에서 답변기 예외는 TestClient까지 전파되지 않고(빈 본문으로 종료),
+    # finally가 부분 답변을 저장한다 — try/except 불필요, 저장 결과로 검증한다.
+    client = _app_with_answerer(tmp_path, _ExplodingAnswerer(after=2))
+    sid = client.post("/api/chats", json={}).json()["id"]
+    with client.stream("POST", "/api/chat", json={"question": "중단 질의", "session_id": sid}) as r:
+        body = "".join(r.iter_text())
+    assert "event: saved" not in body
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[1]["content"] == "부분0 부분1 "  # 부분 답변 보존
+
+
+def test_chat_empty_answer_saves_placeholder(tmp_path: Path):
+    client = _app_with_answerer(tmp_path, _ExplodingAnswerer(after=0))
+    sid = client.post("/api/chats", json={}).json()["id"]
+    with client.stream("POST", "/api/chat", json={"question": "즉시 중단 질의", "session_id": sid}) as r:
+        "".join(r.iter_text())
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert msgs[1]["content"] == "(답변 없음 — 응답 전 중단)"  # 빈 text 블록 방지
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+def test_chat_client_abort_saves_partial(tmp_path: Path):
+    """진짜 GeneratorExit 재현 — 라우트 함수를 직접 호출해 StreamingResponse의 비동기 이터레이터를
+    aclose()로 닫는다. finally의 저장은 버려진 동기 제너레이터가 aclose() 이후 GC될 때 실행된다 —
+    finally 안에 yield가 있으면 그 시점에 RuntimeError가 나지만, __del__ 안에서 발생하므로 보통은
+    PytestUnraisableExceptionWarning으로만 드러나고 테스트는 조용히 통과해버린다. 위 마커가 그
+    경고를 실패로 승격시켜야 이 테스트가 실제로 가드 역할을 한다."""
+    client = _app_with_answerer(tmp_path, _SlowAnswerer())
+    sid = client.post("/api/chats", json={}).json()["id"]
+    fn = next(r.endpoint for r in client.app.routes if getattr(r, "path", "") == "/api/chat")
+    resp = fn({"question": "중단 질의", "session_id": sid})
+
+    async def drive():
+        it = resp.body_iterator
+        await it.__anext__(); await it.__anext__()
+        await it.aclose()  # finally 안에 yield가 있으면 여기서 RuntimeError
+    asyncio.run(drive())
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[1]["content"] == "부분0 부분1 "
+
+
+def test_chat_error_event_saved_truncated(tmp_path: Path):
+    """리뷰 발견: error 이벤트 메시지가 그대로 chats.db에 저장·내보내기돼 예외 상세(민감정보 포함
+    가능성)가 영구화될 수 있었다 — SSE는 전체 메시지를 스트리밍하되 저장은 콜론 이전만 남기는지
+    검증한다."""
+    client = _app_with_answerer(tmp_path, _ErrorAnswerer())
+    sid = client.post("/api/chats", json={}).json()["id"]
+    with client.stream("POST", "/api/chat", json={"question": "질문", "session_id": sid}) as r:
+        body = "".join(r.iter_text())
+    assert "secret sk-123" in body  # SSE는 여전히 전체 메시지 스트리밍
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert "답변 생성 실패" in msgs[1]["content"]
+    assert "sk-123" not in msgs[1]["content"]
+
+
+def test_shutdown_closes_chat_store(tmp_path: Path):
+    notes = tmp_path / "notes"; notes.mkdir()
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(),
+                     enable_scheduler=False)
+    state = app.state.llmsearch
+    with TestClient(app, base_url="http://127.0.0.1"):
+        pass  # 컨텍스트 종료 시 shutdown 이벤트 발화 — chat_store.close() 호출
+    with pytest.raises(sqlite3.ProgrammingError):
+        state["chat_store"].list_sessions()
+
+
+def test_export_slug_rules():
+    from llmsearch.web.app import _export_slug
+
+    assert _export_slug("프로젝트A 킥오프") == "프로젝트A_킥오프"
+    assert _export_slug("../../etc/passwd") == "etc_passwd"
+    assert "/" not in _export_slug("a/b\\c:d*e?f") and ".." not in _export_slug("..")
+    assert _export_slug("") == "chat" and _export_slug("   ") == "chat"
+    assert len(_export_slug("가" * 100)) <= 40
+    # 리뷰 발견: strip("_")은 _sanitize_segment가 Windows 예약 디바이스명 이스케이프용으로
+    # 붙인 선행 "_"까지 지워 원래 예약명("CON")으로 되돌린다 — rstrip만 써야 한다.
+    assert _export_slug("CON") == "_CON"
+    assert _export_slug("nul") == "_nul"
+    assert _export_slug("_x_") == "_x"
+
+
+def test_chat_export_replaces_stale_filename_on_title_change(tmp_path: Path):
+    """리뷰 발견: 기본 제목("새 대화")으로 먼저 내보낸 뒤 첫 질문으로 제목이 자동 변경되면
+    파일명 slug도 바뀐다 — 이전 이름 파일이 orphan으로 남지 않고 정리되어야 세션당 파일 1개가
+    유지된다."""
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]  # 기본 제목
+    path_a = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    assert path_a.name == f"chat-{sid}-새_대화.md"
+    client.post("/api/chat", json={"question": "제목 변경 유발 질의", "session_id": sid})
+    path_b = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    assert path_b != path_a
+    exports = client.app.state.llmsearch["config"].exports_dir
+    assert not path_a.exists()
+    assert sorted(p.name for p in exports.iterdir()) == [path_b.name]
+    assert "## Q1." in path_b.read_text(encoding="utf-8")
+
+
+def test_chat_export_write_failure_preserves_existing_file(tmp_path: Path, monkeypatch):
+    """리뷰 발견: 이전 이름 파일 정리를 새 파일 쓰기보다 먼저 하면, 쓰기(os.replace)가 실패할 때
+    직전까지 유효했던 export가 사라져 세션의 export가 0개가 된다 — 정리는 쓰기 성공 후에만
+    해야 크래시-세이프하다."""
+    import llmsearch.web.app as app_module
+
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]
+    path_a = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    client.post("/api/chat", json={"question": "쓰기 실패 재현 질의", "session_id": sid})
+    exports = client.app.state.llmsearch["config"].exports_dir
+
+    def boom(*_a, **_k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(app_module.os, "replace", boom)
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 500
+    assert path_a.exists()  # 실패한 새 파일 쓰기 때문에 기존 export가 지워지면 안 된다
+    assert sorted(p.name for p in exports.iterdir()) == [path_a.name]
+
+    monkeypatch.undo()
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 200
+    path_b = Path(r.json()["path"])
+    assert path_b != path_a
+    assert not path_a.exists()
+    assert sorted(p.name for p in exports.iterdir()) == [path_b.name]
+
+
+def test_chat_export_deterministic_and_overwrites(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={"title": "내보내기 세션/테스트"}).json()["id"]
+    client.post("/api/chat", json={"question": "내보내기 첫 질의", "session_id": sid})
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 200, r.text
+    path = Path(r.json()["path"])
+    exports = client.app.state.llmsearch["config"].exports_dir
+    assert path.parent == exports and path.name == f"chat-{sid}-내보내기_세션_테스트.md"
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("# [대화기록] 내보내기 세션/테스트\n> 이 문서는") and "## Q1. 내보내기 첫 질의" in text
+    client.post("/api/chat", json={"question": "내보내기 둘째 질의", "session_id": sid})
+    assert Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"]) == path
+    assert "## Q2. 내보내기 둘째 질의" in path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in exports.iterdir()) == [path.name]  # 재내보내기는 같은 파일, tmp 잔재 없음
+    assert client.post("/api/chats/999/export", json={}).status_code == 404
+    assert client.post("/api/chats/1000000000000000000000/export", json={}).status_code == 404
+    assert client.post(f"/api/chats/{sid}/export", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_exports_indexed_as_notes_when_enabled(tmp_path: Path):
+    notes = tmp_path / "notes"; notes.mkdir()
+    (notes / "a.md").write_text("# 메모", encoding="utf-8")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes], export_to_notes=True)
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]
+    client.post("/api/chat", json={"question": "노트 인덱싱 질의", "session_id": sid})
+    client.post(f"/api/chats/{sid}/export", json={})
+    assert client.post("/api/sync/notes").json()["indexed"] == 1
+    titles = {r[0] for r in app.state.llmsearch["read_conn"].execute("SELECT title FROM documents WHERE source_type='notes'")}
+    assert any(t.startswith("[대화기록] ") for t in titles)
+    cfg2 = Config(data_dir=tmp_path / "data2", notes_folders=[notes])  # 기본 false → exports 미포함
+    app2 = create_app(cfg2, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    (cfg2.exports_dir).mkdir(parents=True)
+    (cfg2.exports_dir / "chat-1-x.md").write_text("# [대화기록] x", encoding="utf-8")
+    assert TestClient(app2, base_url="http://127.0.0.1").post("/api/sync/notes").json()["indexed"] == 1  # a.md만

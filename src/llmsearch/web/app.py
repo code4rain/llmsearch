@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import traceback
 from dataclasses import asdict
@@ -20,6 +21,7 @@ from .. import db, indexer, rebuild, search
 from ..archive import archive_project
 from ..atlassian.auth import diagnose, resolve_auth_candidates
 from ..atlassian.registry import Registry
+from ..chats import DEFAULT_TITLE, ChatStore, normalize_title
 from ..config import Config
 from ..connectors.confluence import sync_confluence
 from ..connectors.jira import sync_jira
@@ -29,6 +31,7 @@ from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..eval.golden import evaluate as golden_evaluate, parse_golden
 from ..rules import load_rules_md, parse_rules_md
+from ..summarize import _sanitize_segment
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -65,6 +68,29 @@ def local_origin_only(request: Request) -> None:
     origin = request.headers.get("origin") or request.headers.get("referer")
     if origin and not _is_local_origin(origin):
         raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
+
+
+_SLUG_BAD = re.compile(r"[^0-9A-Za-z가-힣\-_]")
+
+
+def _export_slug(title: str) -> str:
+    """export 파일명 조각 — _sanitize_segment(1계층) 후 허용 문자만, 40자, 빈 값은 chat (스펙 M8 §3).
+
+    _sanitize_segment는 결과가 비면 "일반"으로 대체하므로(summarize.py) 빈 제목을 먼저 걸러야
+    스펙의 "빈 문자열이면 chat"이 성립한다.
+
+    선행 "_"는 조건부로만 지운다 — _sanitize_segment가 이미 "_"로 시작하는 결과를 준 경우
+    (Windows 예약 디바이스명 이스케이프 "CON"→"_CON", 또는 제목 자체가 "_"로 시작)는 의도된
+    문자이므로 보존한다. 반대로 cleaned가 "_"로 시작하지 않았는데 치환 후 선행 "_"가 생겼다면
+    (예: "../../etc/passwd" → 선행 "."/"/"가 "_"로 치환됨) 그건 구분자 치환의 부산물이므로
+    제거한다. 후행 "_"는 항상 제거한다 — strip("_")을 양쪽에 그냥 쓰면 예약명 이스케이프
+    접두사까지 지워져 원래 예약명으로 되돌아가는 문제가 있었다 (리뷰 발견).
+    """
+    cleaned = _sanitize_segment(title) if (title or "").strip() else ""
+    slug = _SLUG_BAD.sub("_", cleaned)
+    if not cleaned.startswith("_"):
+        slug = slug.lstrip("_")
+    return slug[:40].rstrip("_") or "chat"
 
 
 _FILTER_KEYS = ("source_filter", "date_from", "date_to", "sender")
@@ -140,6 +166,20 @@ def _filters_note(filters: dict) -> str:
         return ""
     return ("(사용자 필터 적용: " + ", ".join(parts) + ". 다른 범위가 필요하면 search 툴에 값을 명시하라 — "
             "빈 배열·빈 문자열은 무시되며, 전체 소스를 검색하려면 6개 소스를 모두 나열하라)")
+
+
+EMPTY_ANSWER_PLACEHOLDER = "(답변 없음 — 응답 전 중단)"  # Messages API는 빈 text 블록을 거부한다
+
+
+def _save_assistant(store: ChatStore, session_id: int, parts: list[str], sources: list[dict]) -> bool:
+    """assistant 턴 저장 — 정상 종료·중단 공통. 실패는 로그(클래스명)만."""
+    text = "".join(parts) or EMPTY_ANSWER_PLACEHOLDER
+    try:
+        store.append(session_id, "assistant", text, sources=sources)
+        return True
+    except Exception as exc:
+        _logger.error("대화 저장 실패: %s", type(exc).__name__)
+        return False
 
 
 def _get_outlook_client(state):
@@ -258,7 +298,8 @@ def run_sync(state: dict, source: str) -> dict:
             prev = indexer.get_sync_state(conn, source)
             rules_md = load_rules_md(cfg.rules_md_path)
             if source == "notes":
-                result = sync_notes(cfg.notes_folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
+                folders = cfg.notes_folders + ([cfg.exports_dir] if cfg.export_to_notes else [])
+                result = sync_notes(folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
             elif source == "local_docs":
                 prior_map = {
                     sid: pm for sid in list(prev.get("files", {}))
@@ -358,6 +399,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         conn = read_conn = None
         schema_mismatch = str(exc)
         _logger.error("index.db 스키마 불일치 — 재구축 필요: %s", exc)
+
+    try:
+        chat_store = ChatStore(config.data_dir / "chats.db")
+        chat_store_error = None
+    except Exception as exc:
+        # 대화 저장소 장애가 채팅 기능을 볼모로 잡지 않게 — 세션 API만 503, 채팅은 무저장 폴백
+        chat_store, chat_store_error = None, type(exc).__name__
+        _logger.exception("chats.db를 열 수 없음 — 대화 저장 없이 기동")
+
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
@@ -367,7 +417,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "usage": tracker,
              "resummarizing": False, "resummarize_lock": threading.Lock(),
              "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False,
-             "evaluating": False, "evaluate_lock": threading.Lock()}
+             "evaluating": False, "evaluate_lock": threading.Lock(),
+             "chat_store": chat_store, "chat_store_error": chat_store_error}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
     if conn is not None and rebuild.marker_present(conn):
@@ -378,6 +429,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         """DB를 만지는 엔드포인트 진입 가드 — 스키마 불일치 상태에서는 503으로 안내 (M6b 배너와 짝)."""
         if state["read_conn"] is None or state["conn"] is None:
             raise HTTPException(503, state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다")
+
+    def _require_chat_store() -> ChatStore:
+        store = state.get("chat_store")
+        if store is None:
+            raise HTTPException(503, f"대화 저장소를 열 수 없습니다: {state.get('chat_store_error')}")
+        return store
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -406,6 +463,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if worker is not None:
             try:
                 worker.shutdown()
+            except Exception:
+                pass
+        store = state.get("chat_store")
+        if store is not None:
+            try:
+                store.close()
             except Exception:
                 pass
 
@@ -449,6 +512,81 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         return {"today": t.today_by_kind(), "total": t.today_total(), "limit": t.daily_limit,
                 "indexing_allowed": t.indexing_allowed(),
                 "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
+
+    @app.get("/api/chats")
+    def chats_list():
+        return _require_chat_store().list_sessions()
+
+    @app.post("/api/chats", dependencies=[Depends(local_origin_only)])
+    def chats_create(payload: dict | None = None):
+        store = _require_chat_store()
+        title = (payload or {}).get("title")
+        if title is None or title == "":
+            title = DEFAULT_TITLE
+        if not isinstance(title, str) or len(title) > 200:
+            raise HTTPException(400, "title은 200자 이하 문자열이어야 합니다")
+        sid = store.create_session(title)
+        return {"id": sid, "title": normalize_title(title)}
+
+    @app.get("/api/chats/{session_id}")
+    def chats_get(session_id: int):
+        try:
+            return _require_chat_store().get_session(session_id)
+        except (KeyError, OverflowError):  # OverflowError: sqlite INTEGER 64비트 범위 밖 id
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+
+    @app.delete("/api/chats/{session_id}", dependencies=[Depends(local_origin_only)])
+    def chats_delete(session_id: int):
+        try:
+            found = _require_chat_store().delete_session(session_id)
+        except OverflowError:
+            found = False
+        if not found:
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+        return {"ok": True}
+
+    @app.post("/api/chats/{session_id}/export", dependencies=[Depends(local_origin_only)])
+    def chats_export(session_id: int):
+        store = _require_chat_store()
+        try:
+            title = store.get_title(session_id)
+            text = store.export_markdown(session_id)
+        except (KeyError, OverflowError):  # OverflowError: sqlite INTEGER 64비트 범위 밖 id
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+        exports_dir = config.exports_dir
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        target = exports_dir / f"chat-{session_id}-{_export_slug(title)}.md"  # 세션 단위 결정적 — 재내보내기는 덮어쓰기
+        try:
+            target.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 (CLAUDE.md)
+        except ValueError:
+            raise HTTPException(500, "내보내기 실패: 경로 검증")
+        try:
+            tmp = target.with_name(target.name + ".tmp")
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, target)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+        except Exception as exc:
+            raise HTTPException(500, f"내보내기 실패: {type(exc).__name__}")
+        # 새 파일이 성공적으로 쓰인 뒤에만 이전 이름 파일을 정리한다 — 쓰기 실패 시 직전까지
+        # 유효했던 export가 사라지면 안 된다 (리뷰 발견: 정리를 먼저 하면 쓰기 실패 시 파일이
+        # 0개가 되는 크래시-세이프티 문제가 있었다). 제목이 바뀌면(기본 "새 대화" → 첫 질문
+        # 자동 제목 등) 파일명 slug도 바뀌므로, 같은 session_id의 이전 이름 파일이 orphan으로
+        # 남지 않도록 새 이름과 다른 것들을 정리한다.
+        for old in exports_dir.glob(f"chat-{session_id}-*.md"):
+            if old.name == target.name:
+                continue
+            try:
+                old.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 — glob 결과도 신뢰하지 않는다
+            except ValueError:
+                continue
+            try:
+                old.unlink()
+            except OSError as exc:
+                _logger.warning("내보내기 이전 파일 정리 실패: %s (%s)", old.name, type(exc).__name__)
+        return {"ok": True, "path": str(target)}
 
     @app.get("/api/eval/golden")
     def golden_get():
@@ -715,11 +853,38 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
+        """순서 계약: filters/session_id/question 검증(400·404·503)은 usage.record("answer") 이전에 끝낸다.
+        `saved` 이벤트는 스트림이 정상 종료해 저장까지 성공했을 때만 나간다. `finally`는 절대 yield하지 않는다
+        (중단·예외 경로의 부분 저장 전용 — GeneratorExit 처리 중 yield하면 RuntimeError)."""
         _require_db()
         filters = _validate_filters(payload.get("filters"))  # 400은 answer 계상 전에
-        state["usage"].record("answer")
+        session_id = payload.get("session_id")
+        store = None
+        if session_id is not None:
+            # bool은 int 서브클래스라 별도 검사, sqlite INTEGER는 64비트라 범위 밖은 미리 404
+            if (isinstance(session_id, bool) or not isinstance(session_id, int)
+                    or not (-2**63 <= session_id < 2**63)):
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
+            store = _require_chat_store()
+            try:
+                history = store.history(session_id)  # 서버가 이력 구성 — 페이로드 history 무시, 현재 질문 미포함
+            except KeyError:
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
+        else:
+            history = payload.get("history", [])
         question = payload.get("question", "")
-        history = payload.get("history", [])
+        if store is not None and (not isinstance(question, str) or not question.strip()):
+            raise HTTPException(400, "질문이 비어 있습니다")  # 빈/비문자열 user 블록은 세션의 후속 질문을 전부 깨뜨린다
+        state["usage"].record("answer")
+        if store is not None:
+            try:
+                store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
+                if store.get_title(session_id) == DEFAULT_TITLE:
+                    store.set_title(session_id, question)
+            except KeyError:
+                # history()와 append() 사이 세션이 삭제된 경우 — 이전엔 append가 무가드라 KeyError가
+                # 여기서 그대로 터져 record("answer") 이후 500이 됐다. 여기서 잡아 404로 정규화한다.
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
 
         def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
@@ -729,15 +894,32 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         note = _filters_note(filters)
 
         def event_stream():
-            for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
-                if ev["type"] == "sources":
-                    data = json.dumps([asdict(h) for h in ev["hits"]], ensure_ascii=False)
-                    yield f"event: sources\ndata: {data}\n\n"
-                elif ev["type"] == "error":
-                    yield f"event: error\ndata: {json.dumps(ev['message'], ensure_ascii=False)}\n\n"
-                else:
-                    yield f"event: text\ndata: {json.dumps(ev['text'], ensure_ascii=False)}\n\n"
-            yield "event: done\ndata: {}\n\n"
+            parts: list[str] = []
+            sources_dicts: list[dict] = []
+            attempted = False
+            try:
+                for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
+                    if ev["type"] == "sources":
+                        sources_dicts = [asdict(h) for h in ev["hits"]]  # 한 번만 변환 — SSE 전송·저장 공용
+                        data = json.dumps(sources_dicts, ensure_ascii=False)
+                        yield f"event: sources\ndata: {data}\n\n"
+                    elif ev["type"] == "error":
+                        # SSE는 전체 메시지를 스트리밍하되, chats.db에 영구 저장·내보내기되는 부분은
+                        # 콜론 이전(대개 클래스/카테고리명)만 남긴다 — 민감정보(키·값) 유출 방지.
+                        parts.append("\n⚠️ " + ev["message"].split(":", 1)[0])
+                        yield f"event: error\ndata: {json.dumps(ev['message'], ensure_ascii=False)}\n\n"
+                    else:
+                        parts.append(ev["text"])
+                        yield f"event: text\ndata: {json.dumps(ev['text'], ensure_ascii=False)}\n\n"
+                if store is not None:
+                    attempted = True
+                    if _save_assistant(store, session_id, parts, sources_dicts):
+                        yield f"event: saved\ndata: {json.dumps({'session_id': session_id})}\n\n"
+                yield "event: done\ndata: {}\n\n"
+            finally:
+                # 클라이언트 중단(GeneratorExit)·답변기 예외 — 부분 답변이라도 보존. finally에서 yield 금지.
+                if store is not None and not attempted:
+                    _save_assistant(store, session_id, parts, sources_dicts)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

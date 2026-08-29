@@ -43,11 +43,13 @@ class FakeAnswerer:
     def __init__(self):
         self.rules: dict[str, str] = {}  # 마지막 update_rules 값 — 테스트 관찰용
         self.last_filters_note = ""      # 마지막 filters_note — 테스트 관찰용
+        self.last_history: list | None = None  # 마지막 answer_stream 호출의 history — 테스트 관찰용
 
     def update_rules(self, sections: dict[str, str]) -> None:
         self.rules = dict(sections)
 
     def answer_stream(self, question, history, search_fn, filters_note: str = "") -> Iterator[dict]:
+        self.last_history = list(history)
         self.last_filters_note = filters_note
         hits = search_fn(question)
         if not hits:

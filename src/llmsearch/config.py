@@ -27,6 +27,7 @@ class Config:
     confluence_base_url: str = ""
     jira_base_url: str = ""
     daily_api_call_limit: int = 0  # 0 = 무제한 (스펙 §10 P2)
+    export_to_notes: bool = False  # 내보낸 대화(md)를 notes로 인덱싱 (스펙 M8 §3)
 
     @property
     def db_path(self) -> Path:
@@ -40,6 +41,10 @@ class Config:
     def rules_md_path(self) -> Path:
         return self.data_dir / "rules.md"
 
+    @property
+    def exports_dir(self) -> Path:
+        return self.data_dir / "exports"
+
 
 def load_config(path: Path) -> Config:
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -48,6 +53,7 @@ def load_config(path: Path) -> Config:
     outlook = raw.get("outlook") or {}
     atlassian = raw.get("atlassian") or {}
     limits = raw.get("limits") or {}
+    chat = raw.get("chat") or {}
     return Config(
         data_dir=Path(raw["data_dir"]),
         watch_folders=[Path(p) for p in raw.get("watch_folders", [])],
@@ -68,4 +74,5 @@ def load_config(path: Path) -> Config:
         confluence_base_url=str(atlassian.get("confluence_base_url", "")).rstrip("/"),
         jira_base_url=str(atlassian.get("jira_base_url", "")).rstrip("/"),
         daily_api_call_limit=int(limits.get("daily_api_calls", 0)),
+        export_to_notes=bool(chat.get("export_to_notes", False)),
     )
