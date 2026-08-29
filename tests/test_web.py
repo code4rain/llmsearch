@@ -567,3 +567,11 @@ def test_apply_filters_fills_only_missing_args():
     wrapped("q", source_filter=["jira"], date_from="", date_to="2026-09-01", sender=None)  # 툴: 명시값 우선, falsy 채움
     assert calls == [(["notes"], "2026-08-01", None, "a@b"), (["jira"], "2026-08-01", "2026-09-01", "a@b")]
     assert _apply_filters(search_fn, {"source_filter": None, "date_from": None, "date_to": None, "sender": None}) is search_fn
+
+
+def test_chat_filter_ui_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    for needle in ('id="filters"', 'id="fDateFrom"', 'id="fDateTo"', 'id="fSender"', "filters-note",
+                   "입력 시 메일만 검색됩니다", "resp.ok"):
+        assert needle in html, needle

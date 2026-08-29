@@ -12,6 +12,7 @@
   .msg-q { font-weight: bold; margin-top: 1rem; }
   .src { background: #f4f4f4; border-radius: 6px; padding: .5rem; margin: .3rem 0; font-size: .9rem; }
   .snip { color:#666; font-size:.85em; white-space:normal; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; }
+  .filters-note { color:#666; font-size:.85em; margin:.2rem 0 .4rem; }
   #question { width: 80%; padding: .5rem; } table { border-collapse: collapse; }
   td, th { border: 1px solid #ccc; padding: .4rem .8rem; }
 </style>
@@ -32,6 +33,12 @@
     <input id="question" placeholder="질문을 입력하세요" autocomplete="off">
     <button>검색</button>
   </form>
+  <details id="filters"><summary>필터</summary>
+    <div id="srcFilters"></div>
+    <label>기간 <input type="date" id="fDateFrom"> ~ <input type="date" id="fDateTo"></label>
+    <label>발신자 <input id="fSender" placeholder="kim@corp.com" title="입력 시 메일만 검색됩니다"></label>
+    <small>입력 시 메일만 검색됩니다</small>
+  </details>
 </div>
 
 <div id="sources" class="tab">
@@ -223,6 +230,24 @@ async function saveRules() {
   document.getElementById('rulesStatus').textContent =
     r.ok ? '저장됨 · 섹션: ' + (data.sections.join(', ') || '(없음)') : (data.detail || '저장 실패');
 }
+const SOURCES_UI = ['notes', 'local_docs', 'outlook_mail', 'outlook_cal', 'confluence', 'jira'];
+document.getElementById('srcFilters').replaceChildren(...SOURCES_UI.map(s => {
+  const l = document.createElement('label'); const c = document.createElement('input');
+  c.type = 'checkbox'; c.className = 'srcChk'; c.dataset.src = s;
+  l.append(c, ' ' + s + ' '); return l;
+}));
+function currentFilters() {
+  const srcs = [...document.querySelectorAll('.srcChk:checked')].map(c => c.dataset.src);
+  const v = id => document.getElementById(id).value.trim() || null;
+  return {source_filter: srcs.length ? srcs : null, date_from: v('fDateFrom'), date_to: v('fDateTo'), sender: v('fSender')};
+}
+function filtersLabel(f) {
+  const parts = [];
+  if (f.source_filter) parts.push('소스=' + f.source_filter.join(','));
+  if (f.date_from || f.date_to) parts.push('기간=' + (f.date_from || '') + '~' + (f.date_to || ''));
+  if (f.sender) parts.push('발신자=' + f.sender);
+  return parts.length ? '필터(첫 검색 기준): ' + parts.join(' · ') + ' — 답변 근거는 Claude의 추가 검색으로 넓어질 수 있습니다' : '';
+}
 async function ask(e) {
   e.preventDefault();
   const q = document.getElementById('question').value.trim();
@@ -233,13 +258,21 @@ async function ask(e) {
   qDiv.className = 'msg-q';
   qDiv.textContent = 'Q. ' + q;
   box.appendChild(qDiv);
+  const filters = currentFilters();
+  const label = filtersLabel(filters);
+  if (label) { const n = document.createElement('div'); n.className = 'filters-note'; n.textContent = label; box.appendChild(n); }
   const answerDiv = document.createElement('div');
   answerDiv.className = 'msg-a';
   box.appendChild(answerDiv);
   const resp = await fetch('/api/chat', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({question: q, history}),
+    body: JSON.stringify({question: q, history, filters}),
   });
+  if (!resp.ok) {  // 400(필터 검증)·503(스키마 불일치) — 무증상 실패·history 오염 방지
+    let d = {}; try { d = await resp.json(); } catch {}
+    answerDiv.textContent = '⚠️ ' + (d.detail || ('HTTP ' + resp.status));
+    return;
+  }
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '', answerText = '';
