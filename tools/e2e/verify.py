@@ -274,6 +274,43 @@ with sync_playwright() as p:
     check("골든 결과 표 2행", page.locator("#goldenTable tbody tr").count() == 2)
     check("골든 미스 표시", "❌" in page.locator("#goldenTable tbody tr").nth(1).inner_text())
 
+    # 9.12 M8 — 세션 자동 생성·복원(새로고침)·미리보기·내보내기 (스펙 M8)
+    page.click("nav >> text=채팅")
+    page.click("#newChatBtn")
+    opts_before = page.locator("#sessionSelect option").count()
+    page.fill("#question", "프로젝트A 세션 저장 확인 질의")
+    before_cards = page.locator(".src").count()
+    page.click("form >> text=검색")
+    page.wait_for_function(f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000)
+    page.wait_for_function(f"document.querySelectorAll('#sessionSelect option').length > {opts_before}", timeout=10000)
+    sel = page.locator("#sessionSelect")
+    check("세션 자동 생성", sel.locator("option").count() == opts_before + 1, f"{opts_before}→{sel.locator('option').count()}")
+    check("세션 제목=질문", sel.locator("option:checked").inner_text().strip() == "프로젝트A 세션 저장 확인 질의",
+          sel.locator("option:checked").inner_text())
+    saved_id = sel.input_value()
+    page.reload()
+    page.wait_for_function("document.querySelectorAll('#sessionSelect option').length >= 2", timeout=10000)
+    page.select_option("#sessionSelect", saved_id)
+    page.wait_for_selector(".msg-a", timeout=10000)
+    check("세션 복원: 질문·답변", page.locator(".msg-a").count() >= 1
+          and "프로젝트A 세션 저장 확인 질의" in page.locator("#messages").inner_text())
+    check("세션 복원: 출처 카드", page.locator(".src").count() >= 1)
+    page.locator(".src button", has_text="미리보기").first.click()
+    page.wait_for_selector("#preview[open]", timeout=5000)
+    check("미리보기 본문", page.locator("#previewBody").inner_text().strip() != "")
+    page.click("#previewClose")
+    dialogs.clear()
+    page.click("#exportChatBtn")
+    for _ in range(20):  # alert 도착 폴링 (최대 2s)
+        if dialogs:
+            break
+        page.wait_for_timeout(100)
+    exports = list((DATA / "data" / "exports").glob("chat-*.md"))  # demo_server가 기동 시 .e2e-data를 초기화하므로 1건
+    check("내보내기 alert", any("내보내기 완료" in m for m in dialogs), " / ".join(m[:40] for m in dialogs))
+    body_md = exports[0].read_text(encoding="utf-8") if exports else ""
+    check("내보내기 파일", len(exports) == 1 and body_md.startswith("# [대화기록]") and "프로젝트A 세션 저장 확인 질의" in body_md, str(exports))
+    page.click("#newChatBtn")  # 이후 단계(10단계 UI 채팅)가 새 세션에서 시작하게
+
     # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
     #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다
     #     (매직 카운트 금지). 무한 루프 방지로 40회 상한을 두고, 초과 시 check()가 FAIL 처리한다.
