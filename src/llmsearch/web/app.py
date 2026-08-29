@@ -78,9 +78,19 @@ def _export_slug(title: str) -> str:
 
     _sanitize_segment는 결과가 비면 "일반"으로 대체하므로(summarize.py) 빈 제목을 먼저 걸러야
     스펙의 "빈 문자열이면 chat"이 성립한다.
+
+    선행 "_"는 조건부로만 지운다 — _sanitize_segment가 이미 "_"로 시작하는 결과를 준 경우
+    (Windows 예약 디바이스명 이스케이프 "CON"→"_CON", 또는 제목 자체가 "_"로 시작)는 의도된
+    문자이므로 보존한다. 반대로 cleaned가 "_"로 시작하지 않았는데 치환 후 선행 "_"가 생겼다면
+    (예: "../../etc/passwd" → 선행 "."/"/"가 "_"로 치환됨) 그건 구분자 치환의 부산물이므로
+    제거한다. 후행 "_"는 항상 제거한다 — strip("_")을 양쪽에 그냥 쓰면 예약명 이스케이프
+    접두사까지 지워져 원래 예약명으로 되돌아가는 문제가 있었다 (리뷰 발견).
     """
     cleaned = _sanitize_segment(title) if (title or "").strip() else ""
-    return _SLUG_BAD.sub("_", cleaned)[:40].strip("_") or "chat"
+    slug = _SLUG_BAD.sub("_", cleaned)
+    if not cleaned.startswith("_"):
+        slug = slug.lstrip("_")
+    return slug[:40].rstrip("_") or "chat"
 
 
 _FILTER_KEYS = ("source_filter", "date_from", "date_to", "sender")
@@ -550,10 +560,28 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             target.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 (CLAUDE.md)
         except ValueError:
             raise HTTPException(500, "내보내기 실패: 경로 검증")
+        # 제목이 바뀌면(기본 "새 대화" → 첫 질문 자동 제목 등) 파일명 slug도 바뀐다 — 같은
+        # session_id의 이전 이름 파일이 orphan으로 남지 않도록 새 이름과 다른 것들을 정리한다
+        # (리뷰 발견: 세션당 파일 1개 보장이 이름이 바뀌면 깨졌었다).
+        for old in exports_dir.glob(f"chat-{session_id}-*.md"):
+            if old.name == target.name:
+                continue
+            try:
+                old.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 — glob 결과도 신뢰하지 않는다
+            except ValueError:
+                continue
+            try:
+                old.unlink()
+            except OSError as exc:
+                _logger.warning("내보내기 이전 파일 정리 실패: %s (%s)", old.name, type(exc).__name__)
         try:
             tmp = target.with_name(target.name + ".tmp")
-            tmp.write_text(text, encoding="utf-8")
-            os.replace(tmp, target)
+            try:
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, target)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
         except Exception as exc:
             raise HTTPException(500, f"내보내기 실패: {type(exc).__name__}")
         return {"ok": True, "path": str(target)}

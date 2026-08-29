@@ -852,6 +852,29 @@ def test_export_slug_rules():
     assert "/" not in _export_slug("a/b\\c:d*e?f") and ".." not in _export_slug("..")
     assert _export_slug("") == "chat" and _export_slug("   ") == "chat"
     assert len(_export_slug("가" * 100)) <= 40
+    # 리뷰 발견: strip("_")은 _sanitize_segment가 Windows 예약 디바이스명 이스케이프용으로
+    # 붙인 선행 "_"까지 지워 원래 예약명("CON")으로 되돌린다 — rstrip만 써야 한다.
+    assert _export_slug("CON") == "_CON"
+    assert _export_slug("nul") == "_nul"
+    assert _export_slug("_x_") == "_x"
+
+
+def test_chat_export_replaces_stale_filename_on_title_change(tmp_path: Path):
+    """리뷰 발견: 기본 제목("새 대화")으로 먼저 내보낸 뒤 첫 질문으로 제목이 자동 변경되면
+    파일명 slug도 바뀐다 — 이전 이름 파일이 orphan으로 남지 않고 정리되어야 세션당 파일 1개가
+    유지된다."""
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]  # 기본 제목
+    path_a = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    assert path_a.name == f"chat-{sid}-새_대화.md"
+    client.post("/api/chat", json={"question": "제목 변경 유발 질의", "session_id": sid})
+    path_b = Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"])
+    assert path_b != path_a
+    exports = client.app.state.llmsearch["config"].exports_dir
+    assert not path_a.exists()
+    assert sorted(p.name for p in exports.iterdir()) == [path_b.name]
+    assert "## Q1." in path_b.read_text(encoding="utf-8")
 
 
 def test_chat_export_deterministic_and_overwrites(tmp_path: Path):
