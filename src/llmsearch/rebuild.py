@@ -68,3 +68,76 @@ def reset_index(state: dict) -> dict:
         state["force_reindex_local_docs"] = True
     logger.info("인덱스 초기화 — documents %d건 삭제, para_map·local_docs 상태 보존", deleted)
     return {"documents_deleted": deleted}
+
+
+def claim(state: dict) -> None:
+    """precheck 통과 직후 rebuilding을 원자적으로 선점 — 동시 POST 두 건이 둘 다 초기화하는 것을 막는다.
+
+    선점 후 초기화·start_resync가 실패하면 호출자가 release()로 되돌린다.
+    """
+    with state["sync_lock"]:
+        if state.get("rebuilding"):
+            raise RebuildRefused("재구축이 이미 진행 중입니다")
+        state["rebuilding"] = True
+
+
+def release(state: dict) -> None:
+    state["rebuilding"] = False
+
+
+def start_resync(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequence[str]) -> threading.Thread:
+    """백그라운드 재수집 — 수천 문서·메일 1년치는 수십 분이 걸리므로 HTTP 요청 안에서 기다리지 않는다.
+
+    호출자가 claim()으로 rebuilding을 이미 선점한 상태여야 한다(선점 안 됐으면 여기서 선점).
+    마커는 여기서 지우지 않는다 — local_docs run_sync가 force_reindex 플래그를 소비할 때 지운다.
+    """
+    if not state.get("rebuilding"):
+        claim(state)
+    targets = list(sources)
+
+    def target():
+        try:
+            for source in targets:
+                entry = run_sync(state, source)
+                logger.info("재수집 %s: ok=%s indexed=%s", source, entry["ok"], entry["indexed"])
+        finally:
+            release(state)
+
+    thread = threading.Thread(target=target, name="llmsearch-rebuild", daemon=True)
+    state["rebuild_thread"] = thread
+    try:
+        thread.start()
+    except BaseException:
+        release(state)  # start 실패로 영구 "진행 중"이 되지 않게
+        raise
+    return thread
+
+
+def recover_schema_mismatch(state: dict) -> dict:
+    """스키마 불일치 상태의 재구축 — legacy 매핑 회수 → 파일 재생성 → 매핑 복원 → 커넥션 교체."""
+    cfg = state["config"]
+    with state["sync_lock"]:
+        rows, local_state = db.read_legacy_maps(cfg.db_path)
+        for suffix in ("", "-wal", "-shm"):
+            Path(str(cfg.db_path) + suffix).unlink(missing_ok=True)  # 열린 커넥션 없음(conn is None)
+        conn = db.open_db(cfg.db_path)
+        read_conn = db.open_db(cfg.db_path)
+        for sid, para_path, summary_path in rows:
+            conn.execute("INSERT OR REPLACE INTO para_map(source_id, para_path, summary_path) VALUES (?,?,?)",
+                         (sid, para_path, summary_path))
+        files = dict(local_state.get("files", {})) if isinstance(local_state, dict) else {}
+        for sid, _para, _summary in rows:
+            # 상태가 유실됐어도 para_map에 있는 sid는 상태에 남긴다 — run_sync의 prior_map은 files 키로
+            # 만들어지므로, 비어 있으면 prior=None → _place가 해시 접미사 중복 md를 만든다 (스펙 §10 C1).
+            # 센티널은 시그니처와 결코 일치하지 않아 재요약(또는 md 재사용)은 그대로 강제된다.
+            files.setdefault(sid, [0.0, 0])
+        if files or local_state:
+            indexer.set_sync_state(conn, "local_docs", {**(local_state or {}), "files": files})
+        set_marker(conn)
+        conn.commit()
+        state["conn"], state["read_conn"] = conn, read_conn
+        state["schema_mismatch"] = None
+        state["force_reindex_local_docs"] = True
+    if not rows:
+        logger.warning("legacy 매핑을 회수하지 못함 — local_docs 전량 재요약 (요약 API 소모)")
+    return {"legacy_maps_recovered": len(rows), "documents_deleted": 0}

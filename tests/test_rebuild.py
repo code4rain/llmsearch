@@ -95,3 +95,152 @@ def test_reset_index_keeps_para_map_and_local_state(tmp_path: Path, monkeypatch)
     assert rebuild.marker_present(conn) is True
     assert state["force_reindex_local_docs"] is True
     assert indexer.delete_all_documents(conn) == 0
+
+
+def client_of(app) -> TestClient:
+    return TestClient(app, base_url="http://127.0.0.1")
+
+
+def wait_resync(state, timeout=30):
+    t = state.get("rebuild_thread")
+    assert t is not None
+    t.join(timeout)
+    assert not t.is_alive() and state["rebuilding"] is False
+
+
+def test_rebuild_endpoint_restores_docs_without_llm(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    client.post("/api/sync/notes"); client.post("/api/sync/local_docs")
+    usage_before = dict(state["usage"].today_by_kind())
+    conn = state["read_conn"]
+    assert doc_count(conn) == 3
+    sid = next(iter(indexer.get_sync_state(conn, "local_docs")["files"]))
+    para_before = indexer.get_para_map(conn, sid)
+
+    r = client.post("/api/rebuild", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True and body["phase"] == "resync" and body["documents_deleted"] == 3
+    assert body["targets"] == ["notes", "local_docs", "outlook_mail", "outlook_cal"]  # 등록 없는 confluence/jira 제외
+    wait_resync(state)
+
+    after = state["usage"].today_by_kind()
+    assert after.get("summary", 0) == usage_before.get("summary", 0)  # 요약 md 재사용 — LLM 미호출
+    assert after.get("vision", 0) == usage_before.get("vision", 0)
+    assert after["embed"] > usage_before["embed"]
+    assert doc_count(conn, "notes") == 1 and doc_count(conn, "local_docs") == 2
+    assert indexer.get_para_map(conn, sid) == para_before
+    assert rebuild.marker_present(conn) is False                       # local_docs 성공 후 마커 삭제
+    assert state["force_reindex_local_docs"] is False
+    assert client.get("/api/status").json() == {
+        "schema_mismatch": None, "rebuild_in_progress": False, "rebuilding": False, "resummarizing": False}
+    log_sources = [e["source"] for e in state["log"][:4]]
+    assert set(log_sources) >= {"notes", "local_docs"}
+
+
+def test_rebuild_refusals_and_force(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch, daily_limit=1)
+    client = client_of(app)
+    client.post("/api/sync/notes")  # embed 1 → 상한 도달
+    r = client.post("/api/rebuild", json={})
+    assert r.status_code == 409 and "상한" in r.json()["detail"]
+    assert doc_count(state["read_conn"]) == 1  # DB 무변경
+
+    state["usage"].daily_limit = 0
+    state["config"].watch_folders.append(tmp_path / "unmounted")
+    r = client.post("/api/rebuild", json={})
+    assert r.status_code == 409 and r.json()["missing_folders"] == [str(tmp_path / "unmounted")]
+    r = client.post("/api/rebuild", json={"force": True})
+    assert r.status_code == 200
+    wait_resync(state)
+    assert doc_count(state["read_conn"], "notes") == 1
+    assert client.post("/api/rebuild", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_resummarize_and_second_rebuild_refused_while_rebuilding(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    client.post("/api/sync/local_docs")
+    state["rebuilding"] = True  # 재수집 스레드가 도는 중이라고 가정
+    try:
+        assert client.post("/api/resummarize", json={"all": True}).status_code == 409
+        assert client.post("/api/rebuild", json={}).status_code == 409
+        assert client.post("/api/rebuild/resume", json={}).status_code == 409
+    finally:
+        state["rebuilding"] = False
+
+
+def test_marker_survives_until_local_docs_succeeds(tmp_path: Path, monkeypatch):
+    """마커는 local_docs run_sync가 플래그를 소비한 뒤에만 삭제 — 게이트에 막히면 유지."""
+    from llmsearch.web.app import run_sync
+
+    _, state = make_state(tmp_path, monkeypatch)
+    run_sync(state, "local_docs")
+    rebuild.reset_index(state)
+    state["usage"].daily_limit = 1  # 이미 초과
+    entry = run_sync(state, "local_docs")
+    assert entry["ok"] is False
+    assert rebuild.marker_present(state["conn"]) is True and state["force_reindex_local_docs"] is True
+    state["usage"].daily_limit = 0
+    entry = run_sync(state, "local_docs")
+    assert entry["ok"] is True and entry["indexed"] == 2
+    assert rebuild.marker_present(state["conn"]) is False and state["force_reindex_local_docs"] is False
+
+
+def test_startup_detects_marker_and_resume(tmp_path: Path, monkeypatch):
+    app1, state1 = make_state(tmp_path, monkeypatch)
+    from llmsearch.web.app import run_sync
+    run_sync(state1, "local_docs")
+    rebuild.reset_index(state1)  # 재수집 전에 프로세스가 죽었다고 가정
+    state1["conn"].close(); state1["read_conn"].close()
+
+    cfg = state1["config"]
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)
+    state2 = app2.state.llmsearch
+    assert state2["force_reindex_local_docs"] is True
+    client = client_of(app2)
+    assert client.get("/api/status").json()["rebuild_in_progress"] is True
+    r = client.post("/api/rebuild/resume", json={})
+    assert r.status_code == 200 and r.json()["phase"] == "resync"
+    wait_resync(state2)
+    assert doc_count(state2["read_conn"], "local_docs") == 2
+    assert client.get("/api/status").json()["rebuild_in_progress"] is False
+    assert client.post("/api/rebuild/resume", json={}).status_code == 409  # 재개할 것 없음
+
+
+def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
+    app1, state1 = make_state(tmp_path, monkeypatch)
+    from llmsearch.web.app import run_sync
+    run_sync(state1, "notes"); run_sync(state1, "local_docs")
+    usage_before = dict(state1["usage"].today_by_kind())
+    sid = next(iter(indexer.get_sync_state(state1["conn"], "local_docs")["files"]))
+    para_before = indexer.get_para_map(state1["conn"], sid)
+    state1["conn"].execute("UPDATE meta SET value='0' WHERE key='schema_version'"); state1["conn"].commit()
+    state1["conn"].close(); state1["read_conn"].close()
+
+    cfg = state1["config"]
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)  # 기동 성공
+    state2 = app2.state.llmsearch
+    assert state2["conn"] is None and "schema" in state2["schema_mismatch"]
+    client = client_of(app2)
+    assert client.post("/api/chat", json={"question": "스키마 불일치 질의", "history": []}).status_code == 503
+    assert client.post("/api/sync/notes").status_code == 503
+    s = client.get("/api/status").json()
+    assert s["schema_mismatch"] and s["rebuild_in_progress"] is False
+    assert client.get("/api/sources").json()[0]["schema_mismatch"]
+
+    r = client.post("/api/rebuild", json={})
+    assert r.status_code == 200 and r.json()["legacy_maps_recovered"] == 2
+    wait_resync(state2)
+    conn = state2["read_conn"]
+    assert conn is not None and state2["schema_mismatch"] is None
+    assert doc_count(conn, "local_docs") == 2 and doc_count(conn, "notes") == 1
+    assert indexer.get_para_map(conn, sid) == para_before
+    after = state2["usage"].today_by_kind()
+    assert after.get("summary", 0) == usage_before.get("summary", 0)  # legacy 매핑 회수 → 요약 재사용
+    assert client.post("/api/sync/notes").status_code == 200           # 가드 해제
