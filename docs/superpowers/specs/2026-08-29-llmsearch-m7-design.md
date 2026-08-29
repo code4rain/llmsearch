@@ -20,7 +20,7 @@
 
 ## 2. 채팅 필터
 
-**UI** — 채팅 폼 아래 접이식 "필터" 행: 소스 체크박스 6개(기본 전부 해제 = 제한 없음), 기간 `date_from`/`date_to`(`<input type="date">`), 발신자 텍스트(헬프 텍스트: "입력 시 메일만 검색됩니다"). 값은 `filters` 객체로 `/api/chat` 페이로드에 포함: `{"source_filter": [...]|null, "date_from": "YYYY-MM-DD"|null, "date_to": ...|null, "sender": ...|null}`. 빈 값은 null. 질문 div 아래에 `textContent`로 한 줄: "필터(첫 검색 기준): 소스=notes · 2026-08-01~ · 발신자=… — 답변 근거는 Claude의 추가 검색으로 넓어질 수 있습니다".
+**UI** — 채팅 폼 아래 접이식 "필터" 행: 소스 체크박스 6개(기본 전부 해제 = 제한 없음), 기간 `date_from`/`date_to`(`<input type="date">`), 발신자 텍스트(헬프 텍스트: "입력 시 메일만 검색됩니다"). 값은 `filters` 객체로 `/api/chat` 페이로드에 포함: `{"source_filter": [...]|null, "date_from": "YYYY-MM-DD"|null, "date_to": ...|null, "sender": ...|null}`. 빈 값은 null. 질문 div 아래에 `<div class="filters-note">`(`textContent`)로 한 줄: "필터(첫 검색 기준): 소스=notes · 2026-08-01~ · 발신자=… — 답변 근거는 Claude의 추가 검색으로 넓어질 수 있습니다".
 
 **서버 검증** (`/api/chat`, `state["usage"].record("answer")` **이전**에 수행 — 400에는 answer를 계상하지 않는다; 위반 400):
 - `source_filter`: null 또는 리스트; 각 원소는 `SOURCES` 안의 문자열; **중복 제거 후 `SOURCES` 순서로 정규화**(길이 ≤ 6); 빈 리스트는 null과 동일.
@@ -33,7 +33,7 @@
 - **툴 검색(기본값)**: 툴 루프는 4~5개 키워드를 항상 명시적으로 넘긴다 → **None 또는 falsy(`[]`, `""`)인 인자만 필터로 채운다**(Claude가 값을 준 인자는 우선). Claude가 `source_filter: []`를 돌려줘도 사용자 필터가 조용히 해제되지 않는다.
 - 필터 적용 로직은 `web/app.py`에만 둔다 — `llm.py`의 **답변 루프 로직은 변경하지 않는다**(아래 스키마·고지 변경은 별도).
 
-**Claude 고지** — 사용자 필터가 하나라도 있으면 `answer_stream(question, history, search_fn, filters_note="")`의 새 키워드 인자로 `"(사용자 필터 적용: 소스=notes, 기간=2026-08-01~ — 다른 범위가 필요하면 search 툴에 값을 명시하라)"`를 넘기고, `ClaudeAnswerer`는 사전 검색 결과 블록 앞에 그 줄을 붙인다. `FakeAnswerer`는 무시. Protocol에 기본값 있는 키워드 인자로 추가(기존 호출 호환).
+**Claude 고지** — 사용자 필터가 하나라도 있으면 `answer_stream(question, history, search_fn, filters_note="")`의 새 키워드 인자로 `"(사용자 필터 적용: 소스=notes, 기간=2026-08-01~. 다른 범위가 필요하면 search 툴에 값을 명시하라 — 빈 배열·빈 문자열은 무시되며, 전체 소스를 검색하려면 6개 소스를 모두 나열하라)"`를 넘기고, `ClaudeAnswerer`는 사전 검색 결과 블록 앞에 그 줄을 붙인다. `FakeAnswerer`는 무시. Protocol에 기본값 있는 키워드 인자로 추가(기존 호출 호환).
 
 **검색 툴 스키마** — `_SEARCH_TOOL.input_schema.properties.source_filter.items.enum`을 `["notes","local_docs","outlook_mail","outlook_cal","confluence","jira"]`로, `sender: {"type":"string","description":"보낸 사람 이메일 (메일 전용, 선택)"}` 추가, description에 "메일·일정·Confluence·Jira 포함" 반영. 툴 루프 `search_fn(...)` 호출에 `sender=args.get("sender")` 추가(현재 누락).
 
