@@ -20,6 +20,7 @@ from .. import db, indexer, rebuild, search
 from ..archive import archive_project
 from ..atlassian.auth import diagnose, resolve_auth_candidates
 from ..atlassian.registry import Registry
+from ..chats import DEFAULT_TITLE, ChatStore, normalize_title
 from ..config import Config
 from ..connectors.confluence import sync_confluence
 from ..connectors.jira import sync_jira
@@ -140,6 +141,20 @@ def _filters_note(filters: dict) -> str:
         return ""
     return ("(사용자 필터 적용: " + ", ".join(parts) + ". 다른 범위가 필요하면 search 툴에 값을 명시하라 — "
             "빈 배열·빈 문자열은 무시되며, 전체 소스를 검색하려면 6개 소스를 모두 나열하라)")
+
+
+EMPTY_ANSWER_PLACEHOLDER = "(답변 없음 — 응답 전 중단)"  # Messages API는 빈 text 블록을 거부한다
+
+
+def _save_assistant(store: ChatStore, session_id: int, parts: list[str], hits: list) -> bool:
+    """assistant 턴 저장 — 정상 종료·중단 공통. 실패는 로그(클래스명)만."""
+    text = "".join(parts) or EMPTY_ANSWER_PLACEHOLDER
+    try:
+        store.append(session_id, "assistant", text, sources=[asdict(h) for h in hits])
+        return True
+    except Exception as exc:
+        _logger.error("대화 저장 실패: %s", type(exc).__name__)
+        return False
 
 
 def _get_outlook_client(state):
@@ -358,6 +373,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         conn = read_conn = None
         schema_mismatch = str(exc)
         _logger.error("index.db 스키마 불일치 — 재구축 필요: %s", exc)
+
+    try:
+        chat_store = ChatStore(config.data_dir / "chats.db")
+        chat_store_error = None
+    except Exception as exc:
+        # 대화 저장소 장애가 채팅 기능을 볼모로 잡지 않게 — 세션 API만 503, 채팅은 무저장 폴백
+        chat_store, chat_store_error = None, type(exc).__name__
+        _logger.exception("chats.db를 열 수 없음 — 대화 저장 없이 기동")
+
     state = {"config": config, "conn": conn, "read_conn": read_conn, "embedder": embedder,
              "summarizer": summarizer, "answerer": answerer, "log": [],
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
@@ -367,7 +391,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "usage": tracker,
              "resummarizing": False, "resummarize_lock": threading.Lock(),
              "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False,
-             "evaluating": False, "evaluate_lock": threading.Lock()}
+             "evaluating": False, "evaluate_lock": threading.Lock(),
+             "chat_store": chat_store, "chat_store_error": chat_store_error}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
     if conn is not None and rebuild.marker_present(conn):
@@ -378,6 +403,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         """DB를 만지는 엔드포인트 진입 가드 — 스키마 불일치 상태에서는 503으로 안내 (M6b 배너와 짝)."""
         if state["read_conn"] is None or state["conn"] is None:
             raise HTTPException(503, state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다")
+
+    def _require_chat_store() -> ChatStore:
+        store = state.get("chat_store")
+        if store is None:
+            raise HTTPException(503, f"대화 저장소를 열 수 없습니다: {state.get('chat_store_error')}")
+        return store
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -406,6 +437,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if worker is not None:
             try:
                 worker.shutdown()
+            except Exception:
+                pass
+        store = state.get("chat_store")
+        if store is not None:
+            try:
+                store.close()
             except Exception:
                 pass
 
@@ -449,6 +486,34 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         return {"today": t.today_by_kind(), "total": t.today_total(), "limit": t.daily_limit,
                 "indexing_allowed": t.indexing_allowed(),
                 "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
+
+    @app.get("/api/chats")
+    def chats_list():
+        return _require_chat_store().list_sessions()
+
+    @app.post("/api/chats", dependencies=[Depends(local_origin_only)])
+    def chats_create(payload: dict | None = None):
+        store = _require_chat_store()
+        title = (payload or {}).get("title")
+        if title is None or title == "":
+            title = DEFAULT_TITLE
+        if not isinstance(title, str) or len(title) > 200:
+            raise HTTPException(400, "title은 200자 이하 문자열이어야 합니다")
+        sid = store.create_session(title)
+        return {"id": sid, "title": normalize_title(title)}
+
+    @app.get("/api/chats/{session_id}")
+    def chats_get(session_id: int):
+        try:
+            return _require_chat_store().get_session(session_id)
+        except KeyError:
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+
+    @app.delete("/api/chats/{session_id}", dependencies=[Depends(local_origin_only)])
+    def chats_delete(session_id: int):
+        if not _require_chat_store().delete_session(session_id):
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+        return {"ok": True}
 
     @app.get("/api/eval/golden")
     def golden_get():
@@ -717,9 +782,29 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def chat(payload: dict):
         _require_db()
         filters = _validate_filters(payload.get("filters"))  # 400은 answer 계상 전에
-        state["usage"].record("answer")
+        session_id = payload.get("session_id")
+        store = None
+        if session_id is not None:
+            if isinstance(session_id, bool) or not isinstance(session_id, int):
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
+            store = _require_chat_store()
+            try:
+                history = store.history(session_id)  # 서버가 이력 구성 — 페이로드 history 무시, 현재 질문 미포함
+            except KeyError:
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
+        else:
+            history = payload.get("history", [])
         question = payload.get("question", "")
-        history = payload.get("history", [])
+        if store is not None and not str(question).strip():
+            raise HTTPException(400, "질문이 비어 있습니다")  # 빈 user 블록은 세션의 후속 질문을 전부 깨뜨린다
+        state["usage"].record("answer")
+        if store is not None:
+            store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
+            try:
+                if store.get_title(session_id) == DEFAULT_TITLE:
+                    store.set_title(session_id, question)
+            except KeyError:
+                pass  # 그 사이 삭제된 세션 — 저장 실패와 같은 관용
 
         def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
@@ -729,15 +814,30 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         note = _filters_note(filters)
 
         def event_stream():
-            for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
-                if ev["type"] == "sources":
-                    data = json.dumps([asdict(h) for h in ev["hits"]], ensure_ascii=False)
-                    yield f"event: sources\ndata: {data}\n\n"
-                elif ev["type"] == "error":
-                    yield f"event: error\ndata: {json.dumps(ev['message'], ensure_ascii=False)}\n\n"
-                else:
-                    yield f"event: text\ndata: {json.dumps(ev['text'], ensure_ascii=False)}\n\n"
-            yield "event: done\ndata: {}\n\n"
+            parts: list[str] = []
+            hits: list = []
+            attempted = False
+            try:
+                for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
+                    if ev["type"] == "sources":
+                        hits = list(ev["hits"])
+                        data = json.dumps([asdict(h) for h in hits], ensure_ascii=False)
+                        yield f"event: sources\ndata: {data}\n\n"
+                    elif ev["type"] == "error":
+                        parts.append("\n⚠️ " + ev["message"])
+                        yield f"event: error\ndata: {json.dumps(ev['message'], ensure_ascii=False)}\n\n"
+                    else:
+                        parts.append(ev["text"])
+                        yield f"event: text\ndata: {json.dumps(ev['text'], ensure_ascii=False)}\n\n"
+                if store is not None:
+                    attempted = True
+                    if _save_assistant(store, session_id, parts, hits):
+                        yield f"event: saved\ndata: {json.dumps({'session_id': session_id})}\n\n"
+                yield "event: done\ndata: {}\n\n"
+            finally:
+                # 클라이언트 중단(GeneratorExit)·답변기 예외 — 부분 답변이라도 보존. finally에서 yield 금지.
+                if store is not None and not attempted:
+                    _save_assistant(store, session_id, parts, hits)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
