@@ -7,7 +7,7 @@ import os
 import threading
 import traceback
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -59,6 +59,79 @@ def local_origin_only(request: Request) -> None:
     origin = request.headers.get("origin") or request.headers.get("referer")
     if origin and not _is_local_origin(origin):
         raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
+
+
+_FILTER_KEYS = ("source_filter", "date_from", "date_to", "sender")
+
+
+def _validate_filters(raw) -> dict:
+    """/api/chat `filters` 검증·정규화 (스펙 M7 §2). 위반은 400 — record("answer") 이전에 호출한다."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "filters는 객체여야 합니다")
+    out: dict = {k: None for k in _FILTER_KEYS}
+    sf = raw.get("source_filter")
+    if sf:
+        if not isinstance(sf, list) or not all(isinstance(s, str) for s in sf):
+            raise HTTPException(400, "source_filter는 문자열 리스트여야 합니다")
+        unknown = [s for s in sf if s not in SOURCES]
+        if unknown:
+            raise HTTPException(400, f"알 수 없는 소스: {', '.join(unknown)}")
+        out["source_filter"] = [s for s in SOURCES if s in sf]  # 중복 제거 + SOURCES 순서 정규화 (길이 ≤ 6)
+    for key in ("date_from", "date_to"):
+        v = raw.get(key)
+        if v:
+            if not isinstance(v, str) or len(v) != 10:  # fromisoformat은 20260801·2026-W01-1도 통과시킨다
+                raise HTTPException(400, f"{key}는 YYYY-MM-DD 문자열이어야 합니다")
+            try:
+                date.fromisoformat(v)
+            except ValueError:
+                raise HTTPException(400, f"{key} 형식 오류: YYYY-MM-DD")
+            out[key] = v  # 자정 경계 보정은 search.search가 한다
+    sender = raw.get("sender")
+    if sender:
+        if not isinstance(sender, str) or len(sender.strip()) > 200:
+            raise HTTPException(400, "sender는 200자 이하 문자열이어야 합니다")
+        sender = sender.strip()
+        if sender:
+            if out["source_filter"] and "outlook_mail" not in out["source_filter"]:
+                raise HTTPException(400, "발신자 필터는 메일 소스에서만 동작합니다 — 소스에서 outlook_mail을 "
+                                         "선택하거나 소스 선택을 비우세요")
+            out["sender"] = sender
+    return out
+
+
+def _apply_filters(search_fn, filters: dict):
+    """선검색은 강제, 툴 검색은 기본값 — None/빈 값인 인자만 필터로 채운다 (스펙 M7 §2).
+
+    answer_stream의 사전 검색은 search_fn(question)이라 전부 채워지고(강제), Claude 툴 호출은
+    명시한 값이 우선한다. []·""도 미지정으로 본다 — Claude가 빈 배열로 사용자 필터를 조용히
+    해제하지 못하게.
+    """
+    if not any(filters.get(k) for k in _FILTER_KEYS):
+        return search_fn
+
+    def wrapped(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        return search_fn(query, source_filter=source_filter or filters["source_filter"],
+                         date_from=date_from or filters["date_from"],
+                         date_to=date_to or filters["date_to"],
+                         sender=sender or filters["sender"])
+    return wrapped
+
+
+def _filters_note(filters: dict) -> str:
+    parts = []
+    if filters.get("source_filter"):
+        parts.append("소스=" + ",".join(filters["source_filter"]))
+    if filters.get("date_from") or filters.get("date_to"):
+        parts.append(f"기간={filters.get('date_from') or ''}~{filters.get('date_to') or ''}")
+    if filters.get("sender"):
+        parts.append("발신자=" + filters["sender"])
+    if not parts:
+        return ""
+    return ("(사용자 필터 적용: " + ", ".join(parts) + ". 다른 범위가 필요하면 search 툴에 값을 명시하라 — "
+            "빈 배열·빈 문자열은 무시되며, 전체 소스를 검색하려면 6개 소스를 모두 나열하라)")
 
 
 def _get_outlook_client(state):
@@ -567,16 +640,20 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
         _require_db()
+        filters = _validate_filters(payload.get("filters"))  # 400은 answer 계상 전에
         state["usage"].record("answer")
         question = payload.get("question", "")
         history = payload.get("history", [])
 
-        def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
                                  date_from=date_from, date_to=date_to, sender=sender)
 
+        search_fn = _apply_filters(raw_search_fn, filters)
+        note = _filters_note(filters)
+
         def event_stream():
-            for ev in state["answerer"].answer_stream(question, history, search_fn):
+            for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
                 if ev["type"] == "sources":
                     data = json.dumps([asdict(h) for h in ev["hits"]], ensure_ascii=False)
                     yield f"event: sources\ndata: {data}\n\n"
