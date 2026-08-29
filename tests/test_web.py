@@ -766,6 +766,21 @@ def test_chats_get_delete_out_of_range_session_id_404(tmp_path: Path):
     assert client.delete(f"/api/chats/{huge}").status_code == 404
 
 
+def test_chat_user_presave_keyerror_returns_404(tmp_path: Path, monkeypatch):
+    """리뷰 발견: history()와 append() 사이 세션이 삭제되면 store.append()가 무가드 KeyError를
+    던져 record("answer") 이후 500이 됐다 — 404로 정규화됐는지 검증한다."""
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    sid = client.post("/api/chats", json={}).json()["id"]
+
+    def boom(*a, **k):
+        raise KeyError(1)
+
+    monkeypatch.setattr(state["chat_store"], "append", boom)
+    r = client.post("/api/chat", json={"question": "질문", "session_id": sid})
+    assert r.status_code == 404
+
+
 class _ExplodingAnswerer(FakeAnswerer):
     """스트림 도중 예외 — finally 저장 경로 검증. (클라이언트 중단은 test_chat_client_abort_saves_partial이
     aclose()로 검증; 이 클래스는 답변기 예외 경로.)"""
@@ -789,6 +804,14 @@ class _SlowAnswerer(FakeAnswerer):
         for i in range(5):
             yield {"type": "text", "text": f"부분{i} "}
         yield {"type": "sources", "hits": search_fn(question)}
+
+
+class _ErrorAnswerer(FakeAnswerer):
+    """error 이벤트 저장 축약 검증용 — 콜론 뒤에 민감정보가 있다고 가정한다."""
+
+    def answer_stream(self, question, history, search_fn, filters_note: str = ""):
+        yield {"type": "error", "message": "답변 생성 실패: secret sk-123"}
+        yield {"type": "sources", "hits": []}
 
 
 def _app_with_answerer(tmp_path: Path, answerer) -> TestClient:
@@ -821,9 +844,13 @@ def test_chat_empty_answer_saves_placeholder(tmp_path: Path):
     assert msgs[1]["content"] == "(답변 없음 — 응답 전 중단)"  # 빈 text 블록 방지
 
 
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 def test_chat_client_abort_saves_partial(tmp_path: Path):
     """진짜 GeneratorExit 재현 — 라우트 함수를 직접 호출해 StreamingResponse의 비동기 이터레이터를
-    aclose()로 닫는다. finally 안에 yield가 있으면 여기서 RuntimeError가 난다 (없음을 검증)."""
+    aclose()로 닫는다. finally의 저장은 버려진 동기 제너레이터가 aclose() 이후 GC될 때 실행된다 —
+    finally 안에 yield가 있으면 그 시점에 RuntimeError가 나지만, __del__ 안에서 발생하므로 보통은
+    PytestUnraisableExceptionWarning으로만 드러나고 테스트는 조용히 통과해버린다. 위 마커가 그
+    경고를 실패로 승격시켜야 이 테스트가 실제로 가드 역할을 한다."""
     client = _app_with_answerer(tmp_path, _SlowAnswerer())
     sid = client.post("/api/chats", json={}).json()["id"]
     fn = next(r.endpoint for r in client.app.routes if getattr(r, "path", "") == "/api/chat")
@@ -837,6 +864,20 @@ def test_chat_client_abort_saves_partial(tmp_path: Path):
     msgs = client.get(f"/api/chats/{sid}").json()["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant"]
     assert msgs[1]["content"] == "부분0 부분1 "
+
+
+def test_chat_error_event_saved_truncated(tmp_path: Path):
+    """리뷰 발견: error 이벤트 메시지가 그대로 chats.db에 저장·내보내기돼 예외 상세(민감정보 포함
+    가능성)가 영구화될 수 있었다 — SSE는 전체 메시지를 스트리밍하되 저장은 콜론 이전만 남기는지
+    검증한다."""
+    client = _app_with_answerer(tmp_path, _ErrorAnswerer())
+    sid = client.post("/api/chats", json={}).json()["id"]
+    with client.stream("POST", "/api/chat", json={"question": "질문", "session_id": sid}) as r:
+        body = "".join(r.iter_text())
+    assert "secret sk-123" in body  # SSE는 여전히 전체 메시지 스트리밍
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert "답변 생성 실패" in msgs[1]["content"]
+    assert "sk-123" not in msgs[1]["content"]
 
 
 def test_shutdown_closes_chat_store(tmp_path: Path):

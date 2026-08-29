@@ -53,6 +53,7 @@ Archives의 요약본·복사본·인덱스도 함께 제거된다 — 아카이
   붙는다.
 - `config.yaml`의 `chat.export_to_notes: true`면 이 md 파일들이 notes 동기화 대상에 포함되어
   검색에도 걸린다 (기본은 false).
+- 세션을 삭제해도 이미 내보낸 md 파일은 남는다(필요 시 수동 삭제).
 
 ## 비용 통제
 

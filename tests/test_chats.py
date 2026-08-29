@@ -86,6 +86,8 @@ def test_export_markdown_format(tmp_path: Path):
     s.append(sid, "assistant", "첫 답변", sources=[{"source_type": "notes", "title": "킥오프", "url_or_path": "/n/k.md", "excerpt": "..."}])
     s.append(sid, "user", "둘째 질문")
     s.append(sid, "assistant", "둘째 답변")
+    s.append(sid, "user", "여러 줄\n질문입니다\n\n세 줄째")
+    s.append(sid, "assistant", "셋째 답변")
     md = s.export_markdown(sid)
     lines = md.splitlines()
     assert lines[0] == "# [대화기록] <제목>" and lines[1].startswith("> 이 문서는 llmsearch가 생성한 답변 기록입니다")
@@ -93,6 +95,9 @@ def test_export_markdown_format(tmp_path: Path):
     assert "출처:\n- [notes] 킥오프 — /n/k.md" in md
     assert "## Q2. 둘째 질문" in md and md.index("## Q1.") < md.index("## Q2.")
     assert "(필터:" not in md.split("## Q2.")[1]  # 필터 없는 턴엔 필터 줄 없음
+    # 리뷰 발견: 다중행 질문을 그대로 헤딩에 넣으면 "## Qn." 줄이 개행으로 깨진다 — 공백 정규화 필요
+    assert "## Q3. 여러 줄 질문입니다 세 줄째" in md
+    assert "## Q3. 여러 줄\n" not in md
     with pytest.raises(KeyError):
         s.export_markdown(999)
 

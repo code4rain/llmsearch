@@ -17,7 +17,7 @@
 | M7 검색 품질·평가 | ✅ 머지 | 채팅 필터(선검색 강제·툴 기본값·Claude 고지), 툴 스키마 현행화, 출처 발췌, 골든 평가 GUI |
 | M8 채팅 UX | 🔀 브랜치 완료(머지 시 ✅로) | 세션 저장/복원(chats.db)·내보내기(export_to_notes)·출처 미리보기 |
 
-- 테스트 기준: **369 passed** (`./.venv/bin/pytest`)
+- 테스트 기준: **371 passed** (`./.venv/bin/pytest`)
 - E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
@@ -26,7 +26,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 369 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 371 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```

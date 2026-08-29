@@ -58,16 +58,19 @@ class ChatStore:
         self.path = path
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")  # 커넥션 단위 설정 — cascade가 실제로 동작하게
-        self._conn.executescript(_SCHEMA)
-        row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-        if row is None:
-            self._conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
-            self._conn.commit()
-        elif row[0] != SCHEMA_VERSION:
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")  # 커넥션 단위 설정 — cascade가 실제로 동작하게
+            self._conn.executescript(_SCHEMA)
+            row = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            if row is None:
+                self._conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+                self._conn.commit()
+            elif row[0] != SCHEMA_VERSION:
+                raise RuntimeError(f"chats.db schema v{row[0]} != v{SCHEMA_VERSION}")
+        except BaseException:
             self._conn.close()
-            raise RuntimeError(f"chats.db schema v{row[0]} != v{SCHEMA_VERSION}")
+            raise
 
     # --- 내부 (락 보유 상태에서 호출) ---
     def _require(self, session_id: int) -> tuple:
@@ -174,7 +177,8 @@ class ChatStore:
         for m in messages:
             if m["role"] == "user":
                 n += 1
-                lines.append(f"## Q{n}. {m['content']}")
+                heading = " ".join(m["content"].split())  # 다중행 질문이 헤딩을 깨지 않게 — 전체 내용은 이미 헤딩 줄에 있다
+                lines.append(f"## Q{n}. {heading}")
                 label = filters_label(m["filters"])
                 if label:
                     lines.append(f"(필터: {label})")

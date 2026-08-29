@@ -398,6 +398,7 @@ async function ask(e) {
     let d = {}; try { d = await resp.json(); } catch {}
     const msg = typeof d.detail === 'string' ? d.detail : (d.detail ? JSON.stringify(d.detail) : 'HTTP ' + resp.status);
     answerDiv.textContent = '⚠️ ' + msg;
+    if ((resp.status === 404 || resp.status === 503) && sessionId !== null) { sessionId = null; loadSessions(); }
     return;
   }
   document.getElementById('question').value = '';

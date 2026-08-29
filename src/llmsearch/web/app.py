@@ -877,12 +877,14 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             raise HTTPException(400, "질문이 비어 있습니다")  # 빈/비문자열 user 블록은 세션의 후속 질문을 전부 깨뜨린다
         state["usage"].record("answer")
         if store is not None:
-            store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
             try:
+                store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
                 if store.get_title(session_id) == DEFAULT_TITLE:
                     store.set_title(session_id, question)
             except KeyError:
-                pass  # 그 사이 삭제된 세션 — 저장 실패와 같은 관용
+                # history()와 append() 사이 세션이 삭제된 경우 — 이전엔 append가 무가드라 KeyError가
+                # 여기서 그대로 터져 record("answer") 이후 500이 됐다. 여기서 잡아 404로 정규화한다.
+                raise HTTPException(404, "세션을 찾을 수 없습니다")
 
         def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
@@ -902,7 +904,9 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                         data = json.dumps(sources_dicts, ensure_ascii=False)
                         yield f"event: sources\ndata: {data}\n\n"
                     elif ev["type"] == "error":
-                        parts.append("\n⚠️ " + ev["message"])
+                        # SSE는 전체 메시지를 스트리밍하되, chats.db에 영구 저장·내보내기되는 부분은
+                        # 콜론 이전(대개 클래스/카테고리명)만 남긴다 — 민감정보(키·값) 유출 방지.
+                        parts.append("\n⚠️ " + ev["message"].split(":", 1)[0])
                         yield f"event: error\ndata: {json.dumps(ev['message'], ensure_ascii=False)}\n\n"
                     else:
                         parts.append(ev["text"])
