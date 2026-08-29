@@ -13,7 +13,7 @@
 | M4 잔여 P1 | ✅ 머지 | PPT 비전 보완(SlideRenderer), 서비스별 자격증명(CONFLUENCE_*/JIRA_*), Archive 워크플로 |
 | M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (45/45), 이연 Minor 정리 후속 반영 |
 | M6a 운영 완성(설정·재요약·사용량) | ✅ 머지 | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |
-| M6b rebuild | 🔀 브랜치 완료(머지 시 ✅로) | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |
+| M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |
 
 - 테스트 기준: **318 passed** (`./.venv/bin/pytest`)
 - E2E: **66/66** (`tools/e2e/verify.py` — 9.8단계와 10단계 사이에 M6b 인덱스 재구축 시나리오 11건 추가)
@@ -82,6 +82,7 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 - **keyring 저장 도입**: 스펙 §7.2/§10은 keyring 언급, 현재는 `.env` 대체로 연기 (스펙 M3 구현 노트). 개인용 로컬 툴로는 .env로 충분하다는 판단 — 도입하려면 사용자와 범위 합의.
 - ComWorker submit 타임아웃: COM 모달 행 대비책이지만 STA 스레드가 어차피 wedged로 남아 실익 제한 — 보류.
 - 회사 일정 시스템 연동: 스펙 Out of Scope (커넥터 인터페이스로 확장 가능하게만 설계됨).
+- **local_docs 정상 동기화의 미존재 폴더 삭제 판정**: 감시 폴더(네트워크 드라이브 등)가 한 라운드 미마운트면 그 아래 문서가 전부 deleted로 판정되어 요약 md·복사본이 unlink된다 (M6b 최종 리뷰 지적, 선재 동작). CLAUDE.md "보수적 삭제"와 충돌 — 미존재 폴더의 prev sid를 `RETRY_SENTINEL`로 이월하는 소규모 픽스 후보 (M7 전 처리 권장). rebuild 경로는 precheck·force_reindex로 이미 보호됨.
 - 이연 Minor 잔여분은 각 마일스톤 최종 리뷰에서 전부 OK-TO-DEFER 판정 — 필요 시 git log의 리뷰 반영 커밋들 참조.
 
 ## 8. 함정·이력 (같은 실수 반복 금지)
