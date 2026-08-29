@@ -43,6 +43,16 @@
 완료 처리 후 watch 폴더의 원본 파일을 삭제하면 다음 local_docs 동기화의 삭제 전파로
 Archives의 요약본·복사본·인덱스도 함께 제거된다 — 아카이브를 보존하려면 원본을 남겨둘 것.
 
+## 대화 저장·내보내기
+
+- 채팅 탭의 대화는 `data_dir/chats.db`에 자동 저장된다 — 인덱스 재구축과 무관하게 보존된다.
+  세션 목록에서 이전 대화를 복원하거나 삭제할 수 있다.
+- 대화 화면의 [내보내기]는 `data_dir/exports/chat-<id>-<제목>.md`로 저장한다. 같은 세션을
+  다시 내보내면 같은 파일을 덮어쓴다(추가 파일이 쌓이지 않는다). 첫 줄에 `[대화기록]` 표식과
+  1차 출처가 아니라는 안내가 붙는다.
+- `config.yaml`의 `chat.export_to_notes: true`면 이 md 파일들이 notes 동기화 대상에 포함되어
+  검색에도 걸린다 (기본은 false).
+
 ## 비용 통제
 
 - API 호출(임베딩 embed / 요약 summary / 비전 vision / 답변 answer)은 `data_dir/usage.json`에

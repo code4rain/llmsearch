@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import traceback
 from dataclasses import asdict
@@ -30,6 +31,7 @@ from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..eval.golden import evaluate as golden_evaluate, parse_golden
 from ..rules import load_rules_md, parse_rules_md
+from ..summarize import _sanitize_segment
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -66,6 +68,19 @@ def local_origin_only(request: Request) -> None:
     origin = request.headers.get("origin") or request.headers.get("referer")
     if origin and not _is_local_origin(origin):
         raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
+
+
+_SLUG_BAD = re.compile(r"[^0-9A-Za-z가-힣\-_]")
+
+
+def _export_slug(title: str) -> str:
+    """export 파일명 조각 — _sanitize_segment(1계층) 후 허용 문자만, 40자, 빈 값은 chat (스펙 M8 §3).
+
+    _sanitize_segment는 결과가 비면 "일반"으로 대체하므로(summarize.py) 빈 제목을 먼저 걸러야
+    스펙의 "빈 문자열이면 chat"이 성립한다.
+    """
+    cleaned = _sanitize_segment(title) if (title or "").strip() else ""
+    return _SLUG_BAD.sub("_", cleaned)[:40].strip("_") or "chat"
 
 
 _FILTER_KEYS = ("source_filter", "date_from", "date_to", "sender")
@@ -273,7 +288,8 @@ def run_sync(state: dict, source: str) -> dict:
             prev = indexer.get_sync_state(conn, source)
             rules_md = load_rules_md(cfg.rules_md_path)
             if source == "notes":
-                result = sync_notes(cfg.notes_folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
+                folders = cfg.notes_folders + ([cfg.exports_dir] if cfg.export_to_notes else [])
+                result = sync_notes(folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
             elif source == "local_docs":
                 prior_map = {
                     sid: pm for sid in list(prev.get("files", {}))
@@ -518,6 +534,29 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         if not found:
             raise HTTPException(404, "세션을 찾을 수 없습니다")
         return {"ok": True}
+
+    @app.post("/api/chats/{session_id}/export", dependencies=[Depends(local_origin_only)])
+    def chats_export(session_id: int):
+        store = _require_chat_store()
+        try:
+            title = store.get_title(session_id)
+            text = store.export_markdown(session_id)
+        except (KeyError, OverflowError):  # OverflowError: sqlite INTEGER 64비트 범위 밖 id
+            raise HTTPException(404, "세션을 찾을 수 없습니다")
+        exports_dir = config.exports_dir
+        exports_dir.mkdir(parents=True, exist_ok=True)
+        target = exports_dir / f"chat-{session_id}-{_export_slug(title)}.md"  # 세션 단위 결정적 — 재내보내기는 덮어쓰기
+        try:
+            target.resolve().relative_to(exports_dir.resolve())  # 2계층 검증 (CLAUDE.md)
+        except ValueError:
+            raise HTTPException(500, "내보내기 실패: 경로 검증")
+        try:
+            tmp = target.with_name(target.name + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, target)
+        except Exception as exc:
+            raise HTTPException(500, f"내보내기 실패: {type(exc).__name__}")
+        return {"ok": True, "path": str(target)}
 
     @app.get("/api/eval/golden")
     def golden_get():

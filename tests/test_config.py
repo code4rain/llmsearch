@@ -92,3 +92,15 @@ def test_limits_key_present_but_empty_loads_zero(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text("data_dir: /tmp/x\nlimits:\n", encoding="utf-8")
     assert load_config(p).daily_api_call_limit == 0
+
+
+def test_export_to_notes_loaded_and_default(tmp_path):
+    from llmsearch.config import Config, load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text("data_dir: /tmp/x\nchat:\n  export_to_notes: true\n", encoding="utf-8")
+    cfg = load_config(p)
+    assert cfg.export_to_notes is True and cfg.exports_dir == cfg.data_dir / "exports"
+    p.write_text("data_dir: /tmp/x\nchat:\n", encoding="utf-8")
+    assert load_config(p).export_to_notes is False
+    assert Config(data_dir=tmp_path).export_to_notes is False

@@ -478,3 +478,15 @@ def test_main_parses_rebuild_flags(monkeypatch, tmp_path: Path):
     monkeypatch.setattr("sys.argv", ["llmsearch", "--config", "c.yaml", "--rebuild", "--yes", "--force"])
     m.main()
     assert calls == {"yes": True, "force": True, "state": {"x": 1}, "served": True}
+
+
+def test_rebuild_preserves_chats_db(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    sid = client.post("/api/chats", json={"title": "보존 확인"}).json()["id"]
+    client.post("/api/chat", json={"question": "재구축 보존 질의", "session_id": sid})
+    assert client.post("/api/rebuild", json={}).status_code == 200
+    wait_resync(state)
+    s = client.get(f"/api/chats/{sid}").json()
+    assert s["title"] == "보존 확인" and len(s["messages"]) == 2  # 명시 제목이므로 첫 질문으로 덮이지 않는다
+    assert s["messages"][0]["content"] == "재구축 보존 질의"

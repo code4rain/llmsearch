@@ -842,3 +842,54 @@ def test_shutdown_closes_chat_store(tmp_path: Path):
         pass  # 컨텍스트 종료 시 shutdown 이벤트 발화 — chat_store.close() 호출
     with pytest.raises(sqlite3.ProgrammingError):
         state["chat_store"].list_sessions()
+
+
+def test_export_slug_rules():
+    from llmsearch.web.app import _export_slug
+
+    assert _export_slug("프로젝트A 킥오프") == "프로젝트A_킥오프"
+    assert _export_slug("../../etc/passwd") == "etc_passwd"
+    assert "/" not in _export_slug("a/b\\c:d*e?f") and ".." not in _export_slug("..")
+    assert _export_slug("") == "chat" and _export_slug("   ") == "chat"
+    assert len(_export_slug("가" * 100)) <= 40
+
+
+def test_chat_export_deterministic_and_overwrites(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={"title": "내보내기 세션/테스트"}).json()["id"]
+    client.post("/api/chat", json={"question": "내보내기 첫 질의", "session_id": sid})
+    r = client.post(f"/api/chats/{sid}/export", json={})
+    assert r.status_code == 200, r.text
+    path = Path(r.json()["path"])
+    exports = client.app.state.llmsearch["config"].exports_dir
+    assert path.parent == exports and path.name == f"chat-{sid}-내보내기_세션_테스트.md"
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("# [대화기록] 내보내기 세션/테스트\n> 이 문서는") and "## Q1. 내보내기 첫 질의" in text
+    client.post("/api/chat", json={"question": "내보내기 둘째 질의", "session_id": sid})
+    assert Path(client.post(f"/api/chats/{sid}/export", json={}).json()["path"]) == path
+    assert "## Q2. 내보내기 둘째 질의" in path.read_text(encoding="utf-8")
+    assert sorted(p.name for p in exports.iterdir()) == [path.name]  # 재내보내기는 같은 파일, tmp 잔재 없음
+    assert client.post("/api/chats/999/export", json={}).status_code == 404
+    assert client.post("/api/chats/1000000000000000000000/export", json={}).status_code == 404
+    assert client.post(f"/api/chats/{sid}/export", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_exports_indexed_as_notes_when_enabled(tmp_path: Path):
+    notes = tmp_path / "notes"; notes.mkdir()
+    (notes / "a.md").write_text("# 메모", encoding="utf-8")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes], export_to_notes=True)
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    client.post("/api/sync/notes")
+    sid = client.post("/api/chats", json={}).json()["id"]
+    client.post("/api/chat", json={"question": "노트 인덱싱 질의", "session_id": sid})
+    client.post(f"/api/chats/{sid}/export", json={})
+    assert client.post("/api/sync/notes").json()["indexed"] == 1
+    titles = {r[0] for r in app.state.llmsearch["read_conn"].execute("SELECT title FROM documents WHERE source_type='notes'")}
+    assert any(t.startswith("[대화기록] ") for t in titles)
+    cfg2 = Config(data_dir=tmp_path / "data2", notes_folders=[notes])  # 기본 false → exports 미포함
+    app2 = create_app(cfg2, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(), enable_scheduler=False)
+    (cfg2.exports_dir).mkdir(parents=True)
+    (cfg2.exports_dir / "chat-1-x.md").write_text("# [대화기록] x", encoding="utf-8")
+    assert TestClient(app2, base_url="http://127.0.0.1").post("/api/sync/notes").json()["indexed"] == 1  # a.md만

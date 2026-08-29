@@ -19,3 +19,5 @@ atlassian:
   jira_base_url: ""         # 예: https://jira.corp.com
 limits:
   daily_api_calls: 0   # 일일 API 호출 상한 (0 = 무제한). 도달 시 요약·인덱싱만 일시정지, 검색·답변은 유지
+chat:
+  export_to_notes: false   # 설정 탭/채팅 [내보내기]로 저장한 대화 md(data_dir/exports/)를 notes로 인덱싱
