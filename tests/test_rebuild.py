@@ -10,6 +10,7 @@ from llmsearch.embeddings import FakeEmbeddings
 from llmsearch.llm import FakeAnswerer
 from llmsearch.outlook.client import FakeOutlookClient
 from llmsearch.summarize import FakeSummarizer
+from llmsearch.web import app as app_module
 from llmsearch.web.app import create_app
 
 
@@ -146,6 +147,7 @@ def wait_resync(state, timeout=30):
 
 
 def test_rebuild_endpoint_restores_docs_without_llm(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)  # /api/status의 "windows" 기대값 고정 — 실행 OS 무관 결정적 테스트
     app, state = make_state(tmp_path, monkeypatch)
     client = client_of(app)
     client.post("/api/sync/notes"); client.post("/api/sync/local_docs")
@@ -172,7 +174,7 @@ def test_rebuild_endpoint_restores_docs_without_llm(tmp_path: Path, monkeypatch)
     assert state["force_reindex_local_docs"] is False
     assert client.get("/api/status").json() == {
         "schema_mismatch": None, "rebuild_in_progress": False, "rebuilding": False, "resummarizing": False,
-        "evaluating": False, "windows": False}  # WSL 지원(§A6)으로 "windows" 필드 추가 — 의도된 변경
+        "evaluating": False, "windows": False}  # WSL 지원(§A6)으로 "windows" 필드 추가 — IS_WINDOWS를 위에서 False 고정
     log_sources = [e["source"] for e in state["log"][:4]]
     assert set(log_sources) >= {"notes", "local_docs"}
 
