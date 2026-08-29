@@ -339,6 +339,36 @@ def test_run_cli_prompt_and_refusal(tmp_path: Path, monkeypatch):
     assert code == 2 and any("상한" in ln for ln in lines)
 
 
+def test_run_cli_partial_failure_returns_1_and_server_still_boots(tmp_path: Path, monkeypatch):
+    """M6b 리뷰 Important 2: 일부 소스 재수집 실패는 거부/취소(2)가 아니라 1 — 초기화는 성공했으니
+    서버는 계속 기동해야 한다(__main__은 code==2일 때만 sys.exit)."""
+    from llmsearch.web.app import run_sync
+
+    for var in ("ATLASSIAN_PAT", "ATLASSIAN_USER", "ATLASSIAN_PASSWORD", "ATLASSIAN_COOKIE",
+                "CONFLUENCE_PAT", "CONFLUENCE_USER", "CONFLUENCE_PASSWORD", "CONFLUENCE_COOKIE",
+                "JIRA_PAT", "JIRA_USER", "JIRA_PASSWORD", "JIRA_COOKIE"):
+        monkeypatch.delenv(var, raising=False)
+    _, state = make_state(tmp_path, monkeypatch)
+    lines: list[str] = []
+    code = rebuild.run_cli(state, run_sync, ["notes", "confluence"], yes=True, out=lines.append)
+    assert code == 1
+    assert any("재수집 실패 소스: confluence" in ln for ln in lines)
+    assert doc_count(state["read_conn"], "notes") == 1  # 성공한 소스는 정상 복구
+
+
+def test_run_cli_precheck_refusal_skips_prompt(tmp_path: Path, monkeypatch):
+    """M6b 리뷰 Important 1: precheck 거부는 확인 프롬프트보다 먼저 — input_fn이 호출되면 안 된다."""
+    _, state = make_state(tmp_path, monkeypatch, daily_limit=1)
+    state["usage"].record("embed", 5)
+
+    def run_sync_unused(_state, _source):
+        pytest.fail("run_sync should not be called")
+
+    code = rebuild.run_cli(state, run_sync_unused, ["notes"], yes=False,
+                           input_fn=lambda _p: pytest.fail("prompt shown"), out=lambda _s: None)
+    assert code == 2
+
+
 def test_main_parses_rebuild_flags(monkeypatch, tmp_path: Path):
     import llmsearch.__main__ as m
 

@@ -160,7 +160,10 @@ def recover_schema_mismatch(state: dict) -> dict:
 def run_cli(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequence[str],
             yes: bool = False, force: bool = False, input_fn: Callable[[str], str] = input,
             out: Callable[[str], None] = print) -> int:
-    """헤드리스 재구축 — 서버 기동 전에 동기로 초기화·재수집. 0=성공, 2=거부/취소."""
+    """헤드리스 재구축 — 서버 기동 전에 동기로 초기화·재수집.
+
+    종료코드: 0=전 소스 성공, 1=초기화는 성공했으나 일부 소스 재수집 실패(서버는 계속 기동), 2=거부/취소.
+    """
     try:
         precheck(state, force=force)  # 확인 프롬프트 전에 거부 조건을 먼저 — 확인한 뒤 거부되면 혼란
     except RebuildRefused as exc:
@@ -179,21 +182,28 @@ def run_cli(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequenc
         return 2
     try:
         claim(state)
-        info = recover_schema_mismatch(state) if state.get("schema_mismatch") else reset_index(state)
     except RebuildRefused as exc:
         out(f"재구축 거부: {exc.detail}")
         return 2
+    try:
+        info = recover_schema_mismatch(state) if state.get("schema_mismatch") else reset_index(state)
     except Exception:
         release(state)
         raise
     out(f"초기화 완료: {info}")
     if info.get("legacy_maps_recovered") == 0:
         out("⚠️ 요약 md 매핑을 회수하지 못했습니다 — local_docs가 전량 재요약됩니다(요약 API 소모)")
+    failed = []
     try:
         for source in sources:
             entry = run_sync(state, source)
             out(f"재수집 {source}: ok={entry['ok']} indexed={entry['indexed']}"
                 + (f" error={entry['error'].splitlines()[0]}" if entry["error"] else ""))
+            if not entry["ok"]:
+                failed.append(source)
     finally:
         release(state)
+    if failed:
+        out(f"재수집 실패 소스: {', '.join(failed)} — 로그 탭/스케줄러 라운드에서 재시도됩니다")
+        return 1
     return 0
