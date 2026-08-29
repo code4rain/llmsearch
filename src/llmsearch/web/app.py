@@ -146,11 +146,11 @@ def _filters_note(filters: dict) -> str:
 EMPTY_ANSWER_PLACEHOLDER = "(답변 없음 — 응답 전 중단)"  # Messages API는 빈 text 블록을 거부한다
 
 
-def _save_assistant(store: ChatStore, session_id: int, parts: list[str], hits: list) -> bool:
+def _save_assistant(store: ChatStore, session_id: int, parts: list[str], sources: list[dict]) -> bool:
     """assistant 턴 저장 — 정상 종료·중단 공통. 실패는 로그(클래스명)만."""
     text = "".join(parts) or EMPTY_ANSWER_PLACEHOLDER
     try:
-        store.append(session_id, "assistant", text, sources=[asdict(h) for h in hits])
+        store.append(session_id, "assistant", text, sources=sources)
         return True
     except Exception as exc:
         _logger.error("대화 저장 실패: %s", type(exc).__name__)
@@ -506,12 +506,16 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def chats_get(session_id: int):
         try:
             return _require_chat_store().get_session(session_id)
-        except KeyError:
+        except (KeyError, OverflowError):  # OverflowError: sqlite INTEGER 64비트 범위 밖 id
             raise HTTPException(404, "세션을 찾을 수 없습니다")
 
     @app.delete("/api/chats/{session_id}", dependencies=[Depends(local_origin_only)])
     def chats_delete(session_id: int):
-        if not _require_chat_store().delete_session(session_id):
+        try:
+            found = _require_chat_store().delete_session(session_id)
+        except OverflowError:
+            found = False
+        if not found:
             raise HTTPException(404, "세션을 찾을 수 없습니다")
         return {"ok": True}
 
@@ -780,12 +784,17 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
+        """순서 계약: filters/session_id/question 검증(400·404·503)은 usage.record("answer") 이전에 끝낸다.
+        `saved` 이벤트는 스트림이 정상 종료해 저장까지 성공했을 때만 나간다. `finally`는 절대 yield하지 않는다
+        (중단·예외 경로의 부분 저장 전용 — GeneratorExit 처리 중 yield하면 RuntimeError)."""
         _require_db()
         filters = _validate_filters(payload.get("filters"))  # 400은 answer 계상 전에
         session_id = payload.get("session_id")
         store = None
         if session_id is not None:
-            if isinstance(session_id, bool) or not isinstance(session_id, int):
+            # bool은 int 서브클래스라 별도 검사, sqlite INTEGER는 64비트라 범위 밖은 미리 404
+            if (isinstance(session_id, bool) or not isinstance(session_id, int)
+                    or not (-2**63 <= session_id < 2**63)):
                 raise HTTPException(404, "세션을 찾을 수 없습니다")
             store = _require_chat_store()
             try:
@@ -795,8 +804,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         else:
             history = payload.get("history", [])
         question = payload.get("question", "")
-        if store is not None and not str(question).strip():
-            raise HTTPException(400, "질문이 비어 있습니다")  # 빈 user 블록은 세션의 후속 질문을 전부 깨뜨린다
+        if store is not None and (not isinstance(question, str) or not question.strip()):
+            raise HTTPException(400, "질문이 비어 있습니다")  # 빈/비문자열 user 블록은 세션의 후속 질문을 전부 깨뜨린다
         state["usage"].record("answer")
         if store is not None:
             store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
@@ -815,13 +824,13 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
         def event_stream():
             parts: list[str] = []
-            hits: list = []
+            sources_dicts: list[dict] = []
             attempted = False
             try:
                 for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
                     if ev["type"] == "sources":
-                        hits = list(ev["hits"])
-                        data = json.dumps([asdict(h) for h in hits], ensure_ascii=False)
+                        sources_dicts = [asdict(h) for h in ev["hits"]]  # 한 번만 변환 — SSE 전송·저장 공용
+                        data = json.dumps(sources_dicts, ensure_ascii=False)
                         yield f"event: sources\ndata: {data}\n\n"
                     elif ev["type"] == "error":
                         parts.append("\n⚠️ " + ev["message"])
@@ -831,13 +840,13 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                         yield f"event: text\ndata: {json.dumps(ev['text'], ensure_ascii=False)}\n\n"
                 if store is not None:
                     attempted = True
-                    if _save_assistant(store, session_id, parts, hits):
+                    if _save_assistant(store, session_id, parts, sources_dicts):
                         yield f"event: saved\ndata: {json.dumps({'session_id': session_id})}\n\n"
                 yield "event: done\ndata: {}\n\n"
             finally:
                 # 클라이언트 중단(GeneratorExit)·답변기 예외 — 부분 답변이라도 보존. finally에서 yield 금지.
                 if store is not None and not attempted:
-                    _save_assistant(store, session_id, parts, hits)
+                    _save_assistant(store, session_id, parts, sources_dicts)
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 

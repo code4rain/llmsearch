@@ -1,7 +1,10 @@
+import asyncio
 import json
+import sqlite3
 import threading
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from llmsearch.config import Config
@@ -740,16 +743,25 @@ def test_chat_without_session_is_stateless(tmp_path: Path):
 def test_chat_bad_session_id_404_and_no_answer_count(tmp_path: Path):
     client = make_app(tmp_path)
     before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
-    for bad in (True, 999, "1", 1.5):
+    for bad in (True, 999, "1", 1.5, 10**30, -(10**30)):  # 10**30: sqlite INTEGER(64비트) 범위 밖
         assert client.post("/api/chat", json={"question": "q", "session_id": bad}).status_code == 404, bad
     sid = client.post("/api/chats", json={}).json()["id"]
     assert client.post("/api/chat", json={"question": "  ", "session_id": sid}).status_code == 400  # 빈 질문
+    assert client.post("/api/chat", json={"question": {"a": 1}, "session_id": sid}).status_code == 400  # 비문자열
+    assert client.post("/api/chat", json={"question": [1], "session_id": sid}).status_code == 400  # 비문자열
     assert client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0) == before
 
 
+def test_chats_get_delete_out_of_range_session_id_404(tmp_path: Path):
+    client = make_app(tmp_path)
+    huge = "1000000000000000000000"  # sqlite INTEGER(64비트) 범위 밖 — OverflowError 경로
+    assert client.get(f"/api/chats/{huge}").status_code == 404
+    assert client.delete(f"/api/chats/{huge}").status_code == 404
+
+
 class _ExplodingAnswerer(FakeAnswerer):
-    """스트림 도중 예외 — finally 저장 경로 검증. (스펙 §6의 클라이언트 중단(GeneratorExit)은 TestClient가
-    본문을 전부 버퍼링해 재현 불가 — 예외 경로로 대체. finally 안 yield 금지는 코드 리뷰로 담보.)"""
+    """스트림 도중 예외 — finally 저장 경로 검증. (클라이언트 중단은 test_chat_client_abort_saves_partial이
+    aclose()로 검증; 이 클래스는 답변기 예외 경로.)"""
 
     def __init__(self, after: int):
         super().__init__()
@@ -762,6 +774,16 @@ class _ExplodingAnswerer(FakeAnswerer):
         raise RuntimeError("stream broke")
 
 
+class _SlowAnswerer(FakeAnswerer):
+    """text 이벤트를 여러 번 나눠 내보내 클라이언트 중단(aclose) 타이밍을 재현한다."""
+
+    def answer_stream(self, question, history, search_fn, filters_note: str = ""):
+        self.last_history = list(history)
+        for i in range(5):
+            yield {"type": "text", "text": f"부분{i} "}
+        yield {"type": "sources", "hits": search_fn(question)}
+
+
 def _app_with_answerer(tmp_path: Path, answerer) -> TestClient:
     notes = tmp_path / "notes"; notes.mkdir()
     (notes / "kick.md").write_text("# 킥오프\n내용", encoding="utf-8")
@@ -771,13 +793,12 @@ def _app_with_answerer(tmp_path: Path, answerer) -> TestClient:
 
 
 def test_chat_partial_answer_saved_in_finally(tmp_path: Path):
+    # raise_server_exceptions=False에서 답변기 예외는 TestClient까지 전파되지 않고(빈 본문으로 종료),
+    # finally가 부분 답변을 저장한다 — try/except 불필요, 저장 결과로 검증한다.
     client = _app_with_answerer(tmp_path, _ExplodingAnswerer(after=2))
     sid = client.post("/api/chats", json={}).json()["id"]
-    try:
-        with client.stream("POST", "/api/chat", json={"question": "중단 질의", "session_id": sid}) as r:
-            body = "".join(r.iter_text())
-    except Exception:
-        body = ""
+    with client.stream("POST", "/api/chat", json={"question": "중단 질의", "session_id": sid}) as r:
+        body = "".join(r.iter_text())
     assert "event: saved" not in body
     msgs = client.get(f"/api/chats/{sid}").json()["messages"]
     assert [m["role"] for m in msgs] == ["user", "assistant"]
@@ -787,10 +808,37 @@ def test_chat_partial_answer_saved_in_finally(tmp_path: Path):
 def test_chat_empty_answer_saves_placeholder(tmp_path: Path):
     client = _app_with_answerer(tmp_path, _ExplodingAnswerer(after=0))
     sid = client.post("/api/chats", json={}).json()["id"]
-    try:
-        with client.stream("POST", "/api/chat", json={"question": "즉시 중단 질의", "session_id": sid}) as r:
-            "".join(r.iter_text())
-    except Exception:
-        pass
+    with client.stream("POST", "/api/chat", json={"question": "즉시 중단 질의", "session_id": sid}) as r:
+        "".join(r.iter_text())
     msgs = client.get(f"/api/chats/{sid}").json()["messages"]
     assert msgs[1]["content"] == "(답변 없음 — 응답 전 중단)"  # 빈 text 블록 방지
+
+
+def test_chat_client_abort_saves_partial(tmp_path: Path):
+    """진짜 GeneratorExit 재현 — 라우트 함수를 직접 호출해 StreamingResponse의 비동기 이터레이터를
+    aclose()로 닫는다. finally 안에 yield가 있으면 여기서 RuntimeError가 난다 (없음을 검증)."""
+    client = _app_with_answerer(tmp_path, _SlowAnswerer())
+    sid = client.post("/api/chats", json={}).json()["id"]
+    fn = next(r.endpoint for r in client.app.routes if getattr(r, "path", "") == "/api/chat")
+    resp = fn({"question": "중단 질의", "session_id": sid})
+
+    async def drive():
+        it = resp.body_iterator
+        await it.__anext__(); await it.__anext__()
+        await it.aclose()  # finally 안에 yield가 있으면 여기서 RuntimeError
+    asyncio.run(drive())
+    msgs = client.get(f"/api/chats/{sid}").json()["messages"]
+    assert [m["role"] for m in msgs] == ["user", "assistant"]
+    assert msgs[1]["content"] == "부분0 부분1 "
+
+
+def test_shutdown_closes_chat_store(tmp_path: Path):
+    notes = tmp_path / "notes"; notes.mkdir()
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(),
+                     enable_scheduler=False)
+    state = app.state.llmsearch
+    with TestClient(app, base_url="http://127.0.0.1"):
+        pass  # 컨텍스트 종료 시 shutdown 이벤트 발화 — chat_store.close() 호출
+    with pytest.raises(sqlite3.ProgrammingError):
+        state["chat_store"].list_sessions()
