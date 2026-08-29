@@ -309,3 +309,46 @@ def test_recover_schema_mismatch_backfills_sentinel_for_orphaned_para_map(tmp_pa
         original_name = Path(sid).name
         matches = sorted(p.name for p in summary_dir.glob("*.md") if p.name.startswith(Path(original_name).stem))
         assert matches == [original_name + ".md"]  # 해시 접미사(__<8hex>) 중복본 없음 — sid당 정확히 하나
+
+
+def test_run_cli_headless_rebuild(tmp_path: Path, monkeypatch):
+    from llmsearch.web.app import _scheduled_sources, run_sync
+
+    _, state = make_state(tmp_path, monkeypatch)
+    run_sync(state, "notes"); run_sync(state, "local_docs")
+    summary_before = state["usage"].today_by_kind().get("summary", 0)
+    lines: list[str] = []
+    code = rebuild.run_cli(state, run_sync, _scheduled_sources(state), yes=True, out=lines.append)
+    assert code == 0
+    assert doc_count(state["read_conn"]) == 3 and rebuild.marker_present(state["conn"]) is False
+    assert state["usage"].today_by_kind().get("summary", 0) == summary_before
+    assert any("documents 3" in ln or "3건" in ln for ln in lines) and any("local_docs" in ln for ln in lines)
+
+
+def test_run_cli_prompt_and_refusal(tmp_path: Path, monkeypatch):
+    from llmsearch.web.app import _scheduled_sources, run_sync
+
+    _, state = make_state(tmp_path, monkeypatch)
+    run_sync(state, "notes")
+    lines: list[str] = []
+    code = rebuild.run_cli(state, run_sync, _scheduled_sources(state), yes=False,
+                           input_fn=lambda _p: "n", out=lines.append)
+    assert code == 2 and doc_count(state["read_conn"]) == 1  # 취소 — 무변경
+    state["usage"].daily_limit = 1; state["usage"].record("embed", 5)
+    code = rebuild.run_cli(state, run_sync, _scheduled_sources(state), yes=True, out=lines.append)
+    assert code == 2 and any("상한" in ln for ln in lines)
+
+
+def test_main_parses_rebuild_flags(monkeypatch, tmp_path: Path):
+    import llmsearch.__main__ as m
+
+    calls = {}
+    monkeypatch.setattr(m, "load_config", lambda p: Config(data_dir=tmp_path / "data"))
+    monkeypatch.setattr(m, "create_app", lambda cfg: type("A", (), {"state": type("S", (), {"llmsearch": {"x": 1}})()})())
+    monkeypatch.setattr(m, "load_dotenv", lambda *a, **k: None)  # 실 .env가 os.environ에 새지 않게
+    monkeypatch.setattr(m, "run_cli", lambda state, run_sync, sources, yes, force: calls.update(yes=yes, force=force, state=state) or 0)
+    monkeypatch.setattr(m, "_scheduled_sources", lambda state: ["notes"])
+    monkeypatch.setattr(m.uvicorn, "run", lambda *a, **k: calls.update(served=True))
+    monkeypatch.setattr("sys.argv", ["llmsearch", "--config", "c.yaml", "--rebuild", "--yes", "--force"])
+    m.main()
+    assert calls == {"yes": True, "force": True, "state": {"x": 1}, "served": True}

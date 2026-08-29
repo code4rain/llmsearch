@@ -155,3 +155,45 @@ def recover_schema_mismatch(state: dict) -> dict:
     if not rows:
         logger.warning("legacy 매핑을 회수하지 못함 — local_docs 전량 재요약 (요약 API 소모)")
     return {"legacy_maps_recovered": len(rows), "documents_deleted": 0, "backup": str(backup_path)}
+
+
+def run_cli(state: dict, run_sync: Callable[[dict, str], dict], sources: Sequence[str],
+            yes: bool = False, force: bool = False, input_fn: Callable[[str], str] = input,
+            out: Callable[[str], None] = print) -> int:
+    """헤드리스 재구축 — 서버 기동 전에 동기로 초기화·재수집. 0=성공, 2=거부/취소."""
+    try:
+        precheck(state, force=force)  # 확인 프롬프트 전에 거부 조건을 먼저 — 확인한 뒤 거부되면 혼란
+    except RebuildRefused as exc:
+        out(f"재구축 거부: {exc.detail}" + (" (--force로 건너뛰기 가능)" if exc.missing_folders else ""))
+        return 2
+    conn = state.get("conn")
+    if conn is None:
+        out(f"index.db 스키마 불일치: {state.get('schema_mismatch')} — legacy 매핑을 회수해 재구축합니다")
+    else:
+        n = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+        out(f"현재 인덱스 documents {n}건 — 전부 지우고 {', '.join(sources)} 순서로 재수집합니다 "
+            "(local_docs는 요약 md 재사용, 변경된 파일만 요약 API 호출)")
+    out("주의: 재구축 1회로 일일 API 상한을 초과할 수 있습니다 (게이트는 소스 진입 시점만 검사)")
+    if not yes and input_fn("계속할까요? [y/N] ").strip().lower() not in ("y", "yes"):
+        out("취소됨")
+        return 2
+    try:
+        claim(state)
+        info = recover_schema_mismatch(state) if state.get("schema_mismatch") else reset_index(state)
+    except RebuildRefused as exc:
+        out(f"재구축 거부: {exc.detail}")
+        return 2
+    except Exception:
+        release(state)
+        raise
+    out(f"초기화 완료: {info}")
+    if info.get("legacy_maps_recovered") == 0:
+        out("⚠️ 요약 md 매핑을 회수하지 못했습니다 — local_docs가 전량 재요약됩니다(요약 API 소모)")
+    try:
+        for source in sources:
+            entry = run_sync(state, source)
+            out(f"재수집 {source}: ok={entry['ok']} indexed={entry['indexed']}"
+                + (f" error={entry['error'].splitlines()[0]}" if entry["error"] else ""))
+    finally:
+        release(state)
+    return 0
