@@ -172,7 +172,7 @@ def test_rebuild_endpoint_restores_docs_without_llm(tmp_path: Path, monkeypatch)
     assert state["force_reindex_local_docs"] is False
     assert client.get("/api/status").json() == {
         "schema_mismatch": None, "rebuild_in_progress": False, "rebuilding": False, "resummarizing": False,
-        "evaluating": False}
+        "evaluating": False, "windows": False}  # WSL 지원(§A6)으로 "windows" 필드 추가 — 의도된 변경
     log_sources = [e["source"] for e in state["log"][:4]]
     assert set(log_sources) >= {"notes", "local_docs"}
 

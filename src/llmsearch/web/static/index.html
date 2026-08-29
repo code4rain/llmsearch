@@ -107,10 +107,10 @@ async function loadSources() {
   loadStatus();
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
-    `<tr><td>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
+    `<tr><td${s.unsupported ? ` title="${esc(s.unsupported)}"` : ''}>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
     `<td>${esc(s.doc_count)}</td><td>${esc(s.last_sync ?? '-')}` +
     `${s.last_error ? ' ⚠️' : ''}</td>` +
-    `<td><button onclick="syncNow('${esc(s.source)}')">동기화</button></td></tr>`).join('');
+    `<td>${s.unsupported ? '<small>Windows 전용</small>' : `<button onclick="syncNow('${esc(s.source)}')">동기화</button>`}</td></tr>`).join('');
 }
 async function syncNow(source) {
   await fetch('/api/sync/' + source, {method: 'POST'});

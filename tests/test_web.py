@@ -10,8 +10,10 @@ from fastapi.testclient import TestClient
 from llmsearch.config import Config
 from llmsearch.embeddings import FakeEmbeddings
 from llmsearch.llm import FakeAnswerer
+from llmsearch.outlook.client import FakeOutlookClient
 from llmsearch.summarize import FakeSummarizer
-from llmsearch.web.app import create_app
+from llmsearch.web import app as app_module
+from llmsearch.web.app import _scheduled_sources, _WINDOWS_ONLY_MSG, create_app
 
 
 def make_app(tmp_path: Path) -> TestClient:
@@ -995,3 +997,70 @@ def test_exports_indexed_as_notes_when_enabled(tmp_path: Path):
     (cfg2.exports_dir).mkdir(parents=True)
     (cfg2.exports_dir / "chat-1-x.md").write_text("# [대화기록] x", encoding="utf-8")
     assert TestClient(app2, base_url="http://127.0.0.1").post("/api/sync/notes").json()["indexed"] == 1  # a.md만
+
+
+def test_scheduler_skips_outlook_when_unavailable(tmp_path: Path, monkeypatch):
+    """WSL(비-Windows)이고 Outlook 클라이언트도 주입되지 않았으면 스케줄러가 outlook_*를
+    건너뛴다 — win32com ImportError 트레이스백이 매 라운드 쌓이는 것을 방지 (브리프 A2/A3)."""
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)
+
+    scheduled = _scheduled_sources(state)
+    assert "outlook_mail" not in scheduled and "outlook_cal" not in scheduled
+
+    state["outlook_client"] = FakeOutlookClient(mails={}, appointments=[])
+    scheduled = _scheduled_sources(state)
+    assert "outlook_mail" in scheduled and "outlook_cal" in scheduled
+
+    state["outlook_client"] = None
+    monkeypatch.setattr(app_module, "IS_WINDOWS", True)
+    scheduled = _scheduled_sources(state)
+    assert "outlook_mail" in scheduled and "outlook_cal" in scheduled
+
+
+def test_manual_outlook_sync_on_wsl_returns_clean_message(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)
+    state = client.app.state.llmsearch
+    usage_before = state["usage"].today_total()
+
+    r = client.post("/api/sync/outlook_mail")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False
+    assert body["error"] == _WINDOWS_ONLY_MSG
+    assert "Traceback" not in (body["error"] or "")
+    assert state["log"][0]["source"] == "outlook_mail" and state["log"][0]["ok"] is False
+    assert state["usage"].today_total() == usage_before  # 사용량 카운터 무변화
+
+
+def test_sources_marks_windows_only(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)
+    rows = {s["source"]: s for s in client.get("/api/sources").json()}
+    assert rows["outlook_mail"]["unsupported"] == _WINDOWS_ONLY_MSG
+    assert rows["outlook_cal"]["unsupported"] == _WINDOWS_ONLY_MSG
+    assert "unsupported" not in rows["notes"]
+
+    # Fake 클라이언트가 주입되면 unsupported가 붙지 않는다
+    cfg = Config(data_dir=tmp_path / "data2")
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(), answerer=FakeAnswerer(),
+                     outlook_client=FakeOutlookClient(mails={}, appointments=[]), enable_scheduler=False)
+    client2 = TestClient(app2, base_url="http://127.0.0.1")
+    rows2 = {s["source"]: s for s in client2.get("/api/sources").json()}
+    assert "unsupported" not in rows2["outlook_mail"]
+    assert "unsupported" not in rows2["outlook_cal"]
+
+
+def test_status_reports_platform(tmp_path: Path):
+    client = make_app(tmp_path)
+    body = client.get("/api/status").json()
+    assert isinstance(body["windows"], bool)
+
+
+def test_static_index_html_shows_windows_only_label():
+    html_path = Path(__file__).parent.parent / "src" / "llmsearch" / "web" / "static" / "index.html"
+    html = html_path.read_text(encoding="utf-8")
+    assert "Windows 전용" in html
+    assert "s.unsupported" in html

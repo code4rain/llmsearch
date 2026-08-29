@@ -2,6 +2,19 @@
 
 개인용 통합 문서 검색 툴. 스펙: `docs/superpowers/specs/2026-08-17-llmsearch-design.md`
 
+## 실행 환경
+
+- **Windows(실사용)**: `py -3.12 -m venv .venv && .venv\Scripts\pip install -e ".[win,vec]"` →
+  `python -m llmsearch --config config.yaml`. Outlook 동기화·PowerPoint COM 비전 보완·파일
+  열기(`/api/open`)가 전부 동작한다.
+- **WSL(개발·테스트)**: `python3 -m venv .venv && ./.venv/bin/pip install -e ".[dev]"`
+  (sqlite-vec 미설치 시 numpy 폴백 자동) → `./.venv/bin/pytest`, 데모 서버·E2E는
+  `tools/e2e/` 참조. Outlook 소스(outlook_mail/outlook_cal)는 소스 탭에 "Windows 전용"으로
+  표시되고 스케줄러 대상에서 자동 제외되며, 수동 동기화도 트레이스백 없이 안내 메시지만
+  반환한다 — 테스트·데모 서버가 `FakeOutlookClient`를 주입하는 경우에는 WSL에서도 정상
+  동작한다. PowerPoint 비전 보완·파일 열기는 COM 의존이라 비활성. `config.yaml`의 경로는
+  `/mnt/d/...` 형식으로 설정한다.
+
 ## 설치 (Windows Python 기준)
 1. `pip install -e ".[vec]"` (sqlite-vec 실패 시 `pip install -e .` — numpy 폴백 자동)
 2. `python scripts/spike_sqlite_vec.py` 로 벡터 확장 동작 확인
@@ -21,7 +34,9 @@
 2. Outlook 데스크톱 앱을 실행해 둔 상태에서 `python scripts/check_outlook.py`로 연동 점검
 3. 앱 실행 후 소스 탭에서 outlook_mail / outlook_cal 동기화 — 초기 메일 인덱싱은
    배치(기본 200통)로 진행되며 중단해도 다음 동기화가 이어서 처리한다 (backlog 표시)
-- WSL/테스트 환경에서는 Outlook 소스 동기화 시 안내 오류가 로그에 남고 다른 소스는 정상 동작
+- WSL 등 비-Windows 환경에서는 outlook_mail/outlook_cal이 소스 탭에 "Windows 전용"으로
+  표시되고 스케줄러에서 자동 제외된다(수동 동기화는 안내 메시지만 반환, 다른 소스는 정상
+  동작) — 상세는 위 "실행 환경" 절 참조
 
 ## Confluence / Jira 연동 (M3)
 1. `config.yaml`의 `atlassian:` base URL 2종 설정, `.env`에 인증(PAT 권장 — DC 7.9+; 안 되면 사번/비밀번호, 최후엔 브라우저 쿠키)
