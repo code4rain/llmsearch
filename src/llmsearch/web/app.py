@@ -3,14 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import traceback
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
@@ -21,20 +23,42 @@ from ..atlassian.registry import Registry
 from ..config import Config
 from ..connectors.confluence import sync_confluence
 from ..connectors.jira import sync_jira
-from ..connectors.local_docs import sync_local_docs
+from ..connectors.local_docs import RETRY_SENTINEL, sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
-from ..rules import load_rules_md
+from ..rules import load_rules_md, parse_rules_md
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
+RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
+_RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
 _AUTH_EXPIRED_MSG = (
     "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
     "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
 )
 _logger = logging.getLogger(__name__)
+
+
+def _is_local_origin(value: str) -> bool:
+    try:
+        parts = urlsplit(value)
+    except ValueError:  # 예: "http://[" — 잘못된 IPv6 literal (fail-closed: 로컬이 아닌 것으로 취급)
+        return False
+    return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost")
+
+
+def local_origin_only(request: Request) -> None:
+    """상태 변경 API의 CSRF 방어 (스펙 M6 §2).
+
+    브라우저는 크로스오리진 POST/PUT/DELETE(no-cors 단순 요청 포함)에 항상 Origin을 붙이므로,
+    Origin(없으면 Referer)이 로컬이 아니면 거부한다. 헤더가 둘 다 없는 요청(curl·CLI·TestClient)은
+    브라우저가 아니므로 통과. "null" Origin(샌드박스·file://)도 거부된다.
+    """
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if origin and not _is_local_origin(origin):
+        raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
 
 
 def _get_outlook_client(state):
@@ -124,10 +148,18 @@ def _scheduled_sources(state: dict) -> list[str]:
 def run_sync(state: dict, source: str) -> dict:
     """커넥터 1개 동기화 실행. 실패는 소스별로 격리해 로그에 남긴다 (스펙 §5)."""
     cfg: Config = state["config"]
-    conn = state["conn"]
     entry = {"source": source, "at": datetime.now().isoformat(), "ok": True, "indexed": 0,
              "deleted": 0, "error": None}
     with state["sync_lock"]:  # 단일 sqlite3.Connection 공유 쓰기 직렬화 (스펙 §5 P0)
+        conn = state["conn"]  # 락 안에서 획득 — M6b 재구축이 커넥션을 교체해도 낡은 참조를 들지 않는다
+        if conn is None:
+            # 스키마 불일치 등으로 DB를 열지 못한 상태 — 예외를 던지면 scheduler_loop가 죽는다
+            entry["ok"] = False
+            entry["error"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다"
+            _logger.error("%s 동기화 건너뜀(DB 없음): %s", source, entry["error"])
+            state["log"].insert(0, entry)
+            del state["log"][200:]
+            return entry
         tracker: UsageTracker = state["usage"]
         if not tracker.indexing_allowed():
             # 스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지 — 검색·답변 경로는 이 게이트를
@@ -145,7 +177,7 @@ def run_sync(state: dict, source: str) -> dict:
             prev = indexer.get_sync_state(conn, source)
             rules_md = load_rules_md(cfg.rules_md_path)
             if source == "notes":
-                result = sync_notes(cfg.notes_folders, cfg.exclude, prev)
+                result = sync_notes(cfg.notes_folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
             elif source == "local_docs":
                 prior_map = {
                     sid: pm for sid in list(prev.get("files", {}))
@@ -156,6 +188,7 @@ def run_sync(state: dict, source: str) -> dict:
                     summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
                     projects=cfg.projects, areas=cfg.areas,
                     glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
+                    summary_rules=rules_md.get("요약 규칙", ""),
                     state=prev, prior_map=prior_map,
                     renderer=_get_slide_renderer(state),
                 )
@@ -235,9 +268,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "confluence_client": atlassian_client,
              "jira_client": atlassian_client,
              "registry": Registry(config.data_dir / "atlassian.json"),
-             "usage": tracker}
+             "usage": tracker,
+             "resummarizing": False, "resummarize_lock": threading.Lock()}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
+
+    def _require_db() -> None:
+        """DB를 만지는 엔드포인트 진입 가드 — 스키마 불일치 상태에서는 503으로 안내 (M6b 배너와 짝)."""
+        if state["read_conn"] is None or state["conn"] is None:
+            raise HTTPException(503, state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다")
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -248,7 +287,10 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         while True:
             await asyncio.sleep(config.sync_interval_minutes * 60)
             for source in _scheduled_sources(state):
-                await asyncio.to_thread(run_sync, state, source)
+                try:
+                    await asyncio.to_thread(run_sync, state, source)
+                except Exception:  # run_sync는 내부에서 격리하지만, 어떤 예외에도 루프는 살아야 한다
+                    _logger.exception("스케줄러 동기화 예외 격리: %s", source)
 
     @app.on_event("startup")
     async def _startup():
@@ -270,20 +312,26 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.get("/api/sources")
     def sources():
+        read_conn = state["read_conn"]
         out = []
         for source in SOURCES:
-            row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
             last = next((e for e in state["log"] if e["source"] == source), None)
-            entry = {"source": source, "doc_count": row[0],
+            entry = {"source": source, "doc_count": 0,
                      "last_sync": last["at"] if last else None,
                      "last_error": last["error"] if last else None}
-            if source == "outlook_mail":
-                entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
+            if read_conn is None:
+                entry["schema_mismatch"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다"
+            else:
+                row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
+                entry["doc_count"] = row[0]
+                if source == "outlook_mail":
+                    entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
             out.append(entry)
         return out
 
-    @app.post("/api/sync/{source}")
+    @app.post("/api/sync/{source}", dependencies=[Depends(local_origin_only)])
     def manual_sync(source: str):
+        _require_db()
         if source not in SOURCES:
             raise HTTPException(404, f"unknown source: {source}")
         return run_sync(state, source)
@@ -292,7 +340,77 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def log():
         return state["log"]
 
-    @app.post("/api/atlassian/register")
+    @app.get("/api/usage")
+    def usage_status():
+        t = state["usage"]
+        return {"today": t.today_by_kind(), "total": t.today_total(), "limit": t.daily_limit,
+                "indexing_allowed": t.indexing_allowed(),
+                "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
+
+    @app.get("/api/rules")
+    def rules_get():
+        path = config.rules_md_path
+        text = path.read_text(encoding="utf-8") if path.exists() else RULES_TEMPLATE
+        return {"text": text, "path": str(path), "sections": list(parse_rules_md(text))}
+
+    @app.put("/api/rules", dependencies=[Depends(local_origin_only)])
+    def rules_put(payload: dict):
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "text는 문자열이어야 합니다")
+        data = text.encode("utf-8")
+        if len(data) > _RULES_MAX_BYTES:
+            raise HTTPException(400, f"rules.md는 {_RULES_MAX_BYTES // 1024}KB 이하여야 합니다")
+        path = config.rules_md_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)  # 원자적 교체 — 저장 중 크래시로 규칙 파일이 절단되지 않게
+        sections = parse_rules_md(text)
+        state["answerer"].update_rules(sections)  # 동기화 경로는 run_sync마다 파일을 다시 읽는다
+        return {"ok": True, "sections": list(sections)}
+
+    @app.get("/api/resummarize/count")
+    def resummarize_count():
+        _require_db()
+        files = indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {})
+        return {"count": len(files)}
+
+    @app.post("/api/resummarize", dependencies=[Depends(local_origin_only)])
+    def resummarize(payload: dict):
+        """문서별/전체 재요약 (스펙 §9, M6 §4).
+
+        상태 항목을 제거하지 않고 RETRY_SENTINEL로 치환한다 — sid가 prev에 남아야 run_sync의
+        prior_map이 유지되어 기존 요약 md를 덮어쓰고(제거하면 해시 접미사 중복본 생성),
+        실제 시그니처와 불일치해 재요약이 강제되며, 그 사이 삭제된 파일의 deleted 판정도 산다.
+        """
+        _require_db()
+        if not state["usage"].indexing_allowed():
+            raise HTTPException(409, "일일 API 호출 상한 도달 — 상한이 초기화된 뒤 재요약하세요")
+        if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
+            raise HTTPException(409, "재요약이 이미 진행 중입니다")
+        state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
+        try:
+            with state["sync_lock"]:
+                st = indexer.get_sync_state(state["conn"], "local_docs")
+                files = dict(st.get("files", {}))
+                if payload.get("all") is True:
+                    targets = list(files)
+                else:
+                    sid = str(payload.get("source_id", ""))
+                    if sid not in files:
+                        raise HTTPException(404, "local_docs 인덱스에 없는 문서입니다")
+                    targets = [sid]
+                for sid in targets:
+                    files[sid] = list(RETRY_SENTINEL)
+                indexer.set_sync_state(state["conn"], "local_docs", {**st, "files": files})
+            entry = run_sync(state, "local_docs")  # 상한 게이트·오류 격리·로그 그대로 적용
+            return {**entry, "reset": len(targets)}
+        finally:
+            state["resummarizing"] = False
+            state["resummarize_lock"].release()
+
+    @app.post("/api/atlassian/register", dependencies=[Depends(local_origin_only)])
     def atlassian_register(payload: dict):
         try:
             return state["registry"].add(str(payload.get("url", "")))
@@ -303,7 +421,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def atlassian_registrations():
         return state["registry"].list()
 
-    @app.delete("/api/atlassian/registrations")
+    @app.delete("/api/atlassian/registrations", dependencies=[Depends(local_origin_only)])
     def atlassian_deregister(payload: dict):
         if not state["registry"].remove(str(payload.get("url", ""))):
             raise HTTPException(404, "등록되지 않은 URL")
@@ -312,30 +430,33 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.get("/api/para/projects")
     def para_projects():
         """summaries/Projects/ 하위 폴더 목록 — GUI 아카이브 섹션용 (스펙 §7.1 P1)."""
+        _require_db()
         projects_dir = config.summaries_dir / "Projects"
         out = []
         if projects_dir.is_dir():
             for p in sorted(d for d in projects_dir.iterdir() if d.is_dir()):
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT COUNT(*) FROM documents WHERE para_path=?", (f"Projects/{p.name}",)
                 ).fetchone()
                 out.append({"name": p.name, "doc_count": row[0]})
         return out
 
-    @app.post("/api/archive")
+    @app.post("/api/archive", dependencies=[Depends(local_origin_only)])
     def archive(payload: dict):
         name = str(payload.get("project", ""))
+        _require_db()
         with state["sync_lock"]:  # 동기화 중 폴더 이동 금지 — 쓰기 직렬화
             try:
-                return archive_project(conn, config.summaries_dir, name)
+                return archive_project(state["conn"], config.summaries_dir, name)
             except KeyError as exc:
                 raise HTTPException(404, exc.args[0])  # str(KeyError)는 따옴표가 붙어 UI에 그대로 노출됨
             except ValueError as exc:
                 raise HTTPException(400, str(exc))
 
-    @app.post("/api/open")
+    @app.post("/api/open", dependencies=[Depends(local_origin_only)])
     def open_item(payload: dict):
         target = str(payload.get("url_or_path", ""))
+        _require_db()
         try:
             if target.startswith("outlook:"):
                 _get_outlook_client(state).open_item(target.removeprefix("outlook:"))
@@ -343,12 +464,11 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             if target.startswith("http://") or target.startswith("https://"):
                 # M3부터 confluence/jira 문서의 url_or_path는 http(s) URL — 인덱스에 정확히
                 # 등록된 값인지 검증 후에만 연다(CSRF로 임의 URL을 열게 하는 것 방지).
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
                 ).fetchone()
                 if row is None:
                     return {"ok": False, "error": "인덱스에 등록된 URL만 열 수 있습니다"}
-                import os
                 if hasattr(os, "startfile"):  # Windows 전용 — 기본 브라우저로 연다
                     import webbrowser
                     webbrowser.open(target)
@@ -357,16 +477,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             # 로컬 경로 실행 전 검증: localhost API는 CSRF로 임의 사이트가 두드릴 수 있으므로
             # (M1 XSS와 같은 계열의 위협) 인덱스에 등록된 경로만 연다 — 임의 파일 실행 방지.
             resolved = str(Path(target).resolve())
-            row = read_conn.execute(
+            row = state["read_conn"].execute(
                 "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (resolved,)
             ).fetchone()
             if row is None:  # local_docs/notes는 이미 resolve()된 문자열을 저장하지만 대비 차원의 폴백
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
                 ).fetchone()
             if row is None:
                 return {"ok": False, "error": "인덱스에 등록된 경로만 열 수 있습니다"}
-            import os
             if hasattr(os, "startfile"):  # Windows 전용
                 os.startfile(resolved)  # noqa: S606 — 위에서 인덱스 등록 여부를 검증한 경로만 실행
                 return {"ok": True}
@@ -374,14 +493,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    @app.post("/api/chat")
+    @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
+        _require_db()
         state["usage"].record("answer")
         question = payload.get("question", "")
         history = payload.get("history", [])
 
         def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
-            return search.search(read_conn, embedder, query, source_filter=source_filter,
+            return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
                                  date_from=date_from, date_to=date_to, sender=sender)
 
         def event_stream():

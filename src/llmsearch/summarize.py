@@ -106,6 +106,7 @@ class Summarizer(Protocol):
     def summarize_and_classify(
         self, title: str, text: str, projects: list[str], areas: list[str],
         existing_resources: list[str], prior_category: str | None, glossary: str, rules: str,
+        summary_rules: str = "",
     ) -> SummaryResult: ...
 
     def describe_filename(self, filename: str) -> str: ...
@@ -117,7 +118,7 @@ class FakeSummarizer:
     """결정적 요약·분류 — 테스트용. 제목/본문에 프로젝트·영역명이 있으면 그리로 분류."""
 
     def summarize_and_classify(self, title, text, projects, areas, existing_resources,
-                               prior_category, glossary, rules) -> SummaryResult:
+                               prior_category, glossary, rules, summary_rules="") -> SummaryResult:
         md = f"# {title}\n\n## 요약\n{text[:200]}\n\n## 예상 질문\n- {title}은 무엇인가?\n\n## 키워드\n{title}\n"
         if prior_category:
             return SummaryResult(md, prior_category)
@@ -159,10 +160,27 @@ CATEGORY: <분류>
 {prior}
 {glossary}
 {rules}
+{summary_rules}
 
 --- 문서 제목: {title} ---
 {text}
 """
+
+
+def build_summary_prompt(title, text, projects, areas, existing_resources, prior_category,
+                         glossary, rules, summary_rules=""):
+    """요약·분류 프롬프트 조립 — 규칙 섹션 주입 위치를 테스트로 고정하기 위해 분리 (스펙 §9 표)."""
+    return _SUMMARY_PROMPT.format(
+        projects=", ".join(projects) or "(없음)",
+        areas=", ".join(areas) or "(없음)",
+        resources=", ".join(existing_resources) or "(없음)",
+        prior=f"- 이 문서의 기존 분류: {prior_category} (특별한 이유 없으면 유지)" if prior_category else "",
+        glossary=f"\n## 용어집\n{glossary}" if glossary else "",
+        rules=f"\n## 분류 규칙\n{rules}" if rules else "",
+        summary_rules=f"\n## 요약 규칙\n{summary_rules}" if summary_rules else "",
+        title=title,
+        text=text[:MAX_SUMMARY_INPUT_CHARS],
+    )
 
 
 class GeminiSummarizer:
@@ -183,17 +201,9 @@ class GeminiSummarizer:
             return ""
 
     def summarize_and_classify(self, title, text, projects, areas, existing_resources,
-                               prior_category, glossary, rules) -> SummaryResult:
-        prompt = _SUMMARY_PROMPT.format(
-            projects=", ".join(projects) or "(없음)",
-            areas=", ".join(areas) or "(없음)",
-            resources=", ".join(existing_resources) or "(없음)",
-            prior=f"- 이 문서의 기존 분류: {prior_category} (특별한 이유 없으면 유지)" if prior_category else "",
-            glossary=f"\n## 용어집\n{glossary}" if glossary else "",
-            rules=f"\n## 분류 규칙\n{rules}" if rules else "",
-            title=title,
-            text=text[:MAX_SUMMARY_INPUT_CHARS],
-        )
+                               prior_category, glossary, rules, summary_rules="") -> SummaryResult:
+        prompt = build_summary_prompt(title, text, projects, areas, existing_resources,
+                                       prior_category, glossary, rules, summary_rules)
         out = self._generate(prompt)
         out, category = _extract_category(out, projects, areas)
         return SummaryResult(out, category)

@@ -145,6 +145,63 @@ with sync_playwright() as p:
     for kind in ("embed", "summary", "vision", "answer"):
         check(f"사용량 기록: {kind}", today_usage.get(kind, 0) >= 1, f"count={today_usage.get(kind, 0)}")
 
+    # 9.5 M6a — 설정 탭 rules.md 편집·재로드 (스펙 §9)
+    page.click("nav >> text=설정")
+    page.wait_for_selector("#rulesText")
+    page.wait_for_timeout(300)
+    check("설정 탭 템플릿 로드", page.input_value("#rulesText").startswith("# 규칙 (rules.md)"))
+    page.fill("#rulesText", "# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n\n## 분류 규칙\n\n"
+                            "## 요약 규칙\n수치는 표로\n\n## 답변 규칙\n두괄식\n")
+    page.click("#saveRulesBtn")
+    page.wait_for_timeout(300)
+    status = page.locator("#rulesStatus").inner_text()
+    check("규칙 저장 상태", "저장됨" in status and "요약 규칙" in status, status)
+    page.click("nav >> text=채팅")
+    page.click("nav >> text=설정")
+    page.wait_for_timeout(300)
+    check("규칙 재로드 일치", "PJA = 프로젝트A" in page.input_value("#rulesText"))
+
+    # 9.6 M6a — 사용량 한 줄 표시 (스펙 §10 GUI)
+    page.click("nav >> text=소스")
+    page.wait_for_selector("#usageLine")
+    page.wait_for_timeout(300)
+    usage_line = page.locator("#usageLine").inner_text()
+    check("사용량 표시", "오늘 API 호출" in usage_line and "embed" in usage_line
+          and f"/ {DAILY_LIMIT}건" in usage_line, usage_line)
+
+    # 9.7 M6a — 출처 카드 재요약: 데모 pptx는 비전 경로라 summary +1, vision +1
+    before = usage_today()
+    page.click("nav >> text=채팅")
+    page.fill("#question", "프로젝트A 아키텍처 표지")
+    before_cards = page.locator(".src").count()  # #messages는 누적이라 이전 답변 카드가 남아 있다
+    # "text=검색" 단독 셀렉터는 이미 렌더된 Jira 출처 카드 "[PROJ-1] 검색 버그 수정"과 모호해진다
+    # (실측: page.click("text=검색")이 폼 버튼이 아닌 .src 카드를 클릭해 검색 자체가 발화하지
+    # 않음) — form >> text= 패턴(등록 버튼과 동일)으로 폼 내부 버튼만 특정한다.
+    page.click("form >> text=검색")
+    page.wait_for_function(f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000)
+    dialogs.clear()
+    page.locator(".src button", has_text="재요약").last.click()  # 방금 받은 답변의 카드; confirm은 dialog 핸들러가 accept
+    page.wait_for_timeout(1500)
+    after = usage_today()
+    check("문서 재요약: summary +1", after.get("summary", 0) == before.get("summary", 0) + 1,
+          f"{before.get('summary')}→{after.get('summary')}")
+    check("문서 재요약: vision +1", after.get("vision", 0) == before.get("vision", 0) + 1,
+          f"{before.get('vision')}→{after.get('vision')}")
+    check("문서 재요약: 완료 alert", any("재요약 완료: 1건" in m for m in dialogs),
+          " / ".join(m[:40] for m in dialogs))
+    md_files = list((DATA / "data" / "summaries").rglob("프로젝트A_아키텍처*.md"))
+    check("재요약 후 요약 md 중복 없음", len(md_files) == 1, str(md_files))
+
+    # 9.8 M6a — 설정 탭 전체 재요약: confirm 문구에 건수, 실행 후 summary +1
+    before = usage_today()
+    dialogs.clear()
+    page.click("nav >> text=설정")
+    page.click("#resumAllBtn")
+    page.wait_for_timeout(1500)
+    check("전체 재요약 confirm 건수", any("1건을 다시 요약" in m for m in dialogs),
+          " / ".join(m[:40] for m in dialogs))
+    check("전체 재요약: summary +1", usage_today().get("summary", 0) == before.get("summary", 0) + 1)
+
     # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
     #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다
     #     (매직 카운트 금지). 무한 루프 방지로 40회 상한을 두고, 초과 시 check()가 FAIL 처리한다.
@@ -193,8 +250,11 @@ with sync_playwright() as p:
 
     page.click("nav >> text=채팅")
     page.fill("#question", "프로젝트A 킥오프 다시 알려줘")
-    page.click("text=검색")
-    page.wait_for_selector(".src", timeout=10000)
+    before_cards = page.locator(".src").count()
+    page.click("form >> text=검색")
+    page.wait_for_function(
+        f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000
+    )
     check("상한 도달 후에도 채팅 정상 응답(검색·답변 유지)",
           "프로젝트A" in page.locator("#messages").inner_text())
 

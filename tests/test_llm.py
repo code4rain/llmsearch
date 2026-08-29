@@ -55,3 +55,27 @@ def test_claude_answerer_presearch_exception_yields_error_and_sources(monkeypatc
     sources = [e for e in events if e["type"] == "sources"]
     assert len(sources) == 1
     assert sources[0]["hits"] == []
+
+
+def test_fake_answerer_update_rules_keeps_last():
+    from llmsearch.llm import FakeAnswerer
+
+    a = FakeAnswerer()
+    assert a.rules == {}
+    a.update_rules({"답변 규칙": "두괄식", "용어집": "PJA = 프로젝트A"})
+    assert a.rules["답변 규칙"] == "두괄식"
+
+
+def test_claude_answerer_update_rules_changes_system_prompt(monkeypatch):
+    import sys, types
+    from llmsearch.llm import ClaudeAnswerer
+
+    fake = types.ModuleType("anthropic")
+    fake.Anthropic = lambda: object()
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    a = ClaudeAnswerer(answer_rules="", glossary="")
+    assert "## 답변 규칙" not in a._system()
+    a.update_rules({"답변 규칙": "두괄식", "용어집": "PJA = 프로젝트A"})
+    assert "## 답변 규칙\n두괄식" in a._system() and "## 용어집\nPJA = 프로젝트A" in a._system()
+    a.update_rules({})
+    assert "## 답변 규칙" not in a._system()

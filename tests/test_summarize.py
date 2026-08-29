@@ -154,3 +154,25 @@ def test_gemini_describe_images_graceful_failure_returns_empty_string(monkeypatc
     summarizer = GeminiSummarizer()
     out = summarizer.describe_images("t.pptx", [b"png"])
     assert out == ""
+
+
+def test_build_summary_prompt_injects_summary_rules():
+    from llmsearch.summarize import build_summary_prompt
+
+    p = build_summary_prompt(title="보고서", text="본문", projects=["프로젝트A"], areas=[],
+                             existing_resources=[], prior_category=None, glossary="PJA = 프로젝트A",
+                             rules="경쟁사 자료는 Resources/경쟁사", summary_rules="실적 수치는 표로 보존")
+    assert "## 용어집\nPJA = 프로젝트A" in p
+    assert "## 분류 규칙\n경쟁사 자료는 Resources/경쟁사" in p
+    assert "## 요약 규칙\n실적 수치는 표로 보존" in p
+    assert p.index("## 분류 규칙") < p.index("## 요약 규칙") < p.index("--- 문서 제목")
+    assert "## 요약 규칙" not in build_summary_prompt("t", "x", [], [], [], None, "", "")
+
+
+def test_fake_summarizer_accepts_summary_rules():
+    from llmsearch.summarize import FakeSummarizer
+
+    r = FakeSummarizer().summarize_and_classify(
+        title="문서", text="프로젝트A", projects=["프로젝트A"], areas=[], existing_resources=[],
+        prior_category=None, glossary="", rules="", summary_rules="표로")
+    assert r.category == "Projects/프로젝트A"

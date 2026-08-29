@@ -21,7 +21,7 @@ VISION_MIN_CHARS = 200  # pptx 추출 텍스트가 이 미만이면 이미지 �
 # 일치하지 않도록 불가능한 값을 사용해, 다음 동기화에서 시그니처 불일치로 강제
 # 재처리되게 한다. 동시에 seen에는 남아 있으므로 이번 실행에서 "삭제됨"으로
 # 오판되지 않아 기존 요약본/복사본/색인이 지워지지 않는다.
-_RETRY_SENTINEL = [0.0, 0]
+RETRY_SENTINEL = [0.0, 0]
 
 
 def extract_text(path: Path) -> str:
@@ -126,7 +126,7 @@ def sync_local_docs(
     summarizer: Summarizer, summaries_dir: Path,
     projects: list[str], areas: list[str], glossary: str, class_rules: str,
     state: dict, prior_map: dict[str, tuple[str, str]],
-    renderer: SlideRenderer | None = None,
+    renderer: SlideRenderer | None = None, summary_rules: str = "",
 ) -> SyncResult:
     prev: dict[str, list] = dict(state.get("files", {}))
     seen: dict[str, list] = {}
@@ -142,7 +142,7 @@ def sync_local_docs(
             try:
                 st = path.stat()
             except OSError:
-                seen[sid] = list(_RETRY_SENTINEL)  # 삭제 오판 방지 + 다음 라운드 재시도
+                seen[sid] = list(RETRY_SENTINEL)  # 삭제 오판 방지 + 다음 라운드 재시도
                 continue
             sig = [st.st_mtime, st.st_size]
             if prev.get(sid) == sig:
@@ -167,6 +167,7 @@ def sync_local_docs(
                         existing_resources=_existing_resources(summaries_dir),
                         prior_category=prior[0] if prior else None,
                         glossary=glossary, rules=class_rules,
+                        summary_rules=summary_rules,
                     )
                     category, body = result.category, result.markdown
                 else:
@@ -199,7 +200,7 @@ def sync_local_docs(
                 # 실행에서 deleted로 오판되어 기존 요약본/복사본/색인이 삭제되지 않게
                 # 하고, (2) 실제 시그니처와 항상 달라 다음 동기화에서 재시도되게 한다.
                 logger.exception("local_docs 동기화 실패, 파일 건너뜀: %s", sid)
-                seen[sid] = list(_RETRY_SENTINEL)
+                seen[sid] = list(RETRY_SENTINEL)
                 continue
 
     deleted = [sid for sid in prev if sid not in seen]

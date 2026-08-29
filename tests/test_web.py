@@ -256,3 +256,228 @@ def test_chat_records_answer_usage(tmp_path):
     client.post("/api/chat", json={"question": "q", "history": []})
     tracker = app.state.llmsearch["usage"]
     assert tracker.today_by_kind().get("answer", 0) >= 1
+
+
+def test_run_sync_without_db_returns_error_entry(tmp_path: Path):
+    """M6a 선행 리팩터: conn이 None(스키마 불일치 등)이면 예외 대신 error entry — 스케줄러 보호."""
+    from llmsearch.web.app import run_sync
+
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    state["conn"] = None
+    state["schema_mismatch"] = "index.db schema v0 != v1"
+    entry = run_sync(state, "notes")
+    assert entry["ok"] is False and "schema" in entry["error"]
+    assert state["log"][0] is entry
+
+
+def test_db_endpoints_503_without_read_conn(tmp_path: Path):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    state["read_conn"] = None
+    state["schema_mismatch"] = "index.db schema v0 != v1"
+    assert client.post("/api/chat", json={"question": "q", "history": []}).status_code == 503
+    assert client.get("/api/para/projects").status_code == 503
+    assert client.post("/api/open", json={"url_or_path": "x"}).status_code == 503
+    r = client.get("/api/sources")
+    assert r.status_code == 200
+    assert all(s["doc_count"] == 0 for s in r.json())
+    assert r.json()[0]["schema_mismatch"] == "index.db schema v0 != v1"
+
+
+def test_read_conn_is_looked_up_at_call_time(tmp_path: Path):
+    """커넥션을 클로저가 아니라 state에서 조회해야 M6b가 재구축 후 교체할 수 있다."""
+    from llmsearch import db
+
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    client.post("/api/sync/notes")
+    fresh = db.open_db(state["config"].db_path)
+    state["read_conn"].close()
+    state["read_conn"] = fresh
+    r = client.get("/api/sources")
+    assert next(s for s in r.json() if s["source"] == "notes")["doc_count"] == 1
+
+
+def test_rules_md_indexed_as_notes(tmp_path: Path):
+    """스펙 §9: rules.md는 notes로 취급되어 인덱싱된다 — '내가 정한 규칙'도 검색 가능."""
+    client = make_app(tmp_path)
+    client.put("/api/rules", json={"text": "# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n"})
+    assert client.post("/api/sync/notes").json()["indexed"] == 2  # kick.md + rules.md
+    read_conn = client.app.state.llmsearch["read_conn"]
+    titles = {r[0] for r in read_conn.execute("SELECT title FROM documents WHERE source_type='notes'")}
+    assert "규칙 (rules.md)" in titles
+
+
+def test_mutating_endpoints_reject_foreign_origin(tmp_path: Path):
+    """스펙 M6 §2: 임의 웹페이지의 CSRF(no-cors POST)로 동기화·아카이브·등록이 트리거되면 안 된다."""
+    client = make_app(tmp_path)
+    evil = {"Origin": "http://evil.example"}
+    assert client.post("/api/sync/notes", headers=evil).status_code == 403
+    assert client.post("/api/archive", json={"project": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/atlassian/register", json={"url": "x"}, headers=evil).status_code == 403
+    assert client.request("DELETE", "/api/atlassian/registrations", json={"url": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/sync/notes", headers={"Origin": "null"}).status_code == 403
+    assert client.post("/api/sync/notes", headers={"Referer": "https://evil.example/page"}).status_code == 403
+    assert client.post("/api/open", json={"url_or_path": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/chat", json={"question": "q", "history": []}, headers=evil).status_code == 403
+    # urlsplit()이 ValueError를 던지는 기형 Origin(잘못된 IPv6 literal) — fail-closed로 403
+    assert client.post("/api/sync/notes", headers={"Origin": "http://["}).status_code == 403
+
+
+def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
+    client = make_app(tmp_path)
+    assert client.post("/api/sync/notes").status_code == 200  # curl/CLI — Origin 없음
+    assert client.post("/api/sync/notes", headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
+    assert client.post("/api/sync/notes", headers={"Origin": "http://localhost:8642"}).status_code == 200
+    assert client.post("/api/sync/notes", headers={"Referer": "http://127.0.0.1:8642/"}).status_code == 200
+    assert client.post("/api/chat", json={"question": "오리진 검사 통과 질의", "history": []},
+                       headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
+
+
+def test_rules_get_template_when_missing(tmp_path: Path):
+    client = make_app(tmp_path)
+    r = client.get("/api/rules")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["text"].startswith("# 규칙 (rules.md)")
+    assert body["sections"] == ["용어집", "분류 규칙", "요약 규칙", "답변 규칙"]
+    assert body["path"].endswith("rules.md")
+
+
+def test_rules_put_saves_and_updates_answerer(tmp_path: Path):
+    client = make_app(tmp_path)
+    text = "# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n\n## 답변 규칙\n두괄식\n"
+    r = client.put("/api/rules", json={"text": text})
+    assert r.status_code == 200 and r.json() == {"ok": True, "sections": ["용어집", "답변 규칙"]}
+    path = client.app.state.llmsearch["config"].rules_md_path
+    assert path.read_text(encoding="utf-8") == text
+    assert not path.with_name(path.name + ".tmp").exists()  # 원자적 저장 — tmp 잔재 없음
+    assert client.app.state.llmsearch["answerer"].rules["답변 규칙"] == "두괄식"
+    assert client.get("/api/rules").json()["text"] == text
+
+
+def test_rules_put_rejects_bad_input(tmp_path: Path):
+    client = make_app(tmp_path)
+    assert client.put("/api/rules", json={"text": 123}).status_code == 400
+    assert client.put("/api/rules", json={}).status_code == 400
+    big = "가" * (90 * 1024)  # UTF-8 3바이트 × 90K = 270KB > 256KB
+    assert client.put("/api/rules", json={"text": big}).status_code == 400
+    assert not client.app.state.llmsearch["config"].rules_md_path.exists()  # 파일 미변경
+    assert client.put("/api/rules", json={"text": "x"}, headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_settings_tab_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    assert 'id="settings"' in html and 'id="rulesText"' in html and "설정" in html
+
+
+def make_app_with_docs(tmp_path: Path, monkeypatch) -> TestClient:
+    """local_docs 감시 폴더 1개(pptx 스텁) — markitdown 대신 짧은 본문 스텁."""
+    from llmsearch.connectors import local_docs
+
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: f"{p.stem} 본문. 프로젝트A 관련 내용 " * 10)
+    watch = tmp_path / "watch"; watch.mkdir()
+    (watch / "설계.pptx").write_bytes(b"x")
+    (watch / "회의록.pptx").write_bytes(b"y")
+    cfg = Config(data_dir=tmp_path / "data", watch_folders=[watch], projects=["프로젝트A"])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    return TestClient(app, base_url="http://127.0.0.1")
+
+
+def test_resummarize_one_overwrites_summary_without_duplicates(tmp_path: Path, monkeypatch):
+    """스펙 M6 §4: 센티널 치환 → prior_map 유지 → 기존 요약 md 덮어쓰기(중복본 없음)."""
+    from llmsearch import indexer
+
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    assert client.post("/api/sync/local_docs").json()["indexed"] == 2
+    state = client.app.state.llmsearch
+    sid = str((tmp_path / "watch" / "설계.pptx").resolve())
+    before_map = indexer.get_para_map(state["read_conn"], sid)
+    summary_before = state["usage"].today_by_kind()["summary"]
+
+    r = client.post("/api/resummarize", json={"source_id": sid})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["indexed"] == 1 and body["reset"] == 1
+    assert state["usage"].today_by_kind()["summary"] == summary_before + 1
+    assert indexer.get_para_map(state["read_conn"], sid) == before_map  # 같은 요약 md 경로에 덮어씀
+    md_files = list((tmp_path / "data" / "summaries").rglob("설계*.md"))
+    assert len(md_files) == 1, md_files  # 해시 접미사 중복본이 생기지 않는다
+    files = indexer.get_sync_state(state["read_conn"], "local_docs")["files"]
+    assert files[sid] != [0.0, 0]  # 재요약 후 실제 시그니처로 복귀
+
+
+def test_resummarize_all_and_count(tmp_path: Path, monkeypatch):
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    assert client.get("/api/resummarize/count").json() == {"count": 2}
+    state = client.app.state.llmsearch
+    summary_before = state["usage"].today_by_kind()["summary"]
+    body = client.post("/api/resummarize", json={"all": True}).json()
+    assert body["reset"] == 2 and body["indexed"] == 2
+    assert state["usage"].today_by_kind()["summary"] == summary_before + 2
+
+
+def test_resummarize_unknown_and_foreign_origin(tmp_path: Path, monkeypatch):
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    assert client.post("/api/resummarize", json={"source_id": "/없음.pptx"}).status_code == 404
+    assert client.post("/api/resummarize", json={}).status_code == 404
+    assert client.post("/api/resummarize", json={"all": True},
+                       headers={"Origin": "http://evil.example"}).status_code == 403
+
+
+def test_resummarize_deleted_file_is_detected(tmp_path: Path, monkeypatch):
+    """센티널 치환은 sid를 prev에 남기므로 그 사이 삭제된 파일의 deleted 판정이 살아 있다."""
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    sid = str((tmp_path / "watch" / "설계.pptx").resolve())
+    (tmp_path / "watch" / "설계.pptx").unlink()
+    body = client.post("/api/resummarize", json={"source_id": sid}).json()
+    assert body["indexed"] == 0 and body["deleted"] == 1
+    assert client.get("/api/resummarize/count").json() == {"count": 1}
+
+
+def test_resummarize_rejects_concurrent_run(tmp_path: Path, monkeypatch):
+    """스펙 M6 §4·§8: 진행 중이면 409 — 더블클릭으로 요약 비용이 2배가 되지 않게."""
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    state = client.app.state.llmsearch
+    state["resummarize_lock"].acquire()  # 진행 중 상황 재현
+    try:
+        assert client.post("/api/resummarize", json={"all": True}).status_code == 409
+    finally:
+        state["resummarize_lock"].release()
+
+
+def test_resummarize_respects_daily_limit_gate(tmp_path: Path, monkeypatch):
+    """상한 도달 시 센티널을 쓰기 전에 409로 거부 — 다음 스케줄러 라운드의 N-콜 버스트를 막는다."""
+    from llmsearch import indexer
+
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    state = client.app.state.llmsearch
+    before_files = dict(indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {}))
+    state["usage"].daily_limit = 1  # 이미 초과 상태
+    r = client.post("/api/resummarize", json={"all": True})
+    assert r.status_code == 409
+    assert "일일 API 호출 상한" in r.json()["detail"]
+    after_files = indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {})
+    assert after_files == before_files  # 센티널([0.0, 0])로 치환되지 않음 — 상태 미변경
+
+
+def test_usage_endpoint_and_line(tmp_path: Path):
+    from datetime import date
+
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    client.post("/api/chat", json={"question": "사용량 표시 확인용 질의", "history": []})  # 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피
+    u = client.get("/api/usage").json()
+    assert u["today"]["embed"] >= 2 and u["today"]["answer"] == 1
+    assert u["limit"] == 0 and u["indexing_allowed"] is True
+    assert u["days"][-1]["date"] == date.today().isoformat()
+    assert u["days"][-1]["total"] == u["total"]
+    assert 'id="usageLine"' in client.get("/").text

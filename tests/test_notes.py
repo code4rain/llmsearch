@@ -73,3 +73,27 @@ def test_unreadable_file_isolation(tmp_path: Path, monkeypatch):
     r2 = sync_notes([tmp_path], [], r1.state)
     assert len(r2.documents) == 0
     assert unreadable_sid in r2.state["files"]
+
+
+def test_extra_files_indexed_and_deduped(tmp_path: Path):
+    notes = tmp_path / "notes"; notes.mkdir()
+    (notes / "a.md").write_text("# 메모A", encoding="utf-8")
+    rules = tmp_path / "data" / "rules.md"
+    rules.parent.mkdir()
+    rules.write_text("# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n", encoding="utf-8")
+    result = sync_notes([notes], [], {}, extra_files=[rules, notes / "a.md", tmp_path / "없음.md"])
+    ids = [d.source_id for d in result.documents]
+    assert len(ids) == 2 and str(rules.resolve()) in ids  # 존재하는 extra만, 폴더 안 파일은 중복 없이
+    assert next(d for d in result.documents if d.source_id == str(rules.resolve())).title == "규칙 (rules.md)"
+    assert str(rules.resolve()) in result.state["files"]
+
+
+def test_extra_file_respects_exclude_and_delete(tmp_path: Path):
+    rules = tmp_path / "rules.md"
+    rules.write_text("# 규칙", encoding="utf-8")
+    r1 = sync_notes([], [], {}, extra_files=[rules])
+    assert len(r1.documents) == 1
+    assert sync_notes([], ["path:*rules.md"], {}, extra_files=[rules]).documents == []
+    rules.unlink()
+    r2 = sync_notes([], [], r1.state, extra_files=[rules])
+    assert r2.deleted_ids == [str(rules.resolve())]

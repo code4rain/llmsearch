@@ -21,6 +21,7 @@
   <button onclick="show('chat')">채팅</button>
   <button onclick="show('sources')">소스</button>
   <button onclick="show('log')">로그</button>
+  <button onclick="show('settings')">설정</button>
 </nav>
 
 <div id="chat" class="tab active">
@@ -32,6 +33,7 @@
 </div>
 
 <div id="sources" class="tab">
+  <div id="usageLine"></div>
   <table id="srcTable"><thead><tr><th>소스</th><th>문서 수</th><th>마지막 동기화</th><th></th></tr></thead>
   <tbody></tbody></table>
   <h3>Confluence / Jira URL 등록</h3>
@@ -46,6 +48,15 @@
 
 <div id="log" class="tab"><pre id="logBody"></pre></div>
 
+<div id="settings" class="tab">
+  <h3>규칙 (rules.md) <small id="rulesPath"></small></h3>
+  <p><small>섹션 헤더가 주입 위치를 정한다: ## 용어집(모든 LLM 호출) · ## 분류 규칙 · ## 요약 규칙 · ## 답변 규칙. 규칙 변경은 신규 문서부터 적용 — 기존 문서는 아래 재요약으로.</small></p>
+  <textarea id="rulesText" style="width:100%;height:60vh;font-family:monospace"></textarea><br>
+  <button id="saveRulesBtn" onclick="saveRules()">저장</button> <span id="rulesStatus"></span>
+  <h3>운영</h3>
+  <button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>
+</div>
+
 <script>
 const history = [];
 function show(id) {
@@ -53,11 +64,21 @@ function show(id) {
   document.getElementById(id).classList.add('active');
   if (id === 'sources') { loadSources(); loadRegistrations(); loadProjects(); }
   if (id === 'log') loadLog();
+  if (id === 'settings') loadRules();
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+async function loadUsage() {
+  const u = await (await fetch('/api/usage')).json();
+  const kinds = ['embed', 'summary', 'vision', 'answer'].map(k => `${k} ${u.today[k] || 0}`).join(' · ');
+  let line = `오늘 API 호출 ${u.total}건 (${kinds}) · ` +
+    (u.limit > 0 ? `일일 상한 ${u.total} / ${u.limit}건` : '일일 상한 없음');
+  if (!u.indexing_allowed) line += ' ⚠️ 상한 도달 — 요약·인덱싱 일시정지 (검색·답변은 계속)';
+  document.getElementById('usageLine').textContent = line;
+}
 async function loadSources() {
+  loadUsage();
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
     `<tr><td>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
@@ -73,6 +94,29 @@ async function openItem(p) {
   const r = await (await fetch('/api/open', {method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify({url_or_path: p})})).json();
   if (!r.ok) alert(r.error);
+}
+function resumMessage(r, d) {
+  if (!r.ok) return d.detail || '실패';
+  if (!d.ok) return d.error;
+  return `재요약 완료: ${d.indexed}건` + (d.indexed === 0 ? ' (파일이 이미 없거나 상한/오류 — 로그 탭 확인)' : '');
+}
+async function resummarize(sid) {
+  if (!confirm('이 문서를 다시 요약할까요? 요약 API를 호출합니다.')) return;
+  const r = await fetch('/api/resummarize', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({source_id: sid})});
+  alert(resumMessage(r, await r.json()));
+}
+async function resummarizeAll() {
+  const cr = await fetch('/api/resummarize/count');
+  if (!cr.ok) { alert((await cr.json()).detail || '건수 조회 실패'); return; }
+  const c = (await cr.json()).count;
+  if (!confirm(`${c}건을 다시 요약합니다. 요약 API를 최소 ${c}회(비전 문서는 +1) 호출합니다.`)) return;
+  const btn = document.getElementById('resumAllBtn'); btn.disabled = true;
+  try {
+    const r = await fetch('/api/resummarize', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({all: true})});
+    alert(resumMessage(r, await r.json()));
+  } finally { btn.disabled = false; }
 }
 async function loadRegistrations() {
   const regs = await (await fetch('/api/atlassian/registrations')).json();
@@ -115,6 +159,19 @@ async function loadLog() {
   const data = await (await fetch('/api/log')).json();
   document.getElementById('logBody').textContent = JSON.stringify(data, null, 2);
 }
+async function loadRules() {
+  const r = await (await fetch('/api/rules')).json();
+  document.getElementById('rulesText').value = r.text;  // .value — innerHTML 금지 (</textarea> XSS)
+  document.getElementById('rulesPath').textContent = r.path;
+  document.getElementById('rulesStatus').textContent = '섹션: ' + (r.sections.join(', ') || '(없음)');
+}
+async function saveRules() {
+  const r = await fetch('/api/rules', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: document.getElementById('rulesText').value})});
+  const data = await r.json();
+  document.getElementById('rulesStatus').textContent =
+    r.ok ? '저장됨 · 섹션: ' + (data.sections.join(', ') || '(없음)') : (data.detail || '저장 실패');
+}
 async function ask(e) {
   e.preventDefault();
   const q = document.getElementById('question').value.trim();
@@ -149,10 +206,12 @@ async function ask(e) {
       else if (ev === 'sources') {
         for (const h of JSON.parse(data)) {
           const lock = h.content_indexed ? '' : ' 🔒';
+          const resum = h.source_type === 'local_docs'
+            ? ` <button onclick="resummarize(this.dataset.s)" data-s="${esc(h.source_id)}">재요약</button>` : '';
           answerDiv.insertAdjacentHTML('beforeend',
             `<div class="src">📄 ${esc(h.title)}${lock} <small>(${esc(h.source_type)} · ${esc(h.updated_at)})</small><br>` +
             `<code>${esc(h.url_or_path)}</code> ` +
-            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button></div>`);
+            `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button>${resum}</div>`);
         }
       }
       box.scrollTop = box.scrollHeight;

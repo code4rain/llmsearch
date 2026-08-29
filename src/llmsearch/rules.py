@@ -36,13 +36,12 @@ def is_excluded(path: str | None, sender: str | None, folder: str | None, exclud
     return any(_match_one(rule, path, sender, folder) for rule in excludes)
 
 
-def load_rules_md(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
+def parse_rules_md(text: str) -> dict[str, str]:
+    """`## 섹션` 헤더 단위로 본문을 나눈다 — GUI가 저장 전 본문으로 섹션 목록을 보여줄 때도 같은 파서."""
     sections: dict[str, str] = {}
     current: str | None = None
     lines: list[str] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         if line.startswith("## "):
             if current is not None:
                 sections[current] = "\n".join(lines).strip()
@@ -53,3 +52,9 @@ def load_rules_md(path: Path) -> dict[str, str]:
     if current is not None:
         sections[current] = "\n".join(lines).strip()
     return sections
+
+
+def load_rules_md(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    return parse_rules_md(path.read_text(encoding="utf-8"))
