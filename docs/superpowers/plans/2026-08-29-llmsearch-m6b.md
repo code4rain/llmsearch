@@ -251,6 +251,7 @@ from llmsearch.config import Config
 from llmsearch.connectors import local_docs
 from llmsearch.embeddings import FakeEmbeddings
 from llmsearch.llm import FakeAnswerer
+from llmsearch.outlook.client import FakeOutlookClient
 from llmsearch.summarize import FakeSummarizer
 from llmsearch.web.app import create_app
 
@@ -265,8 +266,10 @@ def make_state(tmp_path: Path, monkeypatch, daily_limit: int = 0):
     (watch / "회의록.pptx").write_bytes(b"y")
     cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes], watch_folders=[watch],
                  projects=["프로젝트A"], daily_api_call_limit=daily_limit)
+    # Outlook은 빈 Fake 주입 — 재수집 대상에 outlook_*가 포함되므로 COM 지연 import 경로를 타지 않게
     app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
-                     answerer=FakeAnswerer(), enable_scheduler=False)
+                     answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                     enable_scheduler=False)
     return app, app.state.llmsearch
 
 
@@ -577,7 +580,8 @@ def test_startup_detects_marker_and_resume(tmp_path: Path, monkeypatch):
 
     cfg = state1["config"]
     app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
-                      answerer=FakeAnswerer(), enable_scheduler=False)
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)
     state2 = app2.state.llmsearch
     assert state2["force_reindex_local_docs"] is True
     client = client_of(app2)
@@ -602,7 +606,8 @@ def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
 
     cfg = state1["config"]
     app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
-                      answerer=FakeAnswerer(), enable_scheduler=False)  # 기동 성공
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)  # 기동 성공
     state2 = app2.state.llmsearch
     assert state2["conn"] is None and "schema" in state2["schema_mismatch"]
     client = client_of(app2)
