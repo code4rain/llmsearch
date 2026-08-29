@@ -471,16 +471,21 @@ def test_chat_bad_session_id_404_and_no_answer_count(tmp_path: Path):
     before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
     for bad in (True, 999, "1", 1.5):
         assert client.post("/api/chat", json={"question": "q", "session_id": bad}).status_code == 404, bad
+    sid = client.post("/api/chats", json={}).json()["id"]
+    assert client.post("/api/chat", json={"question": "  ", "session_id": sid}).status_code == 400  # 빈 질문
     assert client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0) == before
 
 
 class _ExplodingAnswerer(FakeAnswerer):
+    """스트림 도중 예외 — finally 저장 경로 검증. (스펙 §6의 클라이언트 중단(GeneratorExit)은 TestClient가
+    본문을 전부 버퍼링해 재현 불가 — 예외 경로로 대체. finally 안 yield 금지는 코드 리뷰로 담보.)"""
+
     def __init__(self, after: int):
         super().__init__()
         self.after = after  # 이 개수의 text 이벤트 뒤에 폭발 (0이면 첫 토큰 전)
 
     def answer_stream(self, question, history, search_fn, filters_note: str = ""):
-        self.last_history = history
+        self.last_history = list(history)
         for i in range(self.after):
             yield {"type": "text", "text": f"부분{i} "}
         raise RuntimeError("stream broke")
@@ -630,12 +635,17 @@ def _save_assistant(store: ChatStore, session_id: int, parts: list[str], hits: l
                 raise HTTPException(404, "세션을 찾을 수 없습니다")
         else:
             history = payload.get("history", [])
-        state["usage"].record("answer")
         question = payload.get("question", "")
+        if store is not None and not str(question).strip():
+            raise HTTPException(400, "질문이 비어 있습니다")  # 빈 user 블록은 세션의 후속 질문을 전부 깨뜨린다
+        state["usage"].record("answer")
         if store is not None:
             store.append(session_id, "user", question, filters=filters)  # 스트림 전에 저장 — 중단돼도 질문은 남는다
-            if store.get_title(session_id) == DEFAULT_TITLE:
-                store.set_title(session_id, question)
+            try:
+                if store.get_title(session_id) == DEFAULT_TITLE:
+                    store.set_title(session_id, question)
+            except KeyError:
+                pass  # 그 사이 삭제된 세션 — 저장 실패와 같은 관용
 
         def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
@@ -720,7 +730,7 @@ def test_export_slug_rules():
     from llmsearch.web.app import _export_slug
 
     assert _export_slug("프로젝트A 킥오프") == "프로젝트A_킥오프"
-    assert _export_slug("../../etc/passwd") == "etc_passwd" or ".." not in _export_slug("../../etc/passwd")
+    assert _export_slug("../../etc/passwd") == "etc_passwd"
     assert "/" not in _export_slug("a/b\\c:d*e?f") and ".." not in _export_slug("..")
     assert _export_slug("") == "chat" and _export_slug("   ") == "chat"
     assert len(_export_slug("가" * 100)) <= 40
@@ -777,7 +787,8 @@ def test_rebuild_preserves_chats_db(tmp_path: Path, monkeypatch):
     assert client.post("/api/rebuild", json={}).status_code == 200
     wait_resync(state)
     s = client.get(f"/api/chats/{sid}").json()
-    assert s["title"] == "재구축 보존 질의" and len(s["messages"]) == 2
+    assert s["title"] == "보존 확인" and len(s["messages"]) == 2  # 명시 제목이므로 첫 질문으로 덮이지 않는다
+    assert s["messages"][0]["content"] == "재구축 보존 질의"
 ```
 
 - [ ] **Step 2: 실패 확인**
@@ -804,8 +815,13 @@ _SLUG_BAD = re.compile(r"[^0-9A-Za-z가-힣\-_]")
 
 
 def _export_slug(title: str) -> str:
-    """export 파일명 조각 — _sanitize_segment(1계층) 후 허용 문자만, 40자, 빈 값은 chat."""
-    return _SLUG_BAD.sub("_", _sanitize_segment(title))[:40].strip("_") or "chat"
+    """export 파일명 조각 — _sanitize_segment(1계층) 후 허용 문자만, 40자, 빈 값은 chat (스펙 M8 §3).
+
+    _sanitize_segment는 결과가 비면 "일반"으로 대체하므로(summarize.py) 빈 제목을 먼저 걸러야
+    스펙의 "빈 문자열이면 chat"이 성립한다.
+    """
+    cleaned = _sanitize_segment(title) if (title or "").strip() else ""
+    return _SLUG_BAD.sub("_", cleaned)[:40].strip("_") or "chat"
 ```
 
 엔드포인트(`chats_delete` 뒤):
@@ -925,6 +941,7 @@ async function loadSessions() {
     return;
   }
   const list = await r.json();
+  document.getElementById('chatNote').textContent = '';
   sel.replaceChildren(opt('', '— 새 대화 —'), ...list.map(s => opt(String(s.id), s.title)));
   sel.value = sessionId === null ? '' : String(sessionId);
 }
@@ -993,10 +1010,10 @@ function previewHit(btn) {
     if (cr.ok) { sessionId = (await cr.json()).id; document.getElementById('chatNote').textContent = ''; }
     else { const d = await cr.json().catch(() => ({})); document.getElementById('chatNote').textContent = '대화 저장 불가: ' + (d.detail || ('HTTP ' + cr.status)); }
   }
-  const body = sessionId === null ? {question: q, history, filters} : {question: q, session_id: sessionId, filters};
+  const payload = sessionId === null ? {question: q, history, filters} : {question: q, session_id: sessionId, filters};
 ```
 
-fetch의 `body: JSON.stringify(body)`. 스트림 루프: `sources` 분기를 `renderSources(answerDiv, JSON.parse(data));`로 교체(기존 인라인 카드 템플릿 삭제 — 중복 제거), `else if (ev === 'saved') loadSessions();` 추가. 마지막 `history.push(...)`는 `if (sessionId === null) history.push(...)`. 스크립트 말미 `loadStatus();` 뒤에 `loadSessions();`.
+fetch의 `body: JSON.stringify(payload)`. 스트림 루프: `sources` 분기를 `renderSources(answerDiv, JSON.parse(data));`로 교체(기존 인라인 카드 템플릿 삭제 — 중복 제거), `else if (ev === 'saved') loadSessions();` 추가. 마지막 `history.push(...)`는 `if (sessionId === null) history.push(...)`. 스크립트 말미 `loadStatus();` 뒤에 `loadSessions();`.
 
 - [ ] **Step 4: 통과 확인** — `./.venv/bin/pytest -q` → 전체 green
 
@@ -1044,17 +1061,20 @@ git commit -m "feat: 채팅 세션 UI — 목록·복원·자동 생성·삭제�
     page.click("#previewClose")
     dialogs.clear()
     page.click("#exportChatBtn")
-    page.wait_for_timeout(500)
-    exports = list((DATA / "data" / "exports").glob("chat-*.md"))
+    for _ in range(20):  # alert 도착 폴링 (최대 2s)
+        if dialogs:
+            break
+        page.wait_for_timeout(100)
+    exports = list((DATA / "data" / "exports").glob("chat-*.md"))  # demo_server가 기동 시 .e2e-data를 초기화하므로 1건
     check("내보내기 alert", any("내보내기 완료" in m for m in dialogs), " / ".join(m[:40] for m in dialogs))
     body_md = exports[0].read_text(encoding="utf-8") if exports else ""
     check("내보내기 파일", len(exports) == 1 and body_md.startswith("# [대화기록]") and "프로젝트A 세션 저장 확인 질의" in body_md, str(exports))
     page.click("#newChatBtn")  # 이후 단계(10단계 UI 채팅)가 새 세션에서 시작하게
 ```
 
-- [ ] **Step 2: 실행 검증** — 데모 서버 기동 → `./.venv/bin/python tools/e2e/verify.py` → `총 81건 전부 PASS` (73 + 8). 예산: 채팅 1회(+2) ≈ 38 < 50. `page.on("dialog")`는 reload 후 유지된다.
+- [ ] **Step 2: 실행 검증** — 데모 서버 기동 → `./.venv/bin/python tools/e2e/verify.py` → `총 80건 전부 PASS` (73 + 7). 예산: 채팅 1회(+2) ≈ 38 < 50. `page.on("dialog")`는 reload 후 유지된다.
 
-- [ ] **Step 3: 문서** — HANDOFF §1 표 `| M8 채팅 UX | 🔀 브랜치 완료(머지 시 ✅로) | 세션 저장/복원(chats.db)·내보내기(export_to_notes)·출처 미리보기 |`, 기준 테스트 수/E2E 81 갱신, §3 다음 작업 = M9(로컬 임베딩 스파이크), §5 문서 지도에 M8 스펙·계획, §6 수동 게이트 "M8: 실 Claude 세션에서 후속 질문이 이전 맥락을 잇는지, 새로고침 복원, 내보내기 md 확인". 상위 스펙 §13 트리에 `├─ chats.db   # 대화 세션 (M8 — 인덱스와 분리, rebuild 무관)`, `├─ exports/   # 내보낸 대화 md (chat.export_to_notes로 인덱싱 가능)` 추가.
+- [ ] **Step 3: 문서** — HANDOFF §1 표 `| M8 채팅 UX | 🔀 브랜치 완료(머지 시 ✅로) | 세션 저장/복원(chats.db)·내보내기(export_to_notes)·출처 미리보기 |`, 기준 테스트 수/E2E 80 갱신, §3 다음 작업 = M9(로컬 임베딩 스파이크), §5 문서 지도에 M8 스펙·계획, §6 수동 게이트 "M8: 실 Claude 세션에서 후속 질문이 이전 맥락을 잇는지, 새로고침 복원, 내보내기 md 확인". 상위 스펙 §13 트리에 `├─ chats.db   # 대화 세션 (M8 — 인덱스와 분리, rebuild 무관)`, `├─ exports/   # 내보낸 대화 md (chat.export_to_notes로 인덱싱 가능)` 추가.
 
 - [ ] **Step 4: Commit**
 
