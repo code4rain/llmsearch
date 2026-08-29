@@ -575,3 +575,77 @@ def test_chat_filter_ui_in_index(tmp_path: Path):
     for needle in ('id="filters"', 'id="fDateFrom"', 'id="fDateTo"', 'id="fSender"', "filters-note",
                    "입력 시 메일만 검색됩니다", "resp.ok"):
         assert needle in html, needle
+
+
+# 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피 (test_golden.py가 같은 문장을 먼저 임베딩하면 embed 카운트가 어긋난다)
+GOLDEN_TWO = ("- question: 프로젝트A 킥오프 웹평가 전용 질의\n  expect_source_id: kick.md\n"
+              "- question: 존재하지 않는 주제 WEBONLYXYZQW\n  expect_source_id: none.md\n")
+
+
+def test_golden_get_template_and_put(tmp_path: Path):
+    client = make_app(tmp_path)
+    g = client.get("/api/eval/golden").json()
+    assert g["count"] == 0 and g["text"].startswith("#") and g["path"].endswith("golden.yaml")
+    assert client.put("/api/eval/golden", json={"text": g["text"]}).json() == {"ok": True, "count": 0}  # 템플릿 저장 OK
+    r = client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    assert r.status_code == 200 and r.json()["count"] == 2
+    path = client.app.state.llmsearch["config"].data_dir / "golden.yaml"
+    assert path.read_text(encoding="utf-8") == GOLDEN_TWO and not path.with_name("golden.yaml.tmp").exists()
+    assert client.get("/api/eval/golden").json()["count"] == 2
+    assert client.put("/api/eval/golden", json={"text": "question: q\n"}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": 5}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": "- question: [x\n"}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": GOLDEN_TWO},
+                      headers={"Origin": "http://evil.example"}).status_code == 403
+    assert path.read_text(encoding="utf-8") == GOLDEN_TWO  # 실패한 PUT은 파일 미변경
+
+
+def test_golden_run_reports_rank_and_pass(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    assert client.post("/api/eval/golden/run", json={}).status_code == 400  # 파일 없음
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 2 and body["hit_at_3"] == 1 and body["rate"] == 0.5
+    assert body["target"] == 0.7 and body["pass"] is False
+    assert body["cases"][0]["rank"] == 1 and body["cases"][1]["rank"] is None
+    assert client.app.state.llmsearch["usage"].today_by_kind()["embed"] >= 3  # notes 1 + 질의 2
+
+
+def test_golden_run_refusals(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    state = client.app.state.llmsearch
+    state["rebuilding"] = True
+    assert client.post("/api/eval/golden/run", json={}).status_code == 409
+    state["rebuilding"] = False
+    state["evaluate_lock"].acquire()
+    try:
+        assert client.post("/api/eval/golden/run", json={}).status_code == 409
+    finally:
+        state["evaluate_lock"].release()
+    assert client.post("/api/eval/golden/run", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+    state["read_conn"] = None
+    assert client.post("/api/eval/golden/run", json={}).status_code == 503
+
+
+def test_golden_run_embedding_failure_hides_message(tmp_path: Path, monkeypatch):
+    from llmsearch import search as search_mod
+
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+
+    def boom(*a, **k):
+        raise RuntimeError("secret api key sk-123")
+    monkeypatch.setattr(search_mod, "search", boom)
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 502 and "RuntimeError" in r.json()["detail"] and "sk-123" not in r.text
+
+
+def test_golden_ui_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    for needle in ('id="goldenText"', 'id="runGoldenBtn"', 'id="goldenTable"', "loadGolden()"):
+        assert needle in html, needle

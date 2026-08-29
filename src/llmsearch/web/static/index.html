@@ -65,6 +65,13 @@
   <h3>운영</h3>
   <button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>
   <button id="rebuildBtn" onclick="rebuildIndex()">인덱스 재구축</button>
+  <h3>검색 품질 평가 (golden.yaml) <small id="goldenPath"></small></h3>
+  <p><small>expect_source_id는 전체 경로 또는 경로 접미사(파일명) — 동명 파일이 여러 폴더에 있으면 아무 쪽이나 적중으로 셉니다. 최대 50건.</small></p>
+  <textarea id="goldenText" style="width:100%;height:30vh;font-family:monospace"></textarea><br>
+  <button id="saveGoldenBtn" onclick="saveGolden()">저장</button>
+  <button id="runGoldenBtn" onclick="runGolden()">평가 실행</button> <span id="goldenStatus"></span>
+  <div id="goldenResult" style="display:none"><div id="goldenHeader"></div>
+    <table id="goldenTable"><thead><tr><th>질문</th><th>기대</th><th>순위</th><th>상위 결과</th></tr></thead><tbody></tbody></table></div>
 </div>
 
 <script>
@@ -74,7 +81,7 @@ function show(id) {
   document.getElementById(id).classList.add('active');
   if (id === 'sources') { loadSources(); loadRegistrations(); loadProjects(); }
   if (id === 'log') loadLog();
-  if (id === 'settings') loadRules();
+  if (id === 'settings') { loadRules(); loadGolden(); }
 }
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -229,6 +236,42 @@ async function saveRules() {
   const data = await r.json();
   document.getElementById('rulesStatus').textContent =
     r.ok ? '저장됨 · 섹션: ' + (data.sections.join(', ') || '(없음)') : (data.detail || '저장 실패');
+}
+async function loadGolden() {
+  const g = await (await fetch('/api/eval/golden')).json();
+  document.getElementById('goldenText').value = g.text;
+  document.getElementById('goldenPath').textContent = g.path;
+  document.getElementById('goldenStatus').textContent = `${g.count}건`;
+}
+async function saveGolden() {
+  const r = await fetch('/api/eval/golden', {method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({text: document.getElementById('goldenText').value})});
+  const d = await r.json();
+  document.getElementById('goldenStatus').textContent = r.ok ? `저장됨 · ${d.count}건` : (d.detail || '저장 실패');
+}
+async function runGolden() {
+  const g = await (await fetch('/api/eval/golden')).json();
+  const u = await (await fetch('/api/usage')).json();
+  let msg = `최대 ${g.count}건의 질의 임베딩 API 호출이 발생합니다.`;
+  if (!u.indexing_allowed) msg += ' — 이미 일일 상한 도달 상태, 추가 소모됩니다';
+  if (!confirm(msg + ' 계속할까요?')) return;
+  const btn = document.getElementById('runGoldenBtn'); btn.disabled = true;
+  try {
+    const r = await fetch('/api/eval/golden/run', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json();
+    if (!r.ok) { document.getElementById('goldenStatus').textContent = d.detail || '평가 실패'; return; }
+    document.getElementById('goldenHeader').textContent =
+      `상위3 적중률 ${Math.round(d.rate * 100)}% (${d.hit_at_3}/${d.total}) — 목표 ${Math.round(d.target * 100)}% ${d.pass ? '✅' : '❌'}`;
+    const tbody = document.querySelector('#goldenTable tbody');
+    tbody.replaceChildren(...d.cases.map(c => {
+      const tr = document.createElement('tr');
+      for (const v of [c.question, c.expected, c.rank ?? '❌', c.got.join(', ')]) {
+        const td = document.createElement('td'); td.textContent = String(v); tr.append(td);
+      }
+      return tr;
+    }));
+    document.getElementById('goldenResult').style.display = 'block';
+  } finally { btn.disabled = false; }
 }
 const SOURCES_UI = ['notes', 'local_docs', 'outlook_mail', 'outlook_cal', 'confluence', 'jira'];
 document.getElementById('srcFilters').replaceChildren(...SOURCES_UI.map(s => {

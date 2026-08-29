@@ -70,6 +70,18 @@ def test_precheck_refusals(tmp_path: Path, monkeypatch):
         rebuild.precheck(state)
 
 
+def test_precheck_and_rebuild_refused_while_evaluating(tmp_path: Path, monkeypatch):
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    state["evaluating"] = True
+    try:
+        assert client.post("/api/rebuild", json={}).status_code == 409
+        with pytest.raises(rebuild.RebuildRefused, match="진행 중"):
+            rebuild.claim(state)
+    finally:
+        state["evaluating"] = False
+
+
 def test_reset_index_keeps_para_map_and_local_state(tmp_path: Path, monkeypatch):
     from llmsearch.web.app import run_sync
 

@@ -27,6 +27,7 @@ from ..connectors.local_docs import RETRY_SENTINEL, sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
+from ..eval.golden import evaluate as golden_evaluate, parse_golden
 from ..rules import load_rules_md, parse_rules_md
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
@@ -34,6 +35,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
 RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
 _RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
+GOLDEN_TEMPLATE = (
+    "# 골든 질문 세트 — 검색 상위 3위 적중률 측정 (목표 70%)\n"
+    "# expect_source_id: 전체 경로 또는 경로 접미사(파일명). 동명 파일이 여러 폴더에 있으면 아무 쪽이나 적중.\n"
+    "# - question: 프로젝트A 킥오프 언제?\n#   expect_source_id: kickoff.md\n"
+)
 _AUTH_EXPIRED_MSG = (
     "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
     "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
@@ -358,7 +364,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "registry": Registry(config.data_dir / "atlassian.json"),
              "usage": tracker,
              "resummarizing": False, "resummarize_lock": threading.Lock(),
-             "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False}
+             "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False,
+             "evaluating": False, "evaluate_lock": threading.Lock()}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
     if conn is not None and rebuild.marker_present(conn):
@@ -440,6 +447,70 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         return {"today": t.today_by_kind(), "total": t.today_total(), "limit": t.daily_limit,
                 "indexing_allowed": t.indexing_allowed(),
                 "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
+
+    @app.get("/api/eval/golden")
+    def golden_get():
+        path = config.data_dir / "golden.yaml"
+        text = path.read_text(encoding="utf-8") if path.exists() else GOLDEN_TEMPLATE
+        try:
+            count = len(parse_golden(text))
+        except ValueError:
+            count = 0
+        return {"text": text, "path": str(path), "count": count}
+
+    @app.put("/api/eval/golden", dependencies=[Depends(local_origin_only)])
+    def golden_put(payload: dict):
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "text는 문자열이어야 합니다")
+        data = text.encode("utf-8")
+        if len(data) > _RULES_MAX_BYTES:
+            raise HTTPException(400, f"golden.yaml은 {_RULES_MAX_BYTES // 1024}KB 이하여야 합니다")
+        try:
+            cases = parse_golden(text)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        path = config.data_dir / "golden.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        return {"ok": True, "count": len(cases)}
+
+    @app.post("/api/eval/golden/run", dependencies=[Depends(local_origin_only)])
+    def golden_run():
+        """골든 세트 실행 — 검색 경로(상한 게이트 무관, usage에 embed 기록). 자체 읽기 커넥션으로 재구축과 격리."""
+        _require_db()
+        if state.get("rebuilding"):
+            raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 평가하세요")
+        path = config.data_dir / "golden.yaml"
+        if not path.exists():
+            raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
+        try:
+            cases = parse_golden(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not cases:
+            raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
+        if not state["evaluate_lock"].acquire(blocking=False):
+            raise HTTPException(409, "평가가 이미 진행 중입니다")
+        state["evaluating"] = True
+        conn = None
+        try:
+            conn = db.open_db(config.db_path)  # try 안 — open 실패로 락이 영구 점유되지 않게
+            report = golden_evaluate(conn, embedder, cases)
+        except Exception as exc:
+            # 예외 메시지에 자격증명이 섞일 수 있어 클래스명만 노출 — 로그도 클래스명만 (CLAUDE.md 보안)
+            _logger.error("골든 평가 실패: %s", type(exc).__name__)
+            raise HTTPException(502, f"임베딩 호출 실패: {type(exc).__name__}")
+        finally:
+            if conn is not None:
+                conn.close()
+            state["evaluating"] = False
+            state["evaluate_lock"].release()
+        target = 0.7  # 상위 스펙 §1 성공 기준
+        return {**{k: report[k] for k in ("total", "hit_at_3", "rate", "cases")},
+                "target": target, "pass": report["rate"] >= target}
 
     @app.get("/api/status")
     def status():
