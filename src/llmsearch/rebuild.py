@@ -12,9 +12,11 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Callable, Sequence
+from datetime import datetime
 from pathlib import Path
 
 from . import db, indexer
+from .connectors.local_docs import RETRY_SENTINEL
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +75,13 @@ def reset_index(state: dict) -> dict:
 def claim(state: dict) -> None:
     """precheck 통과 직후 rebuilding을 원자적으로 선점 — 동시 POST 두 건이 둘 다 초기화하는 것을 막는다.
 
-    선점 후 초기화·start_resync가 실패하면 호출자가 release()로 되돌린다.
+    재요약(resummarizing)도 함께 거부한다 — 재구축이 local_docs sync_state를 센티널로 덮어쓰는
+    동안 전체 재요약이 끼어들면 이중으로 LLM을 호출하게 된다. 선점 후 초기화·start_resync가
+    실패하면 호출자가 release()로 되돌린다.
     """
     with state["sync_lock"]:
-        if state.get("rebuilding"):
-            raise RebuildRefused("재구축이 이미 진행 중입니다")
+        if state.get("rebuilding") or state.get("resummarizing"):
+            raise RebuildRefused("재구축 또는 재요약이 진행 중입니다 — 끝난 뒤 다시 시도하세요")
         state["rebuilding"] = True
 
 
@@ -104,21 +108,29 @@ def start_resync(state: dict, run_sync: Callable[[dict, str], dict], sources: Se
             release(state)
 
     thread = threading.Thread(target=target, name="llmsearch-rebuild", daemon=True)
-    state["rebuild_thread"] = thread
     try:
         thread.start()
     except BaseException:
         release(state)  # start 실패로 영구 "진행 중"이 되지 않게
         raise
+    state["rebuild_thread"] = thread  # start 성공 뒤에만 노출 — 실패한 스레드를 wait_resync가 join하지 않게
     return thread
 
 
 def recover_schema_mismatch(state: dict) -> dict:
-    """스키마 불일치 상태의 재구축 — legacy 매핑 회수 → 파일 재생성 → 매핑 복원 → 커넥션 교체."""
+    """스키마 불일치 상태의 재구축 — legacy 매핑 회수 → 파일 백업·재생성 → 매핑 복원 → 커넥션 교체.
+
+    손상된 index.db는 지우지 않고 타임스탬프를 붙여 옆에 남긴다 — 새 DB가 실제로 열리는 것을
+    증명하기 전에 지우면, 재오픈이 실패했을 때 legacy 매핑을 되돌릴 방법이 없어진다.
+    """
     cfg = state["config"]
     with state["sync_lock"]:
         rows, local_state = db.read_legacy_maps(cfg.db_path)
-        for suffix in ("", "-wal", "-shm"):
+        db_path = Path(cfg.db_path)
+        backup_path = db_path.with_name(db_path.name + f".corrupt-{datetime.now():%Y%m%d-%H%M%S}")
+        if db_path.exists():
+            db_path.rename(backup_path)  # unlink 대신 rename — 새 DB 오픈 실패 시 legacy 매핑 복구 경로 보존
+        for suffix in ("-wal", "-shm"):
             Path(str(cfg.db_path) + suffix).unlink(missing_ok=True)  # 열린 커넥션 없음(conn is None)
         conn = db.open_db(cfg.db_path)
         read_conn = db.open_db(cfg.db_path)
@@ -129,8 +141,9 @@ def recover_schema_mismatch(state: dict) -> dict:
         for sid, _para, _summary in rows:
             # 상태가 유실됐어도 para_map에 있는 sid는 상태에 남긴다 — run_sync의 prior_map은 files 키로
             # 만들어지므로, 비어 있으면 prior=None → _place가 해시 접미사 중복 md를 만든다 (스펙 §10 C1).
-            # 센티널은 시그니처와 결코 일치하지 않아 재요약(또는 md 재사용)은 그대로 강제된다.
-            files.setdefault(sid, [0.0, 0])
+            # 센티널은 실제 (mtime, size)와 결코 일치하지 않아 재요약을 강제한다(md 재사용 아님) —
+            # 정확한 시그니처를 잃었으니 안전 쪽으로 재요약을 택한다.
+            files.setdefault(sid, list(RETRY_SENTINEL))
         if files or local_state:
             indexer.set_sync_state(conn, "local_docs", {**(local_state or {}), "files": files})
         set_marker(conn)
@@ -138,6 +151,7 @@ def recover_schema_mismatch(state: dict) -> dict:
         state["conn"], state["read_conn"] = conn, read_conn
         state["schema_mismatch"] = None
         state["force_reindex_local_docs"] = True
+    logger.info("손상된 index.db 백업: %s", backup_path)
     if not rows:
         logger.warning("legacy 매핑을 회수하지 못함 — local_docs 전량 재요약 (요약 API 소모)")
-    return {"legacy_maps_recovered": len(rows), "documents_deleted": 0}
+    return {"legacy_maps_recovered": len(rows), "documents_deleted": 0, "backup": str(backup_path)}

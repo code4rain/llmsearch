@@ -217,10 +217,12 @@ def run_sync(state: dict, source: str) -> dict:
                     indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
             indexer.set_sync_state(conn, source, result.state)
             if source == "local_docs" and state.get("force_reindex_local_docs"):
-                # 플래그는 커넥터가 정상 반환한 뒤에만 소비 — 마커도 이 시점에만 삭제 (스펙 M6 §6)
-                state["force_reindex_local_docs"] = False
+                # 플래그는 커넥터가 정상 반환한 뒤에만 소비 — 마커도 이 시점에만 삭제 (스펙 M6 §6).
+                # 영속(마커 삭제 + commit)이 먼저 — 그 뒤에야 인메모리 플래그를 내린다. 순서가
+                # 반대면 커밋 전에 프로세스가 죽었을 때 마커는 남는데 플래그만 꺼진 상태가 된다.
                 rebuild.clear_marker(conn)
                 conn.commit()
+                state["force_reindex_local_docs"] = False
         except httpx.HTTPStatusError as exc:
             conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
             entry["ok"] = False
@@ -368,9 +370,9 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.get("/api/status")
     def status():
-        conn = state["read_conn"]
+        read_conn = state["read_conn"]
         return {"schema_mismatch": state.get("schema_mismatch"),
-                "rebuild_in_progress": conn is not None and rebuild.marker_present(conn),
+                "rebuild_in_progress": read_conn is not None and rebuild.marker_present(read_conn),
                 "rebuilding": bool(state.get("rebuilding")),
                 "resummarizing": bool(state.get("resummarizing"))}
 
@@ -396,11 +398,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def rebuild_resume():
         _require_db()
         if not rebuild.marker_present(state["read_conn"]):
-            raise HTTPException(409, "재개할 재구축이 없습니다")
+            return JSONResponse(status_code=409, content={"detail": "재개할 재구축이 없습니다", "missing_folders": []})
         try:
             rebuild.claim(state)
         except rebuild.RebuildRefused as exc:
-            raise HTTPException(409, exc.detail)
+            return JSONResponse(status_code=409, content={"detail": exc.detail, "missing_folders": []})
+        state["force_reindex_local_docs"] = True  # 마커가 진실 원천 — claim 성공 뒤 명시적으로 맞춰둔다
         try:
             targets = _scheduled_sources(state)
             rebuild.start_resync(state, run_sync, targets)
@@ -447,15 +450,18 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         실제 시그니처와 불일치해 재요약이 강제되며, 그 사이 삭제된 파일의 deleted 판정도 산다.
         """
         _require_db()
-        if state.get("rebuilding"):
-            raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 재요약하세요")
         if not state["usage"].indexing_allowed():
             raise HTTPException(409, "일일 API 호출 상한 도달 — 상한이 초기화된 뒤 재요약하세요")
         if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
             raise HTTPException(409, "재요약이 이미 진행 중입니다")
-        state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
         try:
             with state["sync_lock"]:
+                # rebuilding 판정과 resummarizing 표시를 같은 락 임계구역 첫 줄에 둔다 — claim()도
+                # 같은 락 안에서 두 플래그를 검사하므로(M6b 리뷰 Important 1·2), 이 순서가 아니면
+                # 재구축과 전체 재요약이 서로를 못 보고 동시에 진행돼 LLM을 이중 호출할 수 있다.
+                if state.get("rebuilding"):
+                    raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 재요약하세요")
+                state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
                 st = indexer.get_sync_state(state["conn"], "local_docs")
                 files = dict(st.get("files", {}))
                 if payload.get("all") is True:

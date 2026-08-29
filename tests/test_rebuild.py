@@ -236,6 +236,8 @@ def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
 
     r = client.post("/api/rebuild", json={})
     assert r.status_code == 200 and r.json()["legacy_maps_recovered"] == 2
+    backup_path = Path(r.json()["backup"])
+    assert backup_path.exists()                                        # 손상 DB는 rename 백업 — unlink 아님
     wait_resync(state2)
     conn = state2["read_conn"]
     assert conn is not None and state2["schema_mismatch"] is None
@@ -244,3 +246,66 @@ def test_schema_mismatch_boot_and_recover(tmp_path: Path, monkeypatch):
     after = state2["usage"].today_by_kind()
     assert after.get("summary", 0) == usage_before.get("summary", 0)  # legacy 매핑 회수 → 요약 재사용
     assert client.post("/api/sync/notes").status_code == 200           # 가드 해제
+
+
+def test_resummarize_refused_while_rebuilding_leaves_state_untouched(tmp_path: Path, monkeypatch):
+    """M6b 리뷰 Important 2: rebuilding 중 재요약 요청은 sync_state를 건드리기 전에 거부돼야 한다
+    (거부가 락 임계구역 밖에서 일어나면 claim()과의 TOCTOU 창에서 센티널이 먼저 기록될 수 있다)."""
+    app, state = make_state(tmp_path, monkeypatch)
+    client = client_of(app)
+    client.post("/api/sync/local_docs")
+    before = indexer.get_sync_state(state["read_conn"], "local_docs")
+    state["rebuilding"] = True
+    try:
+        r = client.post("/api/resummarize", json={"all": True})
+        assert r.status_code == 409
+    finally:
+        state["rebuilding"] = False
+    after = indexer.get_sync_state(state["read_conn"], "local_docs")
+    assert after == before             # 센티널이 기록되지 않음 — 락 첫 줄에서 거부됐다는 증거
+    assert state["resummarizing"] is False
+
+
+def test_recover_schema_mismatch_backfills_sentinel_for_orphaned_para_map(tmp_path: Path, monkeypatch):
+    """M6b 리뷰 Important 4: local_docs sync_state가 유실되고 para_map만 남아도
+    recover_schema_mismatch가 para_map의 모든 sid를 RETRY_SENTINEL로 채워 재요약을 강제하고,
+    prior_category가 유지돼 해시 접미사 중복 md를 만들지 않는다(문서 수는 그대로 2건)."""
+    app1, state1 = make_state(tmp_path, monkeypatch)
+    from llmsearch.web.app import run_sync
+
+    run_sync(state1, "local_docs")
+    conn1 = state1["conn"]
+    sids = sorted(r[0] for r in conn1.execute("SELECT source_id FROM para_map").fetchall())
+    assert len(sids) == 2
+    conn1.execute("DELETE FROM sync_state WHERE source_type='local_docs'")  # 상태만 유실 — para_map은 보존
+    conn1.execute("UPDATE meta SET value='0' WHERE key='schema_version'")
+    conn1.commit()
+    state1["conn"].close(); state1["read_conn"].close()
+
+    cfg = state1["config"]
+    app2 = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                      answerer=FakeAnswerer(), outlook_client=FakeOutlookClient(mails={}, appointments=[]),
+                      enable_scheduler=False)
+    state2 = app2.state.llmsearch
+    assert state2["conn"] is None and state2["schema_mismatch"]
+    summary_before = state2["usage"].today_by_kind().get("summary", 0)  # usage.json은 cfg 공유로 state1 몫 포함
+
+    info = rebuild.recover_schema_mismatch(state2)
+    assert info["legacy_maps_recovered"] == 2
+    files = indexer.get_sync_state(state2["conn"], "local_docs")["files"]
+    assert set(files) == set(sids)
+    for sid in sids:
+        assert files[sid] == list(local_docs.RETRY_SENTINEL)  # 유실된 상태를 센티널로 백필
+
+    entry = run_sync(state2, "local_docs")
+    assert entry["ok"] is True
+    assert doc_count(state2["read_conn"], "local_docs") == 2
+    summary_after = state2["usage"].today_by_kind().get("summary", 0)
+    assert summary_after == summary_before + 2  # 센티널 → md 재사용 아님, 전량 재요약(기대됨)
+
+    for sid in sids:
+        _para_path, summary_path = indexer.get_para_map(state2["read_conn"], sid)
+        summary_dir = Path(summary_path).parent
+        original_name = Path(sid).name
+        matches = sorted(p.name for p in summary_dir.glob("*.md") if p.name.startswith(Path(original_name).stem))
+        assert matches == [original_name + ".md"]  # 해시 접미사(__<8hex>) 중복본 없음 — sid당 정확히 하나
