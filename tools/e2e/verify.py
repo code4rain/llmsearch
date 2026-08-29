@@ -250,8 +250,11 @@ with sync_playwright() as p:
 
     page.click("nav >> text=채팅")
     page.fill("#question", "프로젝트A 킥오프 다시 알려줘")
-    page.click("text=검색")
-    page.wait_for_selector(".src", timeout=10000)
+    before_cards = page.locator(".src").count()
+    page.click("form >> text=검색")
+    page.wait_for_function(
+        f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000
+    )
     check("상한 도달 후에도 채팅 정상 응답(검색·답변 유지)",
           "프로젝트A" in page.locator("#messages").inner_text())
 

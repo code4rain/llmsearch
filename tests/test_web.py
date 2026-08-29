@@ -321,6 +321,8 @@ def test_mutating_endpoints_reject_foreign_origin(tmp_path: Path):
     assert client.post("/api/sync/notes", headers={"Referer": "https://evil.example/page"}).status_code == 403
     assert client.post("/api/open", json={"url_or_path": "x"}, headers=evil).status_code == 403
     assert client.post("/api/chat", json={"question": "q", "history": []}, headers=evil).status_code == 403
+    # urlsplit()이 ValueError를 던지는 기형 Origin(잘못된 IPv6 literal) — fail-closed로 403
+    assert client.post("/api/sync/notes", headers={"Origin": "http://["}).status_code == 403
 
 
 def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
@@ -452,12 +454,19 @@ def test_resummarize_rejects_concurrent_run(tmp_path: Path, monkeypatch):
 
 
 def test_resummarize_respects_daily_limit_gate(tmp_path: Path, monkeypatch):
+    """상한 도달 시 센티널을 쓰기 전에 409로 거부 — 다음 스케줄러 라운드의 N-콜 버스트를 막는다."""
+    from llmsearch import indexer
+
     client = make_app_with_docs(tmp_path, monkeypatch)
     client.post("/api/sync/local_docs")
     state = client.app.state.llmsearch
+    before_files = dict(indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {}))
     state["usage"].daily_limit = 1  # 이미 초과 상태
-    body = client.post("/api/resummarize", json={"all": True}).json()
-    assert body["ok"] is False and "일일 API 호출 상한" in body["error"] and body["reset"] == 2
+    r = client.post("/api/resummarize", json={"all": True})
+    assert r.status_code == 409
+    assert "일일 API 호출 상한" in r.json()["detail"]
+    after_files = indexer.get_sync_state(state["read_conn"], "local_docs").get("files", {})
+    assert after_files == before_files  # 센티널([0.0, 0])로 치환되지 않음 — 상태 미변경
 
 
 def test_usage_endpoint_and_line(tmp_path: Path):

@@ -107,7 +107,9 @@ async function resummarize(sid) {
   alert(resumMessage(r, await r.json()));
 }
 async function resummarizeAll() {
-  const c = (await (await fetch('/api/resummarize/count')).json()).count;
+  const cr = await fetch('/api/resummarize/count');
+  if (!cr.ok) { alert((await cr.json()).detail || '건수 조회 실패'); return; }
+  const c = (await cr.json()).count;
   if (!confirm(`${c}건을 다시 요약합니다. 요약 API를 최소 ${c}회(비전 문서는 +1) 호출합니다.`)) return;
   const btn = document.getElementById('resumAllBtn'); btn.disabled = true;
   try {

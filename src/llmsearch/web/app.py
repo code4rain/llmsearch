@@ -42,7 +42,10 @@ _logger = logging.getLogger(__name__)
 
 
 def _is_local_origin(value: str) -> bool:
-    parts = urlsplit(value)
+    try:
+        parts = urlsplit(value)
+    except ValueError:  # 예: "http://[" — 잘못된 IPv6 literal (fail-closed: 로컬이 아닌 것으로 취급)
+        return False
     return parts.scheme == "http" and parts.hostname in ("127.0.0.1", "localhost")
 
 
@@ -382,6 +385,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         실제 시그니처와 불일치해 재요약이 강제되며, 그 사이 삭제된 파일의 deleted 판정도 산다.
         """
         _require_db()
+        if not state["usage"].indexing_allowed():
+            raise HTTPException(409, "일일 API 호출 상한 도달 — 상한이 초기화된 뒤 재요약하세요")
         if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
             raise HTTPException(409, "재요약이 이미 진행 중입니다")
         state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
@@ -464,7 +469,6 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 ).fetchone()
                 if row is None:
                     return {"ok": False, "error": "인덱스에 등록된 URL만 열 수 있습니다"}
-                import os
                 if hasattr(os, "startfile"):  # Windows 전용 — 기본 브라우저로 연다
                     import webbrowser
                     webbrowser.open(target)
@@ -482,7 +486,6 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 ).fetchone()
             if row is None:
                 return {"ok": False, "error": "인덱스에 등록된 경로만 열 수 있습니다"}
-            import os
             if hasattr(os, "startfile"):  # Windows 전용
                 os.startfile(resolved)  # noqa: S606 — 위에서 인덱스 등록 여부를 검증한 경로만 실행
                 return {"ok": True}
