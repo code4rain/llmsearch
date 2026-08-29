@@ -130,12 +130,9 @@ git commit -m "feat: 출처 카드 발췌 — Hit.snippet(최고 청크·헤더 
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
-`tests/test_llm.py` 끝에 추가:
+`tests/test_llm.py` — 상단 import 블록에 `import types`를 추가하고, 끝에 추가:
 
 ```python
-import types
-
-
 def test_search_tool_schema_covers_all_sources_and_sender():
     from llmsearch.llm import _SEARCH_TOOL
 
@@ -337,7 +334,7 @@ def make_app_mixed(tmp_path: Path, monkeypatch) -> TestClient:
 
 
 def _sources_of(body: str) -> list[str]:
-    line = next(l for l in body.splitlines() if l.startswith("data: [") or l.startswith("data: []"))
+    line = next(l for l in body.splitlines() if l.startswith("data: ["))  # text/error 이벤트는 data: "..."
     return [h["source_type"] for h in json.loads(line[len("data: "):])]
 
 
@@ -368,7 +365,7 @@ def test_chat_filter_validation_400_and_no_answer_count(tmp_path: Path, monkeypa
     before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
     bad = [
         {"source_filter": "notes"}, {"source_filter": ["slack"]}, {"source_filter": [1]},
-        {"date_from": "2026-13-45"}, {"date_to": 20260801}, {"sender": "x" * 201},
+        {"date_from": "2026-13-45"}, {"date_to": 20260801}, {"date_from": "20260801"}, {"sender": "x" * 201},
         {"sender": "kim@corp.com", "source_filter": ["notes"]},
     ]
     for f in bad:
@@ -430,7 +427,7 @@ def _validate_filters(raw) -> dict:
     for key in ("date_from", "date_to"):
         v = raw.get(key)
         if v:
-            if not isinstance(v, str):
+            if not isinstance(v, str) or len(v) != 10:  # fromisoformat은 20260801·2026-W01-1도 통과시킨다
                 raise HTTPException(400, f"{key}는 YYYY-MM-DD 문자열이어야 합니다")
             try:
                 date.fromisoformat(v)
@@ -664,7 +661,10 @@ def test_main_default_golden_path_and_missing_file(tmp_path: Path, monkeypatch, 
 	import pytest
 	with pytest.raises(SystemExit) as ei:
 		g.main()
-	assert ei.value.code == 1 and "golden.yaml이 없습니다" in capsys.readouterr().out
+	out = capsys.readouterr().out
+	assert ei.value.code == 1 and "golden.yaml이 없습니다" in out
+	assert str(tmp_path / "data" / "golden.yaml") in out   # --golden 미지정 시 data_dir 기본값
+	assert not (tmp_path / "data" / "index.db").exists()   # 가드가 open_db·임베더 생성보다 앞
 ```
 
 - [ ] **Step 2: 실패 확인** — `./.venv/bin/pytest tests/test_golden.py -v` → FAIL (`cases` 키 없음, `parse_golden` ImportError, `--golden` required)
@@ -713,7 +713,7 @@ def evaluate(conn, embedder, cases: list[dict]) -> dict:
 			"rate": hits_at_3 / total if total else 0.0, "misses": misses, "cases": results}
 ```
 
-`main()`: `parser.add_argument("--golden", type=Path, default=None)`; `cfg = load_config(...)` 뒤:
+`main()`: `parser.add_argument("--golden", type=Path, default=None)`; 아래 가드를 `cfg = load_config(args.config)` **바로 다음, `from ..embeddings import GeminiEmbeddings`·`conn = db.open_db(...)`보다 앞**에 둔다(중단되는 실행이 index.db를 만들지 않게):
 
 ```python
 	golden_path = args.golden or (cfg.data_dir / "golden.yaml")
@@ -746,18 +746,19 @@ git commit -m "feat: 골든 평가 — 질문별 순위(cases)·parse_golden 공
 ### Task 6: 골든 평가 API + 설정 탭 UI
 
 **Files:**
-- Modify: `src/llmsearch/web/app.py`, `src/llmsearch/web/static/index.html`
-- Test: `tests/test_web.py` (추가)
+- Modify: `src/llmsearch/web/app.py`, `src/llmsearch/web/static/index.html`, `src/llmsearch/rebuild.py`
+- Test: `tests/test_web.py`, `tests/test_rebuild.py` (추가)
 
 **Interfaces:**
 - Consumes: Task 5 `parse_golden`/`evaluate`/`GOLDEN_MAX_CASES`; `_require_db`, `local_origin_only`, `state["rebuilding"]`
-- Produces: `GOLDEN_TEMPLATE`; `GET /api/eval/golden` → `{text, path, count}`; `PUT /api/eval/golden {text}` → `{ok, count}`; `POST /api/eval/golden/run` → `{total, hit_at_3, rate, target, pass, cases}`; `state["evaluating"]`, `state["evaluate_lock"]`; UI `#goldenText`, `#saveGoldenBtn`, `#runGoldenBtn`, `#goldenStatus`, `#goldenResult`(헤더 `#goldenHeader` + 표 `#goldenTable`), JS `loadGolden/saveGolden/runGolden`. Task 7 E2E가 사용.
+- Produces: `GOLDEN_TEMPLATE`; `rebuild.precheck`·`rebuild.claim`이 `state["evaluating"]`도 진행 중으로 간주(평가 중 재구축이 평가 커넥션 아래의 문서를 지우지 않게); `GET /api/eval/golden` → `{text, path, count}`; `PUT /api/eval/golden {text}` → `{ok, count}`; `POST /api/eval/golden/run` → `{total, hit_at_3, rate, target, pass, cases}`; `state["evaluating"]`, `state["evaluate_lock"]`; UI `#goldenText`, `#saveGoldenBtn`, `#runGoldenBtn`, `#goldenStatus`, `#goldenResult`(헤더 `#goldenHeader` + 표 `#goldenTable`), JS `loadGolden/saveGolden/runGolden`. Task 7 E2E가 사용.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
 ```python
-GOLDEN_TWO = ("- question: 프로젝트A 킥오프 언제?\n  expect_source_id: kick.md\n"
-              "- question: 존재하지 않는 주제 XYZQW\n  expect_source_id: none.md\n")
+# 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피 (test_golden.py가 같은 문장을 먼저 임베딩하면 embed 카운트가 어긋난다)
+GOLDEN_TWO = ("- question: 프로젝트A 킥오프 웹평가 전용 질의\n  expect_source_id: kick.md\n"
+              "- question: 존재하지 않는 주제 WEBONLYXYZQW\n  expect_source_id: none.md\n")
 
 
 def test_golden_get_template_and_put(tmp_path: Path):
@@ -833,7 +834,7 @@ def test_golden_ui_in_index(tmp_path: Path):
 
 - [ ] **Step 3: 구현**
 
-`app.py` — import `from ..eval.golden import GOLDEN_MAX_CASES, evaluate as golden_evaluate, parse_golden`. 상수:
+`app.py` — import `from ..eval.golden import evaluate as golden_evaluate, parse_golden` (상한은 `parse_golden`이 강제 — 미사용 상수 import 금지). 상수:
 
 ```python
 GOLDEN_TEMPLATE = (
@@ -893,19 +894,22 @@ GOLDEN_TEMPLATE = (
         if not state["evaluate_lock"].acquire(blocking=False):
             raise HTTPException(409, "평가가 이미 진행 중입니다")
         state["evaluating"] = True
-        conn = db.open_db(config.db_path)
+        conn = None
         try:
+            conn = db.open_db(config.db_path)  # try 안 — open 실패로 락이 영구 점유되지 않게
             report = golden_evaluate(conn, embedder, cases)
         except Exception as exc:
-            # 예외 메시지에 자격증명이 섞일 수 있어 클래스명만 노출 (CLAUDE.md 보안)
-            _logger.exception("골든 평가 실패")
+            # 예외 메시지에 자격증명이 섞일 수 있어 클래스명만 노출 — 로그도 클래스명만 (CLAUDE.md 보안)
+            _logger.error("골든 평가 실패: %s", type(exc).__name__)
             raise HTTPException(502, f"임베딩 호출 실패: {type(exc).__name__}")
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
             state["evaluating"] = False
             state["evaluate_lock"].release()
         target = 0.7  # 상위 스펙 §1 성공 기준
-        return {**report, "target": target, "pass": report["rate"] >= target}
+        return {**{k: report[k] for k in ("total", "hit_at_3", "rate", "cases")},
+                "target": target, "pass": report["rate"] >= target}
 ```
 
 `index.html` 설정 탭 운영 버튼 뒤:
@@ -920,7 +924,7 @@ GOLDEN_TEMPLATE = (
     <table id="goldenTable"><thead><tr><th>질문</th><th>기대</th><th>순위</th><th>상위 결과</th></tr></thead><tbody></tbody></table></div>
 ```
 
-`show()`의 settings 분기에 `loadGolden();`. JS:
+`show()`의 settings 분기를 `if (id === 'settings') { loadRules(); loadGolden(); }`로(중괄호 없이 덧붙이면 모든 탭에서 실행된다). JS:
 
 ```js
 async function loadGolden() {
@@ -961,12 +965,14 @@ async function runGolden() {
 }
 ```
 
-- [ ] **Step 4: 통과 확인** — `./.venv/bin/pytest tests/test_web.py -v` → PASS, `./.venv/bin/pytest -q` → 전체 green
+`src/llmsearch/rebuild.py` — `precheck`의 진행 중 판정과 `claim`의 판정에 `or state.get("evaluating")`를 추가하고 메시지를 "재구축·재요약·평가가 진행 중입니다 — 끝난 뒤 다시 시도하세요"로. `tests/test_rebuild.py`에 1건: `state["evaluating"] = True` → `POST /api/rebuild` 409, `rebuild.claim` RebuildRefused.
+
+- [ ] **Step 4: 통과 확인** — `./.venv/bin/pytest tests/test_web.py tests/test_rebuild.py -v` → PASS, `./.venv/bin/pytest -q` → 전체 green
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/llmsearch/web/app.py src/llmsearch/web/static/index.html tests/test_web.py
+git add src/llmsearch/web/app.py src/llmsearch/web/static/index.html src/llmsearch/rebuild.py tests/test_web.py tests/test_rebuild.py
 git commit -m "feat: 골든 평가 GUI — GET/PUT /api/eval/golden·run(자체 커넥션·50건·502 클래스명)·설정 탭 결과 표 (스펙 M7 §4)"
 ```
 
@@ -1000,6 +1006,7 @@ git commit -m "feat: 골든 평가 GUI — GET/PUT /api/eval/golden·run(자체 
     # 9.11 M7 — 골든 평가 GUI: 적중 1 + 확정 미스 1 → 50% (1/2) ❌ (스펙 M7 §4)
     page.click("nav >> text=설정")
     page.wait_for_selector("#goldenText")
+    page.wait_for_function("document.getElementById('goldenStatus').textContent.endsWith('건')", timeout=10000)  # loadGolden() 완료 대기
     page.fill("#goldenText", "- question: 프로젝트A 킥오프 언제?\n  expect_source_id: kickoff.md\n"
                              "- question: 존재하지 않는 주제 XYZQW\n  expect_source_id: none.md\n")
     page.click("#saveGoldenBtn")
