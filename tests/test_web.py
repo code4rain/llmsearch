@@ -309,6 +309,8 @@ def test_mutating_endpoints_reject_foreign_origin(tmp_path: Path):
     assert client.request("DELETE", "/api/atlassian/registrations", json={"url": "x"}, headers=evil).status_code == 403
     assert client.post("/api/sync/notes", headers={"Origin": "null"}).status_code == 403
     assert client.post("/api/sync/notes", headers={"Referer": "https://evil.example/page"}).status_code == 403
+    assert client.post("/api/open", json={"url_or_path": "x"}, headers=evil).status_code == 403
+    assert client.post("/api/chat", json={"question": "q", "history": []}, headers=evil).status_code == 403
 
 
 def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
@@ -317,3 +319,5 @@ def test_mutating_endpoints_accept_local_origin_or_no_origin(tmp_path: Path):
     assert client.post("/api/sync/notes", headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
     assert client.post("/api/sync/notes", headers={"Origin": "http://localhost:8642"}).status_code == 200
     assert client.post("/api/sync/notes", headers={"Referer": "http://127.0.0.1:8642/"}).status_code == 200
+    assert client.post("/api/chat", json={"question": "오리진 검사 통과 질의", "history": []},
+                       headers={"Origin": "http://127.0.0.1:8642"}).status_code == 200
