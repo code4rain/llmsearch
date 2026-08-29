@@ -12,7 +12,7 @@
 | M3 Confluence/Jira | ✅ 머지 | 인증 3단 폴백(PAT→Basic→쿠키), 페이지 트리 미러, 이슈+댓글, URL 등록 GUI |
 | M4 잔여 P1 | ✅ 머지 | PPT 비전 보완(SlideRenderer), 서비스별 자격증명(CONFLUENCE_*/JIRA_*), Archive 워크플로 |
 | M5 비용 통제 P2 | ✅ 머지 | UsageTracker(원자적 쓰기·형태 검증), 카운팅 래퍼, run_sync 게이트, E2E 확장 (45/45), 이연 Minor 정리 후속 반영 |
-| M6a 운영 완성(설정·재요약·사용량) | 🔀 브랜치 완료(머지 시 ✅로) | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |
+| M6a 운영 완성(설정·재요약·사용량) | ✅ 머지 | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |
 
 - master 테스트 기준: **297 passed** (`./.venv/bin/pytest`)
 - E2E: **55/55** (`tools/e2e/verify.py` — 9단계와 10단계 사이에 M6a 설정 탭·사용량 표시·재요약 시나리오 10건 추가)
