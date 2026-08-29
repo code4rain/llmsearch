@@ -18,10 +18,9 @@
 ## 2. 공통 — 상태 변경 API 보호 (M6a)
 
 `/api/rebuild`·`/api/resummarize`는 인증 없이 실비용·인덱스 초기화를 일으키므로, 임의 웹페이지의 `fetch(..., {mode:'no-cors'})` 단순 요청으로 원격 트리거되면 안 된다(기존 `/api/sync`·`/api/archive`도 같은 노출). 공통 FastAPI 의존성 `_local_origin_only`:
-- `Content-Type: application/json` 요구(없으면 415) — 단순 요청 차단
-- `Origin` 또는 `Referer` 헤더가 있으면 `http://127.0.0.1[:port]`·`http://localhost[:port]`만 허용, 아니면 403
+- `Origin`(없으면 `Referer`) 헤더가 있으면 `http://127.0.0.1[:port]`·`http://localhost[:port]`만 허용, 아니면 403. 브라우저는 크로스오리진 POST/PUT/DELETE(no-cors 단순 요청 포함)에 항상 `Origin`을 붙이므로 이것만으로 CSRF가 차단된다. 헤더가 둘 다 없는 요청(curl·CLI·TestClient)은 통과. (초안의 JSON Content-Type 415 요구는 중복이고 바디 없는 `/api/sync` 호출을 깨뜨려 폐기 — 계획 시점 ruling)
 - 적용: 상태를 바꾸는 모든 POST/PUT/DELETE — `/api/sync/{source}`, `/api/archive`, `/api/atlassian/register`·`registrations(DELETE)`, `/api/rules(PUT)`, `/api/resummarize`, `/api/rebuild`. `/api/open`·`/api/chat`은 기존 방어 유지(chat은 JSON 요구만 추가).
-- 프런트 `fetch`는 이미 JSON 헤더를 보내는 곳이 대부분이라 `syncNow`/`removeReg`에만 헤더 추가. E2E의 `page.request.post`도 JSON 헤더 유지.
+- 프런트 `fetch`는 같은 오리진이라 브라우저가 Origin을 자동으로 붙인다 — 변경 불필요.
 
 ## 3. 설정 탭 — rules.md 편집 (M6a)
 
