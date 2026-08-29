@@ -487,3 +487,180 @@ def test_banner_and_rebuild_button_in_index(tmp_path: Path):
     client = make_app(tmp_path)
     html = client.get("/").text
     assert 'id="banner"' in html and 'id="rebuildBtn"' in html and "loadStatus()" in html
+
+
+def make_app_mixed(tmp_path: Path, monkeypatch) -> TestClient:
+    """notes 1 + local_docs 1 — 소스 필터가 실제로 결과를 가르는지 보기 위한 구성."""
+    from llmsearch.connectors import local_docs
+
+    monkeypatch.setattr(local_docs, "extract_text", lambda p: "프로젝트A 아키텍처 설계 본문 " * 10)
+    notes = tmp_path / "notes"; notes.mkdir()
+    (notes / "kick.md").write_text("# 프로젝트A 킥오프\n프로젝트A 일정 확정", encoding="utf-8")
+    watch = tmp_path / "watch"; watch.mkdir()
+    (watch / "설계.pptx").write_bytes(b"x")
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[notes], watch_folders=[watch], projects=["프로젝트A"])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    client = TestClient(app, base_url="http://127.0.0.1")
+    client.post("/api/sync/notes"); client.post("/api/sync/local_docs")
+    return client
+
+
+def _sources_of(body: str) -> list[str]:
+    line = next(l for l in body.splitlines() if l.startswith("data: ["))  # text/error 이벤트는 data: "..."
+    return [h["source_type"] for h in json.loads(line[len("data: "):])]
+
+
+def test_chat_source_filter_forces_presearch(tmp_path: Path, monkeypatch):
+    client = make_app_mixed(tmp_path, monkeypatch)
+    with client.stream("POST", "/api/chat", json={"question": "프로젝트A 필터 검증 질의", "history": [],
+                                                   "filters": {"source_filter": ["notes"]}}) as r:
+        body = "".join(r.iter_text())
+    assert _sources_of(body) == ["notes"]
+    with client.stream("POST", "/api/chat", json={"question": "프로젝트A 필터 없음 질의", "history": []}) as r:
+        body = "".join(r.iter_text())
+    assert set(_sources_of(body)) == {"notes", "local_docs"}
+    assert client.app.state.llmsearch["answerer"].last_filters_note == ""
+
+
+def test_chat_filters_note_delivered_and_normalized(tmp_path: Path, monkeypatch):
+    client = make_app_mixed(tmp_path, monkeypatch)
+    client.post("/api/chat", json={"question": "고지 전달 질의", "history": [],
+                                   "filters": {"source_filter": ["local_docs", "notes", "notes"],
+                                               "date_from": "2026-08-01", "date_to": "", "sender": ""}})
+    note = client.app.state.llmsearch["answerer"].last_filters_note
+    assert note.startswith("(사용자 필터 적용: 소스=notes,local_docs, 기간=2026-08-01~")  # SOURCES 순서·중복 제거
+    assert "빈 배열" in note
+
+
+def test_chat_filter_validation_400_and_no_answer_count(tmp_path: Path, monkeypatch):
+    client = make_app_mixed(tmp_path, monkeypatch)
+    before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
+    bad = [
+        {"source_filter": "notes"}, {"source_filter": ["slack"]}, {"source_filter": [1]},
+        {"date_from": "2026-13-45"}, {"date_to": 20260801}, {"date_from": "20260801"},
+        {"date_from": "2026-W01-1"}, {"sender": "x" * 201},
+        {"sender": "kim@corp.com", "source_filter": ["notes"]},
+    ]
+    for f in bad:
+        r = client.post("/api/chat", json={"question": "q", "history": [], "filters": f})
+        assert r.status_code == 400, f
+    assert client.post("/api/chat", json={"question": "q", "history": [], "filters": "x"}).status_code == 400
+    assert client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0) == before  # 400은 answer 미계상
+    ok = client.post("/api/chat", json={"question": "sender 단독 허용 질의", "history": [],
+                                        "filters": {"sender": " kim@corp.com ", "source_filter": []}})
+    assert ok.status_code == 200
+    assert "발신자=kim@corp.com" in client.app.state.llmsearch["answerer"].last_filters_note
+
+
+def test_apply_filters_fills_only_missing_args():
+    from llmsearch.web.app import _apply_filters
+
+    calls = []
+
+    def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        calls.append((source_filter, date_from, date_to, sender))
+        return []
+
+    f = {"source_filter": ["notes"], "date_from": "2026-08-01", "date_to": None, "sender": "a@b"}
+    wrapped = _apply_filters(search_fn, f)
+    wrapped("q")                                                   # 선검색: 전부 필터
+    wrapped("q", source_filter=["jira"], date_from="", date_to="2026-09-01", sender=None)  # 툴: 명시값 우선, falsy 채움
+    assert calls == [(["notes"], "2026-08-01", None, "a@b"), (["jira"], "2026-08-01", "2026-09-01", "a@b")]
+    assert _apply_filters(search_fn, {"source_filter": None, "date_from": None, "date_to": None, "sender": None}) is search_fn
+
+
+def test_chat_filter_ui_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    for needle in ('id="filters"', 'id="fDateFrom"', 'id="fDateTo"', 'id="fSender"', "filters-note",
+                   "입력 시 메일만 검색됩니다", "resp.ok"):
+        assert needle in html, needle
+
+
+# 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피 (test_golden.py가 같은 문장을 먼저 임베딩하면 embed 카운트가 어긋난다)
+GOLDEN_TWO = ("- question: 프로젝트A 킥오프 웹평가 전용 질의\n  expect_source_id: kick.md\n"
+              "- question: 존재하지 않는 주제 WEBONLYXYZQW\n  expect_source_id: none.md\n")
+
+
+def test_golden_get_template_and_put(tmp_path: Path):
+    client = make_app(tmp_path)
+    g = client.get("/api/eval/golden").json()
+    assert g["count"] == 0 and g["text"].startswith("#") and g["path"].endswith("golden.yaml")
+    assert client.put("/api/eval/golden", json={"text": g["text"]}).json() == {"ok": True, "count": 0}  # 템플릿 저장 OK
+    r = client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    assert r.status_code == 200 and r.json()["count"] == 2
+    path = client.app.state.llmsearch["config"].data_dir / "golden.yaml"
+    assert path.read_text(encoding="utf-8") == GOLDEN_TWO and not path.with_name("golden.yaml.tmp").exists()
+    assert client.get("/api/eval/golden").json()["count"] == 2
+    assert client.put("/api/eval/golden", json={"text": "question: q\n"}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": 5}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": "- question: [x\n"}).status_code == 400
+    assert client.put("/api/eval/golden", json={"text": GOLDEN_TWO},
+                      headers={"Origin": "http://evil.example"}).status_code == 403
+    assert path.read_text(encoding="utf-8") == GOLDEN_TWO  # 실패한 PUT은 파일 미변경
+
+
+def test_golden_run_reports_rank_and_pass(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    assert client.post("/api/eval/golden/run", json={}).status_code == 400  # 파일 없음
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["total"] == 2 and body["hit_at_3"] == 1 and body["rate"] == 0.5
+    assert body["target"] == 0.7 and body["pass"] is False
+    assert body["cases"][0]["rank"] == 1 and body["cases"][1]["rank"] is None
+    assert client.app.state.llmsearch["usage"].today_by_kind()["embed"] >= 3  # notes 1 + 질의 2
+
+
+def test_golden_run_refusals(tmp_path: Path):
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    state = client.app.state.llmsearch
+    state["rebuilding"] = True
+    assert client.post("/api/eval/golden/run", json={}).status_code == 409
+    state["rebuilding"] = False
+    state["evaluate_lock"].acquire()
+    try:
+        assert client.post("/api/eval/golden/run", json={}).status_code == 409
+    finally:
+        state["evaluate_lock"].release()
+    assert client.post("/api/eval/golden/run", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
+    state["read_conn"] = None
+    assert client.post("/api/eval/golden/run", json={}).status_code == 503
+
+
+def test_golden_run_rebuilding_leaves_evaluating_flag_and_lock_clean(tmp_path: Path):
+    """rebuilding 중 409를 받아도 evaluating 플래그·락이 남지 않아야 한다 (rebuild.claim과의 경합 창 회귀 방지)."""
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    state = client.app.state.llmsearch
+    state["rebuilding"] = True
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 409
+    state["rebuilding"] = False
+    assert state["evaluating"] is False
+    assert state["evaluate_lock"].acquire(blocking=False)
+    state["evaluate_lock"].release()
+
+
+def test_golden_run_embedding_failure_hides_message(tmp_path: Path, monkeypatch):
+    from llmsearch import search as search_mod
+
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+
+    def boom(*a, **k):
+        raise RuntimeError("secret api key sk-123")
+    monkeypatch.setattr(search_mod, "search", boom)
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 502 and "RuntimeError" in r.json()["detail"] and "sk-123" not in r.text
+
+
+def test_golden_ui_in_index(tmp_path: Path):
+    client = make_app(tmp_path)
+    html = client.get("/").text
+    for needle in ('id="goldenText"', 'id="runGoldenBtn"', 'id="goldenTable"', "loadGolden()"):
+        assert needle in html, needle

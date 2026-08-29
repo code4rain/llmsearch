@@ -7,7 +7,7 @@ import os
 import threading
 import traceback
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -27,6 +27,7 @@ from ..connectors.local_docs import RETRY_SENTINEL, sync_local_docs
 from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
+from ..eval.golden import evaluate as golden_evaluate, parse_golden
 from ..rules import load_rules_md, parse_rules_md
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
@@ -34,6 +35,11 @@ STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
 RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
 _RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
+GOLDEN_TEMPLATE = (
+    "# 골든 질문 세트 — 검색 상위 3위 적중률 측정 (목표 70%)\n"
+    "# expect_source_id: 전체 경로 또는 경로 접미사(파일명). 동명 파일이 여러 폴더에 있으면 아무 쪽이나 적중.\n"
+    "# - question: 프로젝트A 킥오프 언제?\n#   expect_source_id: kickoff.md\n"
+)
 _AUTH_EXPIRED_MSG = (
     "Atlassian 인증이 만료되었습니다. .env의 자격증명(ATLASSIAN_* 또는 서비스별 "
     "CONFLUENCE_*/JIRA_*)을 갱신한 뒤 다시 동기화하세요."
@@ -59,6 +65,81 @@ def local_origin_only(request: Request) -> None:
     origin = request.headers.get("origin") or request.headers.get("referer")
     if origin and not _is_local_origin(origin):
         raise HTTPException(403, "로컬 브라우저(127.0.0.1)에서만 호출할 수 있습니다")
+
+
+_FILTER_KEYS = ("source_filter", "date_from", "date_to", "sender")
+
+
+def _validate_filters(raw) -> dict:
+    """/api/chat `filters` 검증·정규화 (스펙 M7 §2). 위반은 400 — record("answer") 이전에 호출한다."""
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise HTTPException(400, "filters는 객체여야 합니다")
+    out: dict = {k: None for k in _FILTER_KEYS}
+    sf = raw.get("source_filter")
+    if sf:
+        if not isinstance(sf, list) or not all(isinstance(s, str) for s in sf):
+            raise HTTPException(400, "source_filter는 문자열 리스트여야 합니다")
+        unknown = [s for s in sf if s not in SOURCES]
+        if unknown:
+            raise HTTPException(400, f"알 수 없는 소스: {', '.join(unknown)}")
+        out["source_filter"] = [s for s in SOURCES if s in sf]  # 중복 제거 + SOURCES 순서 정규화 (길이 ≤ 6)
+    for key in ("date_from", "date_to"):
+        v = raw.get(key)
+        if v:
+            if not isinstance(v, str):
+                raise HTTPException(400, f"{key}는 YYYY-MM-DD 형식이어야 합니다")
+            try:
+                ok = date.fromisoformat(v).isoformat() == v  # 왕복 비교 — ISO 주차 표기(2026-W01-1) 등은 걸러낸다
+            except ValueError:
+                ok = False
+            if not ok:
+                raise HTTPException(400, f"{key}는 YYYY-MM-DD 형식이어야 합니다")
+            out[key] = v  # 자정 경계 보정은 search.search가 한다
+    sender = raw.get("sender")
+    if sender:
+        if not isinstance(sender, str) or len(sender.strip()) > 200:
+            raise HTTPException(400, "sender는 200자 이하 문자열이어야 합니다")
+        sender = sender.strip()
+        if sender:
+            if out["source_filter"] and "outlook_mail" not in out["source_filter"]:
+                raise HTTPException(400, "발신자 필터는 메일 소스에서만 동작합니다 — 소스에서 outlook_mail을 "
+                                         "선택하거나 소스 선택을 비우세요")
+            out["sender"] = sender
+    return out
+
+
+def _apply_filters(search_fn, filters: dict):
+    """선검색은 강제, 툴 검색은 기본값 — None/빈 값인 인자만 필터로 채운다 (스펙 M7 §2).
+
+    answer_stream의 사전 검색은 search_fn(question)이라 전부 채워지고(강제), Claude 툴 호출은
+    명시한 값이 우선한다. []·""도 미지정으로 본다 — Claude가 빈 배열로 사용자 필터를 조용히
+    해제하지 못하게.
+    """
+    if not any(filters.get(k) for k in _FILTER_KEYS):
+        return search_fn
+
+    def wrapped(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        return search_fn(query, source_filter=source_filter or filters["source_filter"],
+                         date_from=date_from or filters["date_from"],
+                         date_to=date_to or filters["date_to"],
+                         sender=sender or filters["sender"])
+    return wrapped
+
+
+def _filters_note(filters: dict) -> str:
+    parts = []
+    if filters.get("source_filter"):
+        parts.append("소스=" + ",".join(filters["source_filter"]))
+    if filters.get("date_from") or filters.get("date_to"):
+        parts.append(f"기간={filters.get('date_from') or ''}~{filters.get('date_to') or ''}")
+    if filters.get("sender"):
+        parts.append("발신자=" + filters["sender"])
+    if not parts:
+        return ""
+    return ("(사용자 필터 적용: " + ", ".join(parts) + ". 다른 범위가 필요하면 search 툴에 값을 명시하라 — "
+            "빈 배열·빈 문자열은 무시되며, 전체 소스를 검색하려면 6개 소스를 모두 나열하라)")
 
 
 def _get_outlook_client(state):
@@ -285,7 +366,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "registry": Registry(config.data_dir / "atlassian.json"),
              "usage": tracker,
              "resummarizing": False, "resummarize_lock": threading.Lock(),
-             "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False}
+             "schema_mismatch": schema_mismatch, "rebuilding": False, "force_reindex_local_docs": False,
+             "evaluating": False, "evaluate_lock": threading.Lock()}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
     if conn is not None and rebuild.marker_present(conn):
@@ -368,13 +450,80 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
                 "indexing_allowed": t.indexing_allowed(),
                 "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
 
+    @app.get("/api/eval/golden")
+    def golden_get():
+        path = config.data_dir / "golden.yaml"
+        text = path.read_text(encoding="utf-8") if path.exists() else GOLDEN_TEMPLATE
+        try:
+            count = len(parse_golden(text))
+        except ValueError:
+            count = 0
+        return {"text": text, "path": str(path), "count": count}
+
+    @app.put("/api/eval/golden", dependencies=[Depends(local_origin_only)])
+    def golden_put(payload: dict):
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise HTTPException(400, "text는 문자열이어야 합니다")
+        data = text.encode("utf-8")
+        if len(data) > _RULES_MAX_BYTES:
+            raise HTTPException(400, f"golden.yaml은 {_RULES_MAX_BYTES // 1024}KB 이하여야 합니다")
+        try:
+            cases = parse_golden(text)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        path = config.data_dir / "golden.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        return {"ok": True, "count": len(cases)}
+
+    @app.post("/api/eval/golden/run", dependencies=[Depends(local_origin_only)])
+    def golden_run():
+        """골든 세트 실행 — 검색 경로(상한 게이트 무관, usage에 embed 기록). 자체 읽기 커넥션으로 재구축과 격리."""
+        _require_db()
+        path = config.data_dir / "golden.yaml"
+        if not path.exists():
+            raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
+        try:
+            cases = parse_golden(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if not cases:
+            raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
+        if not state["evaluate_lock"].acquire(blocking=False):
+            raise HTTPException(409, "평가가 이미 진행 중입니다")
+        state["evaluating"] = True  # rebuild.claim이 sync_lock 아래서 이 값을 보게 먼저 세운다 (중간에 인덱스가 지워지는 것 방지)
+        conn = None
+        try:
+            if state.get("rebuilding"):
+                raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 평가하세요")
+            conn = db.open_db(config.db_path)  # try 안 — open 실패로 락이 영구 점유되지 않게
+            report = golden_evaluate(conn, embedder, cases)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # 예외 메시지에 자격증명이 섞일 수 있어 클래스명만 노출 — 로그도 클래스명만 (CLAUDE.md 보안)
+            _logger.error("골든 평가 실패: %s", type(exc).__name__)
+            raise HTTPException(502, f"평가 실패: {type(exc).__name__}")
+        finally:
+            if conn is not None:
+                conn.close()
+            state["evaluating"] = False
+            state["evaluate_lock"].release()
+        target = 0.7  # 상위 스펙 §1 성공 기준
+        return {**{k: report[k] for k in ("total", "hit_at_3", "rate", "cases")},
+                "target": target, "pass": report["rate"] >= target}
+
     @app.get("/api/status")
     def status():
         read_conn = state["read_conn"]
         return {"schema_mismatch": state.get("schema_mismatch"),
                 "rebuild_in_progress": read_conn is not None and rebuild.marker_present(read_conn),
                 "rebuilding": bool(state.get("rebuilding")),
-                "resummarizing": bool(state.get("resummarizing"))}
+                "resummarizing": bool(state.get("resummarizing")),
+                "evaluating": bool(state.get("evaluating"))}
 
     @app.post("/api/rebuild", dependencies=[Depends(local_origin_only)])
     def rebuild_index(payload: dict):
@@ -567,16 +716,20 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.post("/api/chat", dependencies=[Depends(local_origin_only)])
     def chat(payload: dict):
         _require_db()
+        filters = _validate_filters(payload.get("filters"))  # 400은 answer 계상 전에
         state["usage"].record("answer")
         question = payload.get("question", "")
         history = payload.get("history", [])
 
-        def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        def raw_search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
             return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
                                  date_from=date_from, date_to=date_to, sender=sender)
 
+        search_fn = _apply_filters(raw_search_fn, filters)
+        note = _filters_note(filters)
+
         def event_stream():
-            for ev in state["answerer"].answer_stream(question, history, search_fn):
+            for ev in state["answerer"].answer_stream(question, history, search_fn, filters_note=note):
                 if ev["type"] == "sources":
                     data = json.dumps([asdict(h) for h in ev["hits"]], ensure_ascii=False)
                     yield f"event: sources\ndata: {data}\n\n"

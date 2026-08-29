@@ -1,3 +1,4 @@
+import types
 from datetime import datetime
 
 from llmsearch.llm import FakeAnswerer
@@ -79,3 +80,122 @@ def test_claude_answerer_update_rules_changes_system_prompt(monkeypatch):
     assert "## 답변 규칙\n두괄식" in a._system() and "## 용어집\nPJA = 프로젝트A" in a._system()
     a.update_rules({})
     assert "## 답변 규칙" not in a._system()
+
+
+def test_search_tool_schema_covers_all_sources_and_sender():
+    from llmsearch.llm import _SEARCH_TOOL
+
+    props = _SEARCH_TOOL["input_schema"]["properties"]
+    assert props["source_filter"]["items"]["enum"] == [
+        "notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira"]
+    assert props["sender"]["type"] == "string"
+    assert "메일" in _SEARCH_TOOL["description"]
+
+
+def test_fake_answerer_accepts_filters_note():
+    a = FakeAnswerer()
+    list(a.answer_stream("q", [], lambda *x, **k: [HIT], filters_note="(사용자 필터 적용: 소스=notes)"))
+    assert a.last_filters_note == "(사용자 필터 적용: 소스=notes)"
+
+
+class _Stream:
+    def __init__(self, texts, final):
+        self._texts, self._final = texts, final
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    @property
+    def text_stream(self):
+        return iter(self._texts)
+
+    def get_final_message(self):
+        return self._final
+
+
+class _Messages:
+    def __init__(self, responses):
+        self.responses, self.calls = list(responses), []
+
+    def stream(self, **kwargs):
+        self.calls.append(kwargs)
+        texts, final = self.responses.pop(0)
+        return _Stream(texts, final)
+
+
+def _tool_use_then_end(tool_input: dict):
+    first = types.SimpleNamespace(stop_reason="tool_use", content=[
+        types.SimpleNamespace(type="tool_use", id="t1", input=tool_input)])
+    second = types.SimpleNamespace(stop_reason="end_turn", content=[])
+    return [(["검색 중..."], first), (["답변 [1]"], second)]
+
+
+def test_claude_tool_loop_passes_sender_and_filters_note(monkeypatch):
+    import sys
+    from llmsearch.llm import ClaudeAnswerer
+
+    fake_mod = types.ModuleType("anthropic")
+    messages = _Messages(_tool_use_then_end(
+        {"query": "김철수 메일", "sender": "kim@corp.com", "source_filter": []}))
+    fake_mod.Anthropic = lambda: types.SimpleNamespace(messages=messages)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
+
+    calls = []
+
+    def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        calls.append((query, source_filter, date_from, date_to, sender))
+        return [HIT]
+
+    a = ClaudeAnswerer()
+    events = list(a.answer_stream("김철수가 보낸 결정 사항?", [], search_fn,
+                                  filters_note="(사용자 필터 적용: 소스=outlook_mail)"))
+    assert calls[0] == ("김철수가 보낸 결정 사항?", None, None, None, None)     # 사전 검색: 키워드 미지정
+    assert calls[1] == ("김철수 메일", [], None, None, "kim@corp.com")          # 툴 호출: sender 전달
+    first_user = messages.calls[0]["messages"][0]["content"]
+    assert first_user.index("(사용자 필터 적용") < first_user.index("사전 검색 결과")
+    assert "".join(e["text"] for e in events if e["type"] == "text") == "검색 중...답변 [1]"
+    assert len(messages.calls) == 2
+
+
+def test_apply_filters_composed_with_claude_tool_loop(monkeypatch):
+    """웹 계층 _apply_filters로 감싼 search_fn을 ClaudeAnswerer 툴 루프와 조합 — 툴이 source_filter=[]로
+    사용자 필터를 지우려 해도 래퍼가 사전 검색·툴 호출 모두에 원래 필터를 채워 넣는다 (스펙 M7 §2 통합 확인)."""
+    import sys
+    from llmsearch.llm import ClaudeAnswerer
+    from llmsearch.web.app import _apply_filters
+
+    fake_mod = types.ModuleType("anthropic")
+    messages = _Messages(_tool_use_then_end({"query": "킥오프", "source_filter": []}))
+    fake_mod.Anthropic = lambda: types.SimpleNamespace(messages=messages)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
+
+    calls = []
+
+    def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        calls.append((query, source_filter, date_from, date_to, sender))
+        return [HIT]
+
+    filters = {"source_filter": ["notes"], "date_from": None, "date_to": None, "sender": None}
+    wrapped = _apply_filters(search_fn, filters)
+
+    a = ClaudeAnswerer()
+    list(a.answer_stream("킥오프 언제였지?", [], wrapped))
+
+    assert len(calls) == 2
+    assert calls[0][1] == ["notes"]  # 사전 검색 — 강제 적용
+    assert calls[1][1] == ["notes"]  # 툴 호출 — 빈 배열([])이 사용자 필터로 채워짐
+
+
+def test_claude_no_note_when_empty(monkeypatch):
+    import sys
+    from llmsearch.llm import ClaudeAnswerer
+
+    fake_mod = types.ModuleType("anthropic")
+    messages = _Messages([(["끝"], types.SimpleNamespace(stop_reason="end_turn", content=[]))])
+    fake_mod.Anthropic = lambda: types.SimpleNamespace(messages=messages)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
+    list(ClaudeAnswerer().answer_stream("q", [], lambda *x, **k: [HIT]))
+    assert "사용자 필터" not in messages.calls[0]["messages"][0]["content"]

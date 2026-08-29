@@ -14,6 +14,7 @@
 ## 평가
 `golden.yaml`에 `[{question, expect_source_id}]` 작성 후:
 `python -m llmsearch.eval.golden --config config.yaml --golden golden.yaml`
+설정 탭에서도 편집·실행 가능
 
 ## Outlook 연동 (M2, Windows 전용)
 1. Windows Python에 `pip install -e ".[vec,win]"` (pywin32 포함)

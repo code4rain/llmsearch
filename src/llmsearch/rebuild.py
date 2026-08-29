@@ -47,8 +47,8 @@ def clear_marker(conn: sqlite3.Connection) -> None:
 
 def precheck(state: dict, force: bool = False) -> None:
     """아무것도 바꾸기 전의 거부 조건 (스펙 M6 §6 0단계). 진행 중 판정은 인메모리 플래그만 본다."""
-    if state.get("rebuilding") or state.get("resummarizing"):
-        raise RebuildRefused("재구축 또는 재요약이 진행 중입니다 — 끝난 뒤 다시 시도하세요")
+    if state.get("rebuilding") or state.get("resummarizing") or state.get("evaluating"):
+        raise RebuildRefused("재구축·재요약·평가가 진행 중입니다 — 끝난 뒤 다시 시도하세요")
     if not state["usage"].indexing_allowed():
         raise RebuildRefused("일일 API 호출 상한 도달 — 상한이 초기화된 뒤 재구축하세요 "
                              "(초기화 후 게이트에 막히면 빈 인덱스로 자정까지 고착됩니다)")
@@ -87,8 +87,8 @@ def claim(state: dict) -> None:
     실패하면 호출자가 release()로 되돌린다.
     """
     with state["sync_lock"]:
-        if state.get("rebuilding") or state.get("resummarizing"):
-            raise RebuildRefused("재구축 또는 재요약이 진행 중입니다 — 끝난 뒤 다시 시도하세요")
+        if state.get("rebuilding") or state.get("resummarizing") or state.get("evaluating"):
+            raise RebuildRefused("재구축·재요약·평가가 진행 중입니다 — 끝난 뒤 다시 시도하세요")
         state["rebuilding"] = True
 
 

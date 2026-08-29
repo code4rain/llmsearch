@@ -5,7 +5,8 @@
 
 시나리오: 소스 6종 → Atlassian URL 등록/dedup → 6종 동기화(비전 증강 pptx 포함) →
 아카이브 목록 → 채팅+출처 → 열기 버튼 → 프로젝트 완료 처리(디스크 이동 확인) →
-등록 삭제 → 로그 → 사용량 카운터(usage.json) → 일일 API 호출 상한 게이트(M5).
+등록 삭제 → 로그 → 사용량 카운터(usage.json) → 일일 API 호출 상한 게이트(M5) →
+채팅 필터(소스 체크박스)·출처 발췌·골든 평가 GUI(M7).
 """
 import json
 from datetime import date
@@ -234,6 +235,44 @@ with sync_playwright() as p:
     page.click("nav >> text=소스")
     page.wait_for_timeout(300)
     check("재구축 후 배너 없음", page.locator("#banner").is_hidden())
+
+    # 9.10 M7 — 채팅 필터(notes만) → 마지막 답변 카드 전부 notes + 필터 표시 줄 + 발췌 (스펙 M7 §2·§3)
+    page.click("nav >> text=채팅")
+    page.click("#filters summary")
+    page.check(".srcChk[data-src='notes']")
+    page.fill("#question", "프로젝트A 회고 개선점")
+    before_cards = page.locator(".src").count()
+    page.click("form >> text=검색")
+    page.wait_for_function(f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000)
+    page.wait_for_timeout(300)
+    last = page.locator(".msg-a").last
+    kinds = [t.strip("()").split(" · ")[0] for t in last.locator(".src small").all_inner_texts()]
+    check("필터: 카드 전부 notes", kinds and all(k == "notes" for k in kinds), str(kinds))
+    check("필터 표시 줄", "필터(첫 검색 기준): 소스=notes" in page.locator(".filters-note").last.inner_text())
+    snips = last.locator(".snip").all_inner_texts()
+    check("출처 카드 발췌", len(snips) >= 1 and all(s.strip() for s in snips), str(snips[:1]))
+    page.uncheck(".srcChk[data-src='notes']")  # 이후 단계(10단계 UI 채팅)에 영향 없게
+
+    # 9.11 M7 — 골든 평가 GUI: 적중 1 + 확정 미스 1 → 50% (1/2) ❌ (스펙 M7 §4)
+    page.click("nav >> text=설정")
+    page.wait_for_selector("#goldenText")
+    # loadGolden() 완료 대기 — goldenStatus 텍스트 비교는 이전 탭 방문에서 이미 "N건"이 찍혀 있으면
+    # 즉시 통과해버려 이번 fetch 완료를 보장하지 못한다(경쟁: fill 후 늦게 도착한 응답이 textarea를 덮어씀).
+    # 서버가 지금 들고 있는 text와 textarea 값이 같아질 때까지 기다려 결정적으로 완료를 확인한다.
+    expected_text = page.request.get(f"{BASE}/api/eval/golden").json()["text"]
+    page.wait_for_function("t => document.getElementById('goldenText').value === t", arg=expected_text, timeout=10000)
+    page.fill("#goldenText", "- question: 프로젝트A 킥오프 언제?\n  expect_source_id: kickoff.md\n"
+                             "- question: 존재하지 않는 주제 XYZQW\n  expect_source_id: none.md\n")
+    page.click("#saveGoldenBtn")
+    page.wait_for_timeout(300)
+    check("골든 저장 2건", "저장됨 · 2건" in page.locator("#goldenStatus").inner_text())
+    dialogs.clear()
+    page.click("#runGoldenBtn")  # confirm은 dialog 핸들러가 accept
+    page.wait_for_selector("#goldenResult", state="visible", timeout=10000)
+    header = page.locator("#goldenHeader").inner_text()
+    check("골든 결과 헤더", "50% (1/2)" in header and "❌" in header, header)
+    check("골든 결과 표 2행", page.locator("#goldenTable tbody tr").count() == 2)
+    check("골든 미스 표시", "❌" in page.locator("#goldenTable tbody tr").nth(1).inner_text())
 
     # 10. 일일 상한 게이트 — 동기화만 차단, 채팅(검색·답변)은 유지 (스펙 §10)
     #     데모 서버 daily_api_call_limit=50 — usage.json을 매 반복 재판독해 합계로 판정한다

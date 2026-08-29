@@ -12,18 +12,20 @@ MAX_TOOL_ROUNDS = 3  # 사전 검색 이후 Claude 추가 검색 상한 (스펙 
 _SEARCH_TOOL = {
     "name": "search",
     "description": (
-        "사내 통합 인덱스(로컬 문서 요약, 개인 메모)를 검색한다. "
+        "사내 통합 인덱스(로컬 문서 요약, 개인 메모, Outlook 메일·일정, Confluence, Jira)를 검색한다. "
         "첫 검색 결과가 부족하거나, 다른 표현·필터로 더 찾아야 할 때 호출하라. "
-        "일정·날짜 관련 질문은 date_from/date_to 필터를 사용하라."
+        "일정·날짜 관련 질문은 date_from/date_to 필터를, 특정 발신자의 메일은 sender 필터를 사용하라."
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "검색 질의"},
             "source_filter": {"type": "array", "items": {"type": "string",
-                "enum": ["notes", "local_docs"]}, "description": "소스 한정(선택)"},
+                "enum": ["notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira"]},
+                "description": "소스 한정(선택)"},
             "date_from": {"type": "string", "description": "YYYY-MM-DD 이후(선택)"},
             "date_to": {"type": "string", "description": "YYYY-MM-DD 이전(선택)"},
+            "sender": {"type": "string", "description": "보낸 사람 이메일 (메일 전용, 선택)"},
         },
         "required": ["query"],
     },
@@ -31,7 +33,8 @@ _SEARCH_TOOL = {
 
 
 class Answerer(Protocol):
-    def answer_stream(self, question: str, history: list[dict], search_fn: SearchFn) -> Iterator[dict]: ...
+    def answer_stream(self, question: str, history: list[dict], search_fn: SearchFn,
+                      filters_note: str = "") -> Iterator[dict]: ...
 
     def update_rules(self, sections: dict[str, str]) -> None: ...
 
@@ -39,11 +42,13 @@ class Answerer(Protocol):
 class FakeAnswerer:
     def __init__(self):
         self.rules: dict[str, str] = {}  # 마지막 update_rules 값 — 테스트 관찰용
+        self.last_filters_note = ""      # 마지막 filters_note — 테스트 관찰용
 
     def update_rules(self, sections: dict[str, str]) -> None:
         self.rules = dict(sections)
 
-    def answer_stream(self, question, history, search_fn) -> Iterator[dict]:
+    def answer_stream(self, question, history, search_fn, filters_note: str = "") -> Iterator[dict]:
+        self.last_filters_note = filters_note
         hits = search_fn(question)
         if not hits:
             yield {"type": "text", "text": "관련 문서를 찾지 못했습니다."}
@@ -92,13 +97,14 @@ class ClaudeAnswerer:
             parts.append("## 답변 규칙\n" + self.answer_rules)
         return "\n\n".join(parts)
 
-    def answer_stream(self, question, history, search_fn) -> Iterator[dict]:
+    def answer_stream(self, question, history, search_fn, filters_note: str = "") -> Iterator[dict]:
         all_hits: list[Hit] = []
         try:
             all_hits = list(search_fn(question))  # fast path 사전 검색 (스펙 §8)
+            note = f"{filters_note}\n\n" if filters_note else ""
             messages = list(history) + [{
                 "role": "user",
-                "content": f"질문: {question}\n\n사전 검색 결과:\n{_hits_block(all_hits)}",
+                "content": f"질문: {question}\n\n{note}사전 검색 결과:\n{_hits_block(all_hits)}",
             }]
             rounds = 0
             while True:
@@ -128,6 +134,7 @@ class ClaudeAnswerer:
                         source_filter=args.get("source_filter"),
                         date_from=args.get("date_from"),
                         date_to=args.get("date_to"),
+                        sender=args.get("sender"),
                     )
                     known = {h.source_id for h in all_hits}
                     start = len(all_hits)

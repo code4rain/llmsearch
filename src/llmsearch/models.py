@@ -37,3 +37,4 @@ class Hit:
     content_indexed: bool
     score: float
     excerpt: str            # 승격된 문서 본문 (상한 6000자)
+    snippet: str = ""       # 최고 점수 청크 발췌 (헤더 제거, 200자) — 출처 카드 표시용, LLM 컨텍스트 아님

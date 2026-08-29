@@ -12,7 +12,15 @@ RRF_K = 60
 CANDIDATES = 30
 PER_DOC_CAP = 3
 EXCERPT_CAP = 6000
+SNIPPET_CAP = 200
 _QUERY_CACHE: dict[str, list[float]] = {}
+
+
+def _snippet(text: str, title: str, updated_at: str) -> str:
+    """청크 헤더 `[제목 | YYYY-MM-DD] `를 재구성해 제거(정규식 금지 — 제목에 ]·| 가능), 공백 정규화, 200자."""
+    header = f"[{title} | {updated_at[:10]}] "
+    body = text.removeprefix(header)
+    return " ".join(body.split())[:SNIPPET_CAP]
 
 
 def _fts_query(query: str) -> str:
@@ -170,5 +178,8 @@ def search(
             start = full.find(chunk_rows[idx][1])
             lo = max(0, start - EXCERPT_CAP // 2)
             full = full[lo : lo + EXCERPT_CAP]
-        hits.append(Hit(stype, sid, title, url, updated, bool(cidx), doc_scores[doc_id], full))
+        best = doc_best_chunk[doc_id]
+        best_text = next((t for c, t in chunk_rows if c == best), "")
+        hits.append(Hit(stype, sid, title, url, updated, bool(cidx), doc_scores[doc_id], full,
+                        _snippet(best_text, title, updated)))
     return hits
