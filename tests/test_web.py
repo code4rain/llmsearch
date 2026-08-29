@@ -256,3 +256,44 @@ def test_chat_records_answer_usage(tmp_path):
     client.post("/api/chat", json={"question": "q", "history": []})
     tracker = app.state.llmsearch["usage"]
     assert tracker.today_by_kind().get("answer", 0) >= 1
+
+
+def test_run_sync_without_db_returns_error_entry(tmp_path: Path):
+    """M6a 선행 리팩터: conn이 None(스키마 불일치 등)이면 예외 대신 error entry — 스케줄러 보호."""
+    from llmsearch.web.app import run_sync
+
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    state["conn"] = None
+    state["schema_mismatch"] = "index.db schema v0 != v1"
+    entry = run_sync(state, "notes")
+    assert entry["ok"] is False and "schema" in entry["error"]
+    assert state["log"][0] is entry
+
+
+def test_db_endpoints_503_without_read_conn(tmp_path: Path):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    state["read_conn"] = None
+    state["schema_mismatch"] = "index.db schema v0 != v1"
+    assert client.post("/api/chat", json={"question": "q", "history": []}).status_code == 503
+    assert client.get("/api/para/projects").status_code == 503
+    assert client.post("/api/open", json={"url_or_path": "x"}).status_code == 503
+    r = client.get("/api/sources")
+    assert r.status_code == 200
+    assert all(s["doc_count"] == 0 for s in r.json())
+    assert r.json()[0]["schema_mismatch"] == "index.db schema v0 != v1"
+
+
+def test_read_conn_is_looked_up_at_call_time(tmp_path: Path):
+    """커넥션을 클로저가 아니라 state에서 조회해야 M6b가 재구축 후 교체할 수 있다."""
+    from llmsearch import db
+
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    client.post("/api/sync/notes")
+    fresh = db.open_db(state["config"].db_path)
+    state["read_conn"].close()
+    state["read_conn"] = fresh
+    r = client.get("/api/sources")
+    assert next(s for s in r.json() if s["source"] == "notes")["doc_count"] == 1

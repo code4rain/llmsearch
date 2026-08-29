@@ -124,10 +124,18 @@ def _scheduled_sources(state: dict) -> list[str]:
 def run_sync(state: dict, source: str) -> dict:
     """커넥터 1개 동기화 실행. 실패는 소스별로 격리해 로그에 남긴다 (스펙 §5)."""
     cfg: Config = state["config"]
-    conn = state["conn"]
     entry = {"source": source, "at": datetime.now().isoformat(), "ok": True, "indexed": 0,
              "deleted": 0, "error": None}
     with state["sync_lock"]:  # 단일 sqlite3.Connection 공유 쓰기 직렬화 (스펙 §5 P0)
+        conn = state["conn"]  # 락 안에서 획득 — M6b 재구축이 커넥션을 교체해도 낡은 참조를 들지 않는다
+        if conn is None:
+            # 스키마 불일치 등으로 DB를 열지 못한 상태 — 예외를 던지면 scheduler_loop가 죽는다
+            entry["ok"] = False
+            entry["error"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다"
+            _logger.error("%s 동기화 건너뜀(DB 없음): %s", source, entry["error"])
+            state["log"].insert(0, entry)
+            del state["log"][200:]
+            return entry
         tracker: UsageTracker = state["usage"]
         if not tracker.indexing_allowed():
             # 스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지 — 검색·답변 경로는 이 게이트를
@@ -235,9 +243,15 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "confluence_client": atlassian_client,
              "jira_client": atlassian_client,
              "registry": Registry(config.data_dir / "atlassian.json"),
-             "usage": tracker}
+             "usage": tracker,
+             "resummarizing": False, "resummarize_lock": threading.Lock()}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
+
+    def _require_db() -> None:
+        """DB를 만지는 엔드포인트 진입 가드 — 스키마 불일치 상태에서는 503으로 안내 (M6b 배너와 짝)."""
+        if state["read_conn"] is None or state["conn"] is None:
+            raise HTTPException(503, state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다")
 
     app = FastAPI(title="llmsearch")
     app.state.llmsearch = state
@@ -248,7 +262,10 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         while True:
             await asyncio.sleep(config.sync_interval_minutes * 60)
             for source in _scheduled_sources(state):
-                await asyncio.to_thread(run_sync, state, source)
+                try:
+                    await asyncio.to_thread(run_sync, state, source)
+                except Exception:  # run_sync는 내부에서 격리하지만, 어떤 예외에도 루프는 살아야 한다
+                    _logger.exception("스케줄러 동기화 예외 격리: %s", source)
 
     @app.on_event("startup")
     async def _startup():
@@ -270,20 +287,26 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.get("/api/sources")
     def sources():
+        read_conn = state["read_conn"]
         out = []
         for source in SOURCES:
-            row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
             last = next((e for e in state["log"] if e["source"] == source), None)
-            entry = {"source": source, "doc_count": row[0],
+            entry = {"source": source, "doc_count": 0,
                      "last_sync": last["at"] if last else None,
                      "last_error": last["error"] if last else None}
-            if source == "outlook_mail":
-                entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
+            if read_conn is None:
+                entry["schema_mismatch"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다"
+            else:
+                row = read_conn.execute("SELECT COUNT(*) FROM documents WHERE source_type=?", (source,)).fetchone()
+                entry["doc_count"] = row[0]
+                if source == "outlook_mail":
+                    entry["backlog"] = backlog_hint(indexer.get_sync_state(read_conn, source))
             out.append(entry)
         return out
 
     @app.post("/api/sync/{source}")
     def manual_sync(source: str):
+        _require_db()
         if source not in SOURCES:
             raise HTTPException(404, f"unknown source: {source}")
         return run_sync(state, source)
@@ -312,11 +335,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.get("/api/para/projects")
     def para_projects():
         """summaries/Projects/ 하위 폴더 목록 — GUI 아카이브 섹션용 (스펙 §7.1 P1)."""
+        _require_db()
         projects_dir = config.summaries_dir / "Projects"
         out = []
         if projects_dir.is_dir():
             for p in sorted(d for d in projects_dir.iterdir() if d.is_dir()):
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT COUNT(*) FROM documents WHERE para_path=?", (f"Projects/{p.name}",)
                 ).fetchone()
                 out.append({"name": p.name, "doc_count": row[0]})
@@ -325,9 +349,10 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.post("/api/archive")
     def archive(payload: dict):
         name = str(payload.get("project", ""))
+        _require_db()
         with state["sync_lock"]:  # 동기화 중 폴더 이동 금지 — 쓰기 직렬화
             try:
-                return archive_project(conn, config.summaries_dir, name)
+                return archive_project(state["conn"], config.summaries_dir, name)
             except KeyError as exc:
                 raise HTTPException(404, exc.args[0])  # str(KeyError)는 따옴표가 붙어 UI에 그대로 노출됨
             except ValueError as exc:
@@ -336,6 +361,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     @app.post("/api/open")
     def open_item(payload: dict):
         target = str(payload.get("url_or_path", ""))
+        _require_db()
         try:
             if target.startswith("outlook:"):
                 _get_outlook_client(state).open_item(target.removeprefix("outlook:"))
@@ -343,7 +369,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             if target.startswith("http://") or target.startswith("https://"):
                 # M3부터 confluence/jira 문서의 url_or_path는 http(s) URL — 인덱스에 정확히
                 # 등록된 값인지 검증 후에만 연다(CSRF로 임의 URL을 열게 하는 것 방지).
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
                 ).fetchone()
                 if row is None:
@@ -357,11 +383,11 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             # 로컬 경로 실행 전 검증: localhost API는 CSRF로 임의 사이트가 두드릴 수 있으므로
             # (M1 XSS와 같은 계열의 위협) 인덱스에 등록된 경로만 연다 — 임의 파일 실행 방지.
             resolved = str(Path(target).resolve())
-            row = read_conn.execute(
+            row = state["read_conn"].execute(
                 "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (resolved,)
             ).fetchone()
             if row is None:  # local_docs/notes는 이미 resolve()된 문자열을 저장하지만 대비 차원의 폴백
-                row = read_conn.execute(
+                row = state["read_conn"].execute(
                     "SELECT 1 FROM documents WHERE url_or_path=? LIMIT 1", (target,)
                 ).fetchone()
             if row is None:
@@ -376,12 +402,13 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.post("/api/chat")
     def chat(payload: dict):
+        _require_db()
         state["usage"].record("answer")
         question = payload.get("question", "")
         history = payload.get("history", [])
 
         def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
-            return search.search(read_conn, embedder, query, source_filter=source_filter,
+            return search.search(state["read_conn"], embedder, query, source_filter=source_filter,
                                  date_from=date_from, date_to=date_to, sender=sender)
 
         def event_stream():
