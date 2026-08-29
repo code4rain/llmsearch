@@ -299,6 +299,16 @@ def test_read_conn_is_looked_up_at_call_time(tmp_path: Path):
     assert next(s for s in r.json() if s["source"] == "notes")["doc_count"] == 1
 
 
+def test_rules_md_indexed_as_notes(tmp_path: Path):
+    """스펙 §9: rules.md는 notes로 취급되어 인덱싱된다 — '내가 정한 규칙'도 검색 가능."""
+    client = make_app(tmp_path)
+    client.put("/api/rules", json={"text": "# 규칙 (rules.md)\n\n## 용어집\nPJA = 프로젝트A\n"})
+    assert client.post("/api/sync/notes").json()["indexed"] == 2  # kick.md + rules.md
+    read_conn = client.app.state.llmsearch["read_conn"]
+    titles = {r[0] for r in read_conn.execute("SELECT title FROM documents WHERE source_type='notes'")}
+    assert "규칙 (rules.md)" in titles
+
+
 def test_mutating_endpoints_reject_foreign_origin(tmp_path: Path):
     """스펙 M6 §2: 임의 웹페이지의 CSRF(no-cors POST)로 동기화·아카이브·등록이 트리거되면 안 된다."""
     client = make_app(tmp_path)

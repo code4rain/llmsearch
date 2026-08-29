@@ -174,7 +174,7 @@ def run_sync(state: dict, source: str) -> dict:
             prev = indexer.get_sync_state(conn, source)
             rules_md = load_rules_md(cfg.rules_md_path)
             if source == "notes":
-                result = sync_notes(cfg.notes_folders, cfg.exclude, prev)
+                result = sync_notes(cfg.notes_folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
             elif source == "local_docs":
                 prior_map = {
                     sid: pm for sid in list(prev.get("files", {}))
