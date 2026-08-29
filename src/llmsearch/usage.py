@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import threading
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -81,6 +81,13 @@ class UsageTracker:
         """오늘 종류별 카운트 복사본 — 반환값을 변경해도 내부 상태에 영향 없음."""
         with self._lock:
             return dict(self._data.get(self._today(), {}))
+
+    def recent_days(self, n: int) -> list[tuple[str, int]]:
+        """최근 n일(오늘 포함) (날짜, 합계) 오름차순 — 기록 없는 날은 제외. GUI 표시용 (스펙 §10)."""
+        cutoff = (date.today() - timedelta(days=n - 1)).isoformat()
+        with self._lock:
+            return [(day, sum(kinds.values()))
+                    for day, kinds in sorted(self._data.items()) if day >= cutoff]
 
     def indexing_allowed(self) -> bool:
         return self.daily_limit <= 0 or self.today_total() < self.daily_limit

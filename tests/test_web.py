@@ -458,3 +458,17 @@ def test_resummarize_respects_daily_limit_gate(tmp_path: Path, monkeypatch):
     state["usage"].daily_limit = 1  # 이미 초과 상태
     body = client.post("/api/resummarize", json={"all": True}).json()
     assert body["ok"] is False and "일일 API 호출 상한" in body["error"] and body["reset"] == 2
+
+
+def test_usage_endpoint_and_line(tmp_path: Path):
+    from datetime import date
+
+    client = make_app(tmp_path)
+    client.post("/api/sync/notes")
+    client.post("/api/chat", json={"question": "사용량 표시 확인용 질의", "history": []})  # 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피
+    u = client.get("/api/usage").json()
+    assert u["today"]["embed"] >= 2 and u["today"]["answer"] == 1
+    assert u["limit"] == 0 and u["indexing_allowed"] is True
+    assert u["days"][-1]["date"] == date.today().isoformat()
+    assert u["days"][-1]["total"] == u["total"]
+    assert 'id="usageLine"' in client.get("/").text

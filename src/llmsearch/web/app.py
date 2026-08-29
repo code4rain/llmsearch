@@ -337,6 +337,13 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def log():
         return state["log"]
 
+    @app.get("/api/usage")
+    def usage_status():
+        t = state["usage"]
+        return {"today": t.today_by_kind(), "total": t.today_total(), "limit": t.daily_limit,
+                "indexing_allowed": t.indexing_allowed(),
+                "days": [{"date": d, "total": n} for d, n in t.recent_days(7)]}
+
     @app.get("/api/rules")
     def rules_get():
         path = config.rules_md_path

@@ -203,3 +203,20 @@ def test_counting_summarizer_records_by_kind(tmp_path: Path):
     saved = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
     today = date.today().isoformat()
     assert saved[today] == {"summary": 2, "vision": 1}
+
+
+def test_recent_days_window_and_order(tmp_path: Path):
+    from datetime import timedelta
+
+    today = date.today()
+    data = {
+        (today - timedelta(days=10)).isoformat(): {"embed": 99},
+        (today - timedelta(days=6)).isoformat(): {"embed": 2, "answer": 1},
+        today.isoformat(): {"summary": 4},
+    }
+    path = tmp_path / "usage.json"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    t = UsageTracker(path)
+    assert t.recent_days(7) == [((today - timedelta(days=6)).isoformat(), 3), (today.isoformat(), 4)]
+    assert t.recent_days(1) == [(today.isoformat(), 4)]
+    assert UsageTracker(tmp_path / "none.json").recent_days(7) == []

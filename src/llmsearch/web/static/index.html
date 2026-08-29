@@ -33,6 +33,7 @@
 </div>
 
 <div id="sources" class="tab">
+  <div id="usageLine"></div>
   <table id="srcTable"><thead><tr><th>소스</th><th>문서 수</th><th>마지막 동기화</th><th></th></tr></thead>
   <tbody></tbody></table>
   <h3>Confluence / Jira URL 등록</h3>
@@ -68,7 +69,16 @@ function show(id) {
 function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+async function loadUsage() {
+  const u = await (await fetch('/api/usage')).json();
+  const kinds = ['embed', 'summary', 'vision', 'answer'].map(k => `${k} ${u.today[k] || 0}`).join(' · ');
+  let line = `오늘 API 호출 ${u.total}건 (${kinds}) · ` +
+    (u.limit > 0 ? `일일 상한 ${u.total} / ${u.limit}건` : '일일 상한 없음');
+  if (!u.indexing_allowed) line += ' ⚠️ 상한 도달 — 요약·인덱싱 일시정지 (검색·답변은 계속)';
+  document.getElementById('usageLine').textContent = line;
+}
 async function loadSources() {
+  loadUsage();
   const data = await (await fetch('/api/sources')).json();
   document.querySelector('#srcTable tbody').innerHTML = data.map(s =>
     `<tr><td>${esc(s.source)}${s.backlog === true ? ' <span title="백로그 수집 중">⏳ 수집 중</span>' : ''}</td>` +
