@@ -538,7 +538,8 @@ def test_chat_filter_validation_400_and_no_answer_count(tmp_path: Path, monkeypa
     before = client.app.state.llmsearch["usage"].today_by_kind().get("answer", 0)
     bad = [
         {"source_filter": "notes"}, {"source_filter": ["slack"]}, {"source_filter": [1]},
-        {"date_from": "2026-13-45"}, {"date_to": 20260801}, {"date_from": "20260801"}, {"sender": "x" * 201},
+        {"date_from": "2026-13-45"}, {"date_to": 20260801}, {"date_from": "20260801"},
+        {"date_from": "2026-W01-1"}, {"sender": "x" * 201},
         {"sender": "kim@corp.com", "source_filter": ["notes"]},
     ]
     for f in bad:
@@ -629,6 +630,20 @@ def test_golden_run_refusals(tmp_path: Path):
     assert client.post("/api/eval/golden/run", json={}, headers={"Origin": "http://evil.example"}).status_code == 403
     state["read_conn"] = None
     assert client.post("/api/eval/golden/run", json={}).status_code == 503
+
+
+def test_golden_run_rebuilding_leaves_evaluating_flag_and_lock_clean(tmp_path: Path):
+    """rebuilding 중 409를 받아도 evaluating 플래그·락이 남지 않아야 한다 (rebuild.claim과의 경합 창 회귀 방지)."""
+    client = make_app(tmp_path)
+    client.put("/api/eval/golden", json={"text": GOLDEN_TWO})
+    state = client.app.state.llmsearch
+    state["rebuilding"] = True
+    r = client.post("/api/eval/golden/run", json={})
+    assert r.status_code == 409
+    state["rebuilding"] = False
+    assert state["evaluating"] is False
+    assert state["evaluate_lock"].acquire(blocking=False)
+    state["evaluate_lock"].release()
 
 
 def test_golden_run_embedding_failure_hides_message(tmp_path: Path, monkeypatch):

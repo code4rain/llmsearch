@@ -160,6 +160,35 @@ def test_claude_tool_loop_passes_sender_and_filters_note(monkeypatch):
     assert len(messages.calls) == 2
 
 
+def test_apply_filters_composed_with_claude_tool_loop(monkeypatch):
+    """웹 계층 _apply_filters로 감싼 search_fn을 ClaudeAnswerer 툴 루프와 조합 — 툴이 source_filter=[]로
+    사용자 필터를 지우려 해도 래퍼가 사전 검색·툴 호출 모두에 원래 필터를 채워 넣는다 (스펙 M7 §2 통합 확인)."""
+    import sys
+    from llmsearch.llm import ClaudeAnswerer
+    from llmsearch.web.app import _apply_filters
+
+    fake_mod = types.ModuleType("anthropic")
+    messages = _Messages(_tool_use_then_end({"query": "킥오프", "source_filter": []}))
+    fake_mod.Anthropic = lambda: types.SimpleNamespace(messages=messages)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_mod)
+
+    calls = []
+
+    def search_fn(query, source_filter=None, date_from=None, date_to=None, sender=None):
+        calls.append((query, source_filter, date_from, date_to, sender))
+        return [HIT]
+
+    filters = {"source_filter": ["notes"], "date_from": None, "date_to": None, "sender": None}
+    wrapped = _apply_filters(search_fn, filters)
+
+    a = ClaudeAnswerer()
+    list(a.answer_stream("킥오프 언제였지?", [], wrapped))
+
+    assert len(calls) == 2
+    assert calls[0][1] == ["notes"]  # 사전 검색 — 강제 적용
+    assert calls[1][1] == ["notes"]  # 툴 호출 — 빈 배열([])이 사용자 필터로 채워짐
+
+
 def test_claude_no_note_when_empty(monkeypatch):
     import sys
     from llmsearch.llm import ClaudeAnswerer

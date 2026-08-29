@@ -88,12 +88,14 @@ def _validate_filters(raw) -> dict:
     for key in ("date_from", "date_to"):
         v = raw.get(key)
         if v:
-            if not isinstance(v, str) or len(v) != 10:  # fromisoformat은 20260801·2026-W01-1도 통과시킨다
-                raise HTTPException(400, f"{key}는 YYYY-MM-DD 문자열이어야 합니다")
+            if not isinstance(v, str):
+                raise HTTPException(400, f"{key}는 YYYY-MM-DD 형식이어야 합니다")
             try:
-                date.fromisoformat(v)
+                ok = date.fromisoformat(v).isoformat() == v  # 왕복 비교 — ISO 주차 표기(2026-W01-1) 등은 걸러낸다
             except ValueError:
-                raise HTTPException(400, f"{key} 형식 오류: YYYY-MM-DD")
+                ok = False
+            if not ok:
+                raise HTTPException(400, f"{key}는 YYYY-MM-DD 형식이어야 합니다")
             out[key] = v  # 자정 경계 보정은 search.search가 한다
     sender = raw.get("sender")
     if sender:
@@ -481,8 +483,6 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
     def golden_run():
         """골든 세트 실행 — 검색 경로(상한 게이트 무관, usage에 embed 기록). 자체 읽기 커넥션으로 재구축과 격리."""
         _require_db()
-        if state.get("rebuilding"):
-            raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 평가하세요")
         path = config.data_dir / "golden.yaml"
         if not path.exists():
             raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
@@ -494,15 +494,19 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             raise HTTPException(400, "golden.yaml에 질문을 먼저 작성하세요")
         if not state["evaluate_lock"].acquire(blocking=False):
             raise HTTPException(409, "평가가 이미 진행 중입니다")
-        state["evaluating"] = True
+        state["evaluating"] = True  # rebuild.claim이 sync_lock 아래서 이 값을 보게 먼저 세운다 (중간에 인덱스가 지워지는 것 방지)
         conn = None
         try:
+            if state.get("rebuilding"):
+                raise HTTPException(409, "인덱스 재구축이 진행 중입니다 — 완료 후 평가하세요")
             conn = db.open_db(config.db_path)  # try 안 — open 실패로 락이 영구 점유되지 않게
             report = golden_evaluate(conn, embedder, cases)
+        except HTTPException:
+            raise
         except Exception as exc:
             # 예외 메시지에 자격증명이 섞일 수 있어 클래스명만 노출 — 로그도 클래스명만 (CLAUDE.md 보안)
             _logger.error("골든 평가 실패: %s", type(exc).__name__)
-            raise HTTPException(502, f"임베딩 호출 실패: {type(exc).__name__}")
+            raise HTTPException(502, f"평가 실패: {type(exc).__name__}")
         finally:
             if conn is not None:
                 conn.close()
@@ -518,7 +522,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
         return {"schema_mismatch": state.get("schema_mismatch"),
                 "rebuild_in_progress": read_conn is not None and rebuild.marker_present(read_conn),
                 "rebuilding": bool(state.get("rebuilding")),
-                "resummarizing": bool(state.get("resummarizing"))}
+                "resummarizing": bool(state.get("resummarizing")),
+                "evaluating": bool(state.get("evaluating"))}
 
     @app.post("/api/rebuild", dependencies=[Depends(local_origin_only)])
     def rebuild_index(payload: dict):

@@ -295,7 +295,6 @@ async function ask(e) {
   e.preventDefault();
   const q = document.getElementById('question').value.trim();
   if (!q) return;
-  document.getElementById('question').value = '';
   const box = document.getElementById('messages');
   const qDiv = document.createElement('div');
   qDiv.className = 'msg-q';
@@ -313,9 +312,11 @@ async function ask(e) {
   });
   if (!resp.ok) {  // 400(필터 검증)·503(스키마 불일치) — 무증상 실패·history 오염 방지
     let d = {}; try { d = await resp.json(); } catch {}
-    answerDiv.textContent = '⚠️ ' + (d.detail || ('HTTP ' + resp.status));
+    const msg = typeof d.detail === 'string' ? d.detail : (d.detail ? JSON.stringify(d.detail) : 'HTTP ' + resp.status);
+    answerDiv.textContent = '⚠️ ' + msg;
     return;
   }
+  document.getElementById('question').value = '';
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '', answerText = '';

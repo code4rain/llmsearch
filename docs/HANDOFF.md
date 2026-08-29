@@ -16,7 +16,7 @@
 | M6b rebuild | ✅ 머지 | 제자리 초기화·요약 md 재사용·마커 재개·스키마 불일치 배너/복구·CLI --rebuild |
 | M7 검색 품질·평가 | 🔀 브랜치 완료(머지 시 ✅로) | 채팅 필터(선검색 강제·툴 기본값·Claude 고지), 툴 스키마 현행화, 출처 발췌, 골든 평가 GUI |
 
-- 테스트 기준: **342 passed** (`./.venv/bin/pytest`)
+- 테스트 기준: **344 passed** (`./.venv/bin/pytest`)
 - E2E: **73/73** (`tools/e2e/verify.py` — 9.9단계(M6b 인덱스 재구축)와 10단계 사이에 M7 채팅 필터·출처 발췌·골든 평가 GUI 시나리오 7건 추가)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
@@ -25,7 +25,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 342 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 344 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```

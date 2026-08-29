@@ -171,7 +171,8 @@ def test_rebuild_endpoint_restores_docs_without_llm(tmp_path: Path, monkeypatch)
     assert rebuild.marker_present(conn) is False                       # local_docs 성공 후 마커 삭제
     assert state["force_reindex_local_docs"] is False
     assert client.get("/api/status").json() == {
-        "schema_mismatch": None, "rebuild_in_progress": False, "rebuilding": False, "resummarizing": False}
+        "schema_mismatch": None, "rebuild_in_progress": False, "rebuilding": False, "resummarizing": False,
+        "evaluating": False}
     log_sources = [e["source"] for e in state["log"][:4]]
     assert set(log_sources) >= {"notes", "local_docs"}
 
