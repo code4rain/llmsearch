@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-29-llmsearch-m6-design.md` (§1 M6a 열, §2, §3, §4, §5, §8)
 
-**Ruling (계획 시점):** 스펙 §2의 "Content-Type: application/json 요구(415)"는 채택하지 않는다. 브라우저는 크로스오리진 POST(no-cors 단순 요청 포함)에 항상 `Origin`을 보내므로 Origin/Referer 검사만으로 CSRF가 차단되고, JSON 요구는 바디 없는 `/api/sync/{source}` 기존 테스트·E2E를 깨뜨린다. 스펙 §2를 이에 맞춰 수정했다.
+**Ruling (계획 시점):** 스펙 §2의 "Content-Type: application/json 요구(415)"는 채택하지 않는다. 브라우저는 크로스오리진 POST(no-cors 단순 요청 포함)에 항상 `Origin`을 보내므로 Origin/Referer 검사만으로 CSRF가 차단되고, JSON 요구는 바디 없는 `/api/sync/{source}` 기존 테스트·E2E를 깨뜨린다. 스펙 §2를 이에 맞춰 수정했다. 또한 스펙 §2가 "기존 방어 유지"라 한 `/api/open`·`/api/chat`에도 같은 의존성을 건다(의도된 강화) — Playwright `page.request.post`는 Origin/Referer를 보내지 않으므로(playwright 1.62 + chromium 실측) E2E 10단계 루프는 영향 없다.
 
 ## Global Constraints
 
@@ -18,9 +18,10 @@
 - 재요약은 상태 항목 **제거 금지, 센티널 `[0.0, 0]` 치환** (스펙 §4 — `prior_map` 유지가 요약 md 중복 생성을 막는다)
 - UI 동적 값은 `esc()` 또는 `textContent`/`.value`로만 주입 (CLAUDE.md 보안) — rules 본문을 innerHTML에 넣지 않는다
 - 웹 테스트 `TestClient(app, base_url="http://127.0.0.1")` 필수 (TrustedHostMiddleware)
-- Python 4칸 들여쓰기, 표준 라이브러리만, 기존 테스트 271개 무변경 통과(의도된 계약 변경 없음), 전체 `./.venv/bin/pytest -q` 태스크마다 green
+- Python 4칸 들여쓰기, 표준 라이브러리만, 기존 테스트 271개 무변경 통과, 전체 `./.venv/bin/pytest -q` 태스크마다 green
 - E2E 기존 45건 무변경, 신규 시나리오는 verify.py **9단계와 10단계 사이**에 삽입 (10단계가 상한을 소진하므로 그 뒤에서는 성립하지 않음)
 - 커밋 메시지 한국어, `feat:`/`refactor:`/`test:` 접두사
+- 질의 임베딩은 `search._QUERY_CACHE`에 프로세스 전역으로 캐시된다 — embed 카운트를 단언하는 테스트는 스위트에서 유일한 질문 문자열을 쓸 것 (같은 질문을 재사용하면 embed 호출이 생략되어 카운트가 어긋난다)
 
 ---
 
@@ -96,13 +97,14 @@ Expected: FAIL — `run_sync`가 `AttributeError: 'NoneType' object has no attri
             # 스키마 불일치 등으로 DB를 열지 못한 상태 — 예외를 던지면 scheduler_loop가 죽는다
             entry["ok"] = False
             entry["error"] = state.get("schema_mismatch") or "index.db를 열 수 없습니다 — 재구축이 필요합니다"
+            _logger.error("%s 동기화 건너뜀(DB 없음): %s", source, entry["error"])
             state["log"].insert(0, entry)
             del state["log"][200:]
             return entry
         tracker: UsageTracker = state["usage"]
 ```
 
-`create_app`에서 `read_conn`/`conn` 클로저 캡처를 전부 `state[...]` 조회로 바꾸고 가드 헬퍼를 추가한다. `state = {...}` 정의 직후:
+`create_app`의 `state = {...}` 리터럴에 `"resummarizing": False, "resummarize_lock": threading.Lock(),`를 추가한다(Task 6의 재요약 중복 실행 방지와 M6b rebuild 사전 검사가 `state["resummarizing"]`을 읽는다 — 미초기화면 KeyError). 그리고 `read_conn`/`conn` 클로저 캡처를 전부 `state[...]` 조회로 바꾸고 가드 헬퍼를 추가한다. `state = {...}` 정의 직후:
 
 ```python
     def _require_db() -> None:
@@ -155,7 +157,7 @@ Expected: FAIL — `run_sync`가 `AttributeError: 'NoneType' object has no attri
                                  date_from=date_from, date_to=date_to, sender=sender)
 ```
 
-마지막으로 `conn = db.open_db(config.db_path)` / `read_conn = db.open_db(config.db_path)` 두 지역변수는 `state` 구성에만 쓰이므로 그대로 두되, 이후 본문에서 `read_conn`·`conn` 이름을 직접 참조하는 곳이 남지 않았는지 `grep -n "read_conn\.\|(conn," src/llmsearch/web/app.py`로 확인한다(허용: `state = {... "conn": conn, "read_conn": read_conn ...}` 한 곳).
+마지막으로 `conn = db.open_db(config.db_path)` / `read_conn = db.open_db(config.db_path)` 두 지역변수는 `state` 구성에만 쓰이므로 그대로 두되, 클로저 참조가 남지 않았는지 확인한다: `grep -n '\bread_conn\b' src/llmsearch/web/app.py | grep -v 'state\["read_conn"\]'` → `read_conn = db.open_db(...)` 줄과 `state = {...}` 줄만 남아야 한다; `grep -n 'archive_project(' src/llmsearch/web/app.py` → `state["conn"]`을 넘기는지 확인. (run_sync 안의 `conn` 지역변수는 락 안에서 획득한 것이므로 그대로 둔다.)
 
 - [ ] **Step 4: 통과 확인**
 
@@ -253,7 +255,7 @@ git commit -m "feat: 상태 변경 API 로컬 오리진 검사 — CSRF로 동�
 - Test: `tests/test_rules.py`, `tests/test_llm.py`, `tests/test_web.py` (추가)
 
 **Interfaces:**
-- Produces: `rules.parse_rules_md(text: str) -> dict[str, str]` (`load_rules_md`는 이를 호출); `Answerer.update_rules(sections: dict[str, str]) -> None` (Fake는 `self.rules`에 보관); `GET /api/rules` → `{"text", "path", "sections"}`, `PUT /api/rules {"text"}` → `{"ok", "sections"}`; 상수 `RULES_TEMPLATE`; UI 요소 `#rulesText`, `#saveRulesBtn`, `#rulesStatus`, `#rulesPath`, nav 버튼 "설정", `<div id="settings" class="tab">`. Task 6이 설정 탭에 버튼을 추가하고, Task 8 E2E가 이 id들을 사용한다.
+- Produces: `rules.parse_rules_md(text: str) -> dict[str, str]` (`load_rules_md`는 이를 호출); `Answerer.update_rules(sections: dict[str, str]) -> None` (Fake는 `self.rules`에 보관); `GET /api/rules` → `{"text", "path", "sections"}`, `PUT /api/rules {"text"}` → `{"ok", "sections"}`; 상수 `RULES_TEMPLATE`; UI 요소 `#rulesText`, `#saveRulesBtn`, `#rulesStatus`, `#rulesPath`, `#resumAllBtn`(핸들러 `resummarizeAll`은 Task 6이 정의 — 그때까지 클릭 시 ReferenceError는 허용), nav 버튼 "설정", `<div id="settings" class="tab">`. Task 8 E2E가 이 id들을 사용한다.
 
 - [ ] **Step 1: 실패하는 테스트 작성**
 
@@ -404,7 +406,7 @@ class FakeAnswerer:
 
 ```python
 RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
-_RULES_MAX_BYTES = 256 * 1024  # 파일 크기 방어 — 본문은 이미 파싱된 뒤라 메모리 보호 목적은 아님
+_RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
 ```
 
 엔드포인트 (`/api/log` 뒤):
@@ -443,7 +445,7 @@ _RULES_MAX_BYTES = 256 * 1024  # 파일 크기 방어 — 본문은 이미 파�
   <textarea id="rulesText" style="width:100%;height:60vh;font-family:monospace"></textarea><br>
   <button id="saveRulesBtn" onclick="saveRules()">저장</button> <span id="rulesStatus"></span>
   <h3>운영</h3>
-  <div id="opsButtons"></div>
+  <button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>
 </div>
 ```
 
@@ -812,6 +814,18 @@ def test_resummarize_deleted_file_is_detected(tmp_path: Path, monkeypatch):
     assert client.get("/api/resummarize/count").json() == {"count": 1}
 
 
+def test_resummarize_rejects_concurrent_run(tmp_path: Path, monkeypatch):
+    """스펙 M6 §4·§8: 진행 중이면 409 — 더블클릭으로 요약 비용이 2배가 되지 않게."""
+    client = make_app_with_docs(tmp_path, monkeypatch)
+    client.post("/api/sync/local_docs")
+    state = client.app.state.llmsearch
+    state["resummarize_lock"].acquire()  # 진행 중 상황 재현
+    try:
+        assert client.post("/api/resummarize", json={"all": True}).status_code == 409
+    finally:
+        state["resummarize_lock"].release()
+
+
 def test_resummarize_respects_daily_limit_gate(tmp_path: Path, monkeypatch):
     client = make_app_with_docs(tmp_path, monkeypatch)
     client.post("/api/sync/local_docs")
@@ -828,12 +842,12 @@ Expected: FAIL — `/api/resummarize` 404
 
 - [ ] **Step 3: 구현**
 
-`src/llmsearch/connectors/local_docs.py` — 센티널을 공개 이름으로:
+`src/llmsearch/connectors/local_docs.py` — 센티널을 공개 이름으로 제자리 개명(`_RETRY_SENTINEL` 참조는 이 파일의 3곳뿐 — 별칭을 남기지 않는다):
 
 ```python
 RETRY_SENTINEL = [0.0, 0]
-_RETRY_SENTINEL = RETRY_SENTINEL  # 기존 참조 호환
 ```
+(파일 내 `list(_RETRY_SENTINEL)` 2곳을 `list(RETRY_SENTINEL)`로.)
 
 `src/llmsearch/web/app.py` — import에 `from ..connectors.local_docs import RETRY_SENTINEL, sync_local_docs`. 엔드포인트(`/api/rules` 뒤):
 
@@ -853,9 +867,9 @@ _RETRY_SENTINEL = RETRY_SENTINEL  # 기존 참조 호환
         실제 시그니처와 불일치해 재요약이 강제되며, 그 사이 삭제된 파일의 deleted 판정도 산다.
         """
         _require_db()
-        if state.get("resummarizing"):
+        if not state["resummarize_lock"].acquire(blocking=False):  # check-then-set 경쟁 방지 (스레드풀)
             raise HTTPException(409, "재요약이 이미 진행 중입니다")
-        state["resummarizing"] = True
+        state["resummarizing"] = True  # M6b rebuild 사전 검사(스펙 §6)가 읽는 표시
         try:
             with state["sync_lock"]:
                 st = indexer.get_sync_state(state["conn"], "local_docs")
@@ -874,6 +888,7 @@ _RETRY_SENTINEL = RETRY_SENTINEL  # 기존 참조 호환
             return {**entry, "reset": len(targets)}
         finally:
             state["resummarizing"] = False
+            state["resummarize_lock"].release()
 ```
 
 `index.html` — 출처 카드 렌더링(`ev === 'sources'` 루프)에서 열기 버튼 뒤에 재요약 버튼:
@@ -887,7 +902,7 @@ _RETRY_SENTINEL = RETRY_SENTINEL  # 기존 참조 호환
             `<button onclick="openItem(this.dataset.p)" data-p="${esc(h.url_or_path)}">열기</button>${resum}</div>`);
 ```
 
-설정 탭 `#opsButtons`에 `<button id="resumAllBtn" onclick="resummarizeAll()">전체 재요약</button>` (HTML에 직접). JS:
+설정 탭의 `#resumAllBtn`(Task 3 마크업에 이미 있음)이 호출할 JS:
 
 ```js
 function resumMessage(r, d) {
@@ -961,14 +976,15 @@ def test_recent_days_window_and_order(tmp_path: Path):
 
 ```python
 def test_usage_endpoint_and_line(tmp_path: Path):
+    from datetime import date
+
     client = make_app(tmp_path)
     client.post("/api/sync/notes")
-    client.post("/api/chat", json={"question": "q", "history": []})
+    client.post("/api/chat", json={"question": "사용량 표시 확인용 질의", "history": []})  # 스위트 내 유일한 질문 — 질의 임베딩 캐시 회피
     u = client.get("/api/usage").json()
     assert u["today"]["embed"] >= 2 and u["today"]["answer"] == 1
-    assert u["total"] == sum(u["today"].values())
     assert u["limit"] == 0 and u["indexing_allowed"] is True
-    assert u["days"][-1]["date"] == client.app.state.llmsearch["usage"]._today()
+    assert u["days"][-1]["date"] == date.today().isoformat()
     assert u["days"][-1]["total"] == u["total"]
     assert 'id="usageLine"' in client.get("/").text
 ```
@@ -1070,10 +1086,11 @@ git commit -m "feat: 사용량 GUI 표시 — recent_days·GET /api/usage·소�
     before = usage_today()
     page.click("nav >> text=채팅")
     page.fill("#question", "프로젝트A 아키텍처 표지")
+    before_cards = page.locator(".src").count()  # #messages는 누적이라 이전 답변 카드가 남아 있다
     page.click("text=검색")
-    page.wait_for_selector(".src button:has-text('재요약')", timeout=10000)
+    page.wait_for_function(f"document.querySelectorAll('.src').length > {before_cards}", timeout=10000)
     dialogs.clear()
-    page.locator(".src button", has_text="재요약").first.click()  # confirm은 기존 dialog 핸들러가 accept
+    page.locator(".src button", has_text="재요약").last.click()  # 방금 받은 답변의 카드; confirm은 dialog 핸들러가 accept
     page.wait_for_timeout(1500)
     after = usage_today()
     check("문서 재요약: summary +1", after.get("summary", 0) == before.get("summary", 0) + 1,
@@ -1103,11 +1120,11 @@ git commit -m "feat: 사용량 GUI 표시 — recent_days·GET /api/usage·소�
 ./.venv/bin/python tools/e2e/verify.py
 ```
 
-Expected: `총 56건 전부 PASS` (45 + 11). 예산: 기존 ≈12건 + 채팅 2 + 재요약 3 + 전체 재요약 3 ≈ 20 < 50, 10단계 루프 여유 충분. 서버 종료.
+Expected: `총 55건 전부 PASS` (45 + 10). 예산: 기존 ≈12건 + 채팅 2 + 재요약 3 + 전체 재요약 3 ≈ 20 < 50, 10단계 루프 여유 충분. 서버 종료.
 
 - [ ] **Step 3: HANDOFF 갱신**
 
-`docs/HANDOFF.md` §1 표 M5 행 아래에 `| M6a 운영 완성(설정·재요약·사용량) | ✅ 머지 | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |` 추가, "master 테스트 기준"과 E2E 건수를 실제 값으로 갱신, §5 문서 지도에 M6 스펙·로드맵·계획 경로 추가, §3을 "다음 작업: M6b (`docs/superpowers/plans/2026-08-29-llmsearch-m6b.md` — 작성 예정)"로.
+`docs/HANDOFF.md` §1 표 M5 행 아래에 `| M6a 운영 완성(설정·재요약·사용량) | 🔀 브랜치 완료(머지 시 ✅로) | rules.md 설정 탭·요약 규칙 주입·notes 인덱싱, 재요약(센티널), 사용량 표시, 로컬 오리진 검사 |` 추가, "master 테스트 기준"과 E2E 건수(55/55)를 실제 값으로 갱신, §5 문서 지도에 M6 스펙·로드맵·계획 경로 추가, §3을 "다음 작업: M6b (`docs/superpowers/plans/2026-08-29-llmsearch-m6b.md` — 작성 예정)"로.
 
 - [ ] **Step 4: Commit**
 

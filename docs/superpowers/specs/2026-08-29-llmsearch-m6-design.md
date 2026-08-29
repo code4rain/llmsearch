@@ -96,7 +96,7 @@
 
 | 상황 | 동작 |
 |---|---|
-| 비로컬 Origin/비JSON 상태 변경 요청 | 403/415, 부작용 없음 |
+| 비로컬 Origin 상태 변경 요청 | 403, 부작용 없음 |
 | rules PUT 본문 비정상/256KB 초과 | 400, 파일 미변경 |
 | 재요약 sid 미존재 / 진행 중 중복 | 404 / 409 |
 | 재요약·재수집 중 일일 상한 도달 | run_sync 게이트가 entry.error로 안내, 나머지 소스 계속. 재구축은 1회 실행으로 상한을 초과할 수 있음(게이트는 소스 진입 시점만 검사) — confirm에 명시 |
@@ -107,7 +107,7 @@
 
 ## 8. 테스트
 
-**M6a 단위** (Fake 주입, `TestClient(base_url="http://127.0.0.1")`): 로컬 오리진 의존성(외부 Origin 403, 비JSON 415, 정상 통과); rules GET 템플릿·sections 일관성, PUT 저장·원자성·400(비str/256KB)·`FakeAnswerer.rules` 갱신; 요약 규칙이 `GeminiSummarizer` 프롬프트에 주입됨(프롬프트 조립 함수 단위)·`sync_local_docs`→summarizer로 전달; notes `extra_files` 인덱싱·dedupe·제외 적용; resummarize 문서별(센티널 치환·prior 유지·요약 md 경로 불변·usage summary +1)·전체·404·409·삭제된 파일의 `deleted` 판정 유지; `recent_days`·`/api/usage`.
+**M6a 단위** (Fake 주입, `TestClient(base_url="http://127.0.0.1")`): 로컬 오리진 의존성(외부 Origin 403, 로컬/헤더 없음 통과); rules GET 템플릿·sections 일관성, PUT 저장·원자성·400(비str/256KB)·`FakeAnswerer.rules` 갱신; 요약 규칙이 `GeminiSummarizer` 프롬프트에 주입됨(프롬프트 조립 함수 단위)·`sync_local_docs`→summarizer로 전달; notes `extra_files` 인덱싱·dedupe·제외 적용; resummarize 문서별(센티널 치환·prior 유지·요약 md 경로 불변·usage summary +1)·전체·404·409·삭제된 파일의 `deleted` 판정 유지; `recent_days`·`/api/usage`.
 
 **M6b 단위**: `force_reindex` 요약 md 재사용(summary/vision 불변, 문서 수 복원, `extra.summary_path` 존재, DRM 문서 `content_indexed=False`, md 읽기 실패 폴백, 삭제 판정 없음, 미마운트 폴더 409); `reset_index` 트랜잭션(documents 0, para_map 유지, local_docs 상태 유지, 다른 sync_state 삭제, 마커 기록)·상한 도달 409·플래그 해제 시점; 재개 마커 기동; `read_legacy_maps`; 스키마 불일치 기동(meta 버전 강제 변경 DB) → `/api/sources` 필드·503 가드·run_sync entry.error·rebuild 복구; scheduler 예외 격리; CLI `--rebuild --yes` 헤드리스.
 
