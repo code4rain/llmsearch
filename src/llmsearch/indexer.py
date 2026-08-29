@@ -61,6 +61,14 @@ def delete_documents(conn: sqlite3.Connection, source_type: str, source_ids: lis
     return count
 
 
+def delete_all_documents(conn: sqlite3.Connection) -> int:
+    """documents 전 행을 fts5/vec 정합성 있게 삭제 — rebuild 제자리 초기화용. 커밋은 호출자가."""
+    ids = [r[0] for r in conn.execute("SELECT id FROM documents").fetchall()]  # 스캔 중 삭제 방지: fetchall 후 순회
+    for doc_id in ids:
+        _delete_doc_rows(conn, doc_id)
+    return len(ids)
+
+
 def get_sync_state(conn: sqlite3.Connection, source_type: str) -> dict:
     row = conn.execute("SELECT state_json FROM sync_state WHERE source_type=?", (source_type,)).fetchone()
     return json.loads(row[0]) if row else {}

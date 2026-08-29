@@ -105,3 +105,23 @@ def test_embedding_numpy_fallback(tmp_path: Path, monkeypatch):
     assert chunk_ids == {1, 2}
     # Verify results are sorted by distance
     assert results[0][1] <= results[1][1]
+
+
+def test_read_legacy_maps_ignores_schema_version(tmp_path):
+    from llmsearch import db, indexer
+
+    path = tmp_path / "index.db"
+    conn = db.open_db(path)
+    indexer.set_para_map(conn, "/a.pptx", "Projects/프로젝트A", "/s/a.md")
+    indexer.set_sync_state(conn, "local_docs", {"files": {"/a.pptx": [1.0, 2]}})
+    indexer.set_sync_state(conn, "notes", {"files": {}})
+    conn.execute("UPDATE meta SET value='0' WHERE key='schema_version'")
+    conn.commit(); conn.close()
+    with pytest.raises(db.SchemaMismatchError):
+        db.open_db(path)  # 버전 불일치는 여전히 기동을 막는다
+    rows, state = db.read_legacy_maps(path)
+    assert rows == [("/a.pptx", "Projects/프로젝트A", "/s/a.md")]
+    assert state == {"files": {"/a.pptx": [1.0, 2]}}
+    assert db.read_legacy_maps(tmp_path / "none.db") == ([], {})
+    (tmp_path / "junk.db").write_bytes(b"not sqlite")
+    assert db.read_legacy_maps(tmp_path / "junk.db") == ([], {})
