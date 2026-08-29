@@ -10,7 +10,7 @@
 
 | 계획 | 기능 | 근거 |
 |---|---|---|
-| **M6a** | 설정 탭 rules.md 편집(+요약 규칙 주입, notes 인덱싱), 재요약(문서별/전체), 사용량 GUI 표시, 상태 변경 API의 로컬 오리진 검사 | §9, §10 |
+| **M6a** | **선행 리팩터**(DB 커넥션을 `state`에서 호출 시점 조회, `_require_db` 가드, `run_sync`의 conn 획득을 락 내부로, 스케줄러 예외 격리 — M6b 스키마 불일치 경로의 전제이며 단독으로도 무해), 설정 탭 rules.md 편집(+요약 규칙 주입, notes 인덱싱), 재요약(문서별/전체), 사용량 GUI 표시, 상태 변경 API의 로컬 오리진 검사 | §9, §10 |
 | **M6b** | rebuild(제자리 초기화 + 요약 md 재사용), 스키마 불일치 기동·배너·복구, CLI `--rebuild` | §8, §3 "인덱스는 소모품, 요약 md는 보존" |
 
 범위 밖: 사용량 차트, rules.md 문법 검증, 재요약 진행률, 요약 모델 선택 UI, 소스별 부분 rebuild, local_docs의 미스 카운터(보수적 삭제 판정 — 별도 과제로 기록).
@@ -68,26 +68,27 @@
 **의미** — 인덱스는 소모품, **요약 md·para_map·local_docs 동기화 상태·Atlassian 등록·usage.json·rules.md는 보존**. local_docs는 요약 md를 LLM 호출 없이 재사용한다.
 
 **정상 경로 = 제자리 초기화 (파일 삭제 없음)** — `rebuild.reset_index(state) -> dict`:
-0. 사전 검사(아무것도 바꾸기 전): `state["usage"].indexing_allowed()`가 False면 409 "일일 API 상한 도달 — 상한이 초기화된 뒤 실행하세요"(초기화 후 게이트에 막히면 빈 인덱스로 자정까지 고착); `cfg.watch_folders`·`cfg.notes_folders` 중 존재하지 않는 폴더가 있으면 409 + 폴더 목록(미마운트 드라이브 상태의 재구축 방지); `state["resummarizing"]`/진행 중 rebuild면 409.
-1. `sync_lock` 안, 단일 트랜잭션: `documents` 전 행을 `indexer._delete_doc_rows`로 순회 삭제(fts5 external-content·vec0 삭제를 이미 정확히 처리하는 검증된 경로), `sync_state`에서 local_docs **제외** 전부 삭제, `meta`에 `rebuild_in_progress='1'` 기록. `para_map`·local_docs `sync_state`는 건드리지 않는다 → 스냅샷 파일 불필요. 커넥션 유지 → 클로저 캡처·WAL 삭제·경쟁 창 문제 없음(리더는 WAL 스냅샷 격리로 커밋 전/후 상태만 봄).
+0. 사전 검사(아무것도 바꾸기 전): `state["usage"].indexing_allowed()`가 False면 409 "일일 API 상한 도달 — 상한이 초기화된 뒤 실행하세요"(초기화 후 게이트에 막히면 빈 인덱스로 자정까지 고착); `cfg.watch_folders`·`cfg.notes_folders` 중 존재하지 않는 폴더가 있으면 409 + 폴더 목록(미마운트 드라이브 상태의 재구축 방지) — 단 요청 본문 `{"force": true}`면 경고를 무시하고 진행(UI는 409 응답의 폴더 목록을 confirm으로 보여준 뒤 force 재요청; 아래 미관측 sid 센티널 규칙 덕에 안전); `state["resummarizing"]` 또는 **인메모리** `state["rebuilding"]`이 True면 409(`meta` 마커로 판정하지 않는다 — 재개 대기 중엔 마커가 남아 있어 버튼이 영구 409가 됨).
+1. `sync_lock` 안, 단일 트랜잭션: `SELECT id FROM documents`를 **`fetchall()`한 뒤** `indexer._delete_doc_rows`로 순회 삭제(스캔 중 삭제로 인한 행 건너뜀 방지)(fts5 external-content·vec0 삭제를 이미 정확히 처리하는 검증된 경로), `sync_state`에서 local_docs **제외** 전부 삭제, `meta`에 `rebuild_in_progress='1'` 기록. `para_map`·local_docs `sync_state`는 건드리지 않는다 → 스냅샷 파일 불필요. 커넥션 유지 → 클로저 캡처·WAL 삭제·경쟁 창 문제 없음(리더는 WAL 스냅샷 격리로 커밋 전/후 상태만 봄).
 2. `state["force_reindex_local_docs"] = True`.
-3. 응답 `{"ok": true, "phase": "resync", "targets": [...]}` — `ok`는 초기화 성공을 뜻한다. **재수집은 백그라운드 스레드**(`threading.Thread(daemon=True)`)에서 `_scheduled_sources(state)` 순서로 `run_sync` 실행(등록 없는 소스 스킵 정책과 일관). 수천 문서·메일 1년치는 수십 분이 걸리므로 HTTP 요청 안에서 기다리지 않는다. 진행은 소스 탭 문서 수·로그 탭으로 관찰. 전 소스 완료 후 `meta.rebuild_in_progress` 삭제.
+3. 응답 `{"ok": true, "phase": "resync", "targets": [...]}` — `ok`는 초기화 성공을 뜻한다. **재수집은 백그라운드 스레드**(`threading.Thread(daemon=True)`, `state["rebuilding"]=True`로 표시하고 `try/finally`로 반드시 해제)에서 `_scheduled_sources(state)` 순서로 `run_sync` 실행(등록 없는 소스 스킵 정책과 일관). 수천 문서·메일 1년치는 수십 분이 걸리므로 HTTP 요청 안에서 기다리지 않는다. 진행은 소스 탭 문서 수·로그 탭으로 관찰. **`meta.rebuild_in_progress` 마커는 local_docs `run_sync`가 `ok=True`로 `force_reindex` 플래그를 실제로 소비한 뒤에만 삭제한다** — 다른 소스의 오류(confluence 401 등)는 자체 `sync_state`가 비어 다음 라운드에 자가 복구되므로 마커와 무관하지만, local_docs는 복구 수단이 인메모리 플래그뿐이라 오류·상한 게이트로 소비되지 않은 채 마커를 지우면 재기동 후 영구 결손된다. 스케줄러의 local_docs 라운드가 백그라운드 스레드보다 먼저 플래그를 소비해도 무방(둘 다 `sync_lock` 직렬화, 나중 실행은 무동작 패스). outlook_mail은 `batch_size` 때문에 1패스로 복원이 끝나지 않고 `backlog`로 스케줄러 라운드에 이어진다 — 배너 문구에 명시.
 
 **`sync_local_docs(..., force_reindex: bool = False)`**
 - `force_reindex`이면 `prev[sid] == sig`인 파일도 건너뛰지 않는다. `prior_map[sid]`의 `summary_path`가 존재하고 읽히면(`read_text` 실패 = OSError/UnicodeDecodeError → 정상 요약 경로 폴백) 그 md 본문으로 `Document` 생성: `source_type="local_docs"`, `source_id=sid`, `title=path.name`, `text=본문`, `url_or_path=sid`, `updated_at=파일 mtime`, `content_indexed = DRM_MARKER not in 본문`, `extra={"para_path": prior[0], "summary_path": prior[1]}` — `summary_path`는 필수(run_sync의 `set_para_map` 조건과 `archive_project`의 접두사 치환이 이 키에 의존). `_place`는 호출하지 않는다(원본 복사본 재복사 불필요; 따라서 `para_overrides`도 재평가하지 않음 — 결정 기록). `seen[sid] = sig`.
 - 요약 md가 없거나 시그니처가 바뀐 파일은 정상 요약 경로(LLM).
+- **반환 state 규칙**: 이번 패스에서 관측하지 못한 `prev`의 sid(하위 폴더 미마운트·`stat()` 실패·잠김 등)는 **센티널 `[0.0, 0]`로 남긴다** — 반환 `state = {"files": {**{sid: [0.0, 0] for sid in prev if sid not in seen}, **seen}}`. `seen`만 저장하면 prior_map이 소실되어 파일 재등장 시 해시 접미사 중복 md가 생기고(C1 재발), `prev`를 그대로 합치면 documents는 비었는데 시그니처가 일치해 영구 스킵된다. 센티널이면 prior_map 유지 + 다음 동기화에서 재처리 + 실제 삭제 시 `deleted` 판정 정상.
 - **삭제 판정을 수행하지 않는다** (`deleted=[]`, `_cleanup` 미호출) — 재구축은 복원이지 정리가 아니다. 감시 폴더 미마운트 시 전 문서가 deleted로 판정되어 요약 md가 unlink되는 사고 차단. 정리는 다음 정상 동기화가 담당.
 - `DRM_MARKER = "🔒 DRM/암호화로 내용 미인덱싱"` 상수를 `local_docs`에 두고 생성·판정 양쪽이 사용.
 - 플래그 해제 시점: `run_sync`는 `sync_local_docs`가 **정상 반환한 뒤에만** `force_reindex_local_docs`를 지운다(게이트·예외로 커넥터에 도달 못 하면 유지).
 - 검증 지표: 재구축 전후 `usage.json`의 `summary`·`vision` 불변(재사용 경로는 summarizer를 호출하지 않음), `embed`만 증가.
 
-**중단 재개** — 기동 시 `meta.rebuild_in_progress='1'`이면 `state["force_reindex_local_docs"]=True` + 배너 "이전 재구축이 완료되지 않았습니다 [재개]"(= 재수집 스레드 시작 버튼). 이 마커 덕에 재수집 도중 프로세스가 죽어도 "sync_state는 최신인데 documents는 빈" 고착이 생기지 않는다.
+**중단 재개** — 기동 시 `meta.rebuild_in_progress='1'`이면 `state["force_reindex_local_docs"]=True`. 배너는 기동 시뿐 아니라 **마커가 존재하는 동안 항상** 표시(`/api/sources`에 `rebuild_in_progress` 필드): 재수집 스레드가 도는 중이면 "재구축 진행 중 — 문서 수·로그 탭 참조 (메일은 백로그로 이어짐)", 스레드가 없으면 "이전 재구축이 완료되지 않았습니다 [재개]"(= 재수집 스레드 시작 버튼). 이 마커 덕에 재수집 도중 프로세스가 죽어도 "sync_state는 최신인데 documents는 빈" 고착이 생기지 않는다.
 
 **스키마 불일치 경로 (M9의 임베딩 차원 변경 시 실제로 타는 경로)**
 - `db.read_legacy_maps(path) -> (para_rows, local_docs_state)`: 버전 검사·확장 로드 없이 `sqlite3.connect`로 열어 `para_map` 전체와 `sync_state(local_docs)`만 읽고 닫는다(테이블 부재는 빈 결과). 이 두 테이블은 스키마 변경 대상이 아니다.
 - `create_app`: `open_db`의 `SchemaMismatchError`를 잡아 `state["conn"]=state["read_conn"]=None`, `state["schema_mismatch"]=메시지`. 기동은 성공.
-- 가드: `_require_db()` 헬퍼(없으면 503 `schema_mismatch` 메시지)를 DB를 만지는 모든 엔드포인트 진입부에 둔다 — `/api/para/projects`·`/api/open`·`/api/chat`·`/api/archive`·`/api/resummarize`·`/api/sync`. `/api/sources`만 예외: `doc_count` 0 + `schema_mismatch` 필드로 정상 응답(배너 표시용). `run_sync`는 게이트 검사 **이전**에 `conn is None`이면 `entry.error`로 기록 후 반환(예외 금지). `scheduler_loop`의 `to_thread` 호출은 `try/except`+로그로 감싸 어떤 예외에도 루프가 죽지 않게 한다(기존 취약점 동시 해소). 엔드포인트·`search_fn`은 `state["read_conn"]`/`state["conn"]`을 호출 시점에 조회한다(현재 `read_conn` 클로저 캡처 7곳 + `/api/archive`의 `conn` 1곳; `run_sync`의 `conn` 획득도 락 내부로 이동).
-- rebuild(스키마 불일치 상태): `read_legacy_maps`로 매핑 확보 → `index.db`·`-wal`·`-shm` 삭제(열린 커넥션 없음) → `open_db` 2회 → `para_map`·local_docs `sync_state` 복원 → `rebuild_in_progress` 기록 → `state` 커넥션 교체, `schema_mismatch` 제거 → 백그라운드 재수집(정상 경로와 동일). `read_legacy_maps`마저 실패한 경우에만 "local_docs 전량 재요약(요약 API n회)" 경고를 배너·confirm에 표시.
+- 가드: `_require_db()` 헬퍼(없으면 503 `schema_mismatch` 메시지)를 DB를 만지는 모든 엔드포인트 진입부에 둔다 — `/api/para/projects`·`/api/open`·`/api/chat`·`/api/archive`·`/api/resummarize`·`/api/resummarize/count`·`/api/sync`. (이 가드와 아래 state 조회 리팩터는 **M6a 선행 태스크**로 먼저 들어간다.) `/api/sources`만 예외: `doc_count` 0 + `schema_mismatch` 필드로 정상 응답(배너 표시용). `run_sync`는 게이트 검사 **이전**에 `conn is None`이면 `entry.error`로 기록 후 반환(예외 금지). `scheduler_loop`의 `to_thread` 호출은 `try/except`+로그로 감싸 어떤 예외에도 루프가 죽지 않게 한다(기존 취약점 동시 해소). 엔드포인트·`search_fn`은 `state["read_conn"]`/`state["conn"]`을 호출 시점에 조회한다(현재 `read_conn` 클로저 캡처 7곳 + `/api/archive`의 `conn` 1곳; `run_sync`의 `conn` 획득도 락 내부로 이동).
+- rebuild(스키마 불일치 상태, 전 구간 `sync_lock` 보유): `read_legacy_maps`로 매핑 확보 → `index.db`·`-wal`·`-shm` 삭제(열린 커넥션 없음) → `open_db` 2회 → `para_map`·local_docs `sync_state` 복원 → `rebuild_in_progress` 기록 → `state` 커넥션 교체, `schema_mismatch` 제거 → 백그라운드 재수집(정상 경로와 동일). `read_legacy_maps`마저 실패한 경우에만 "local_docs 전량 재요약(요약 API n회)" 경고를 배너·confirm에 표시.
 - UI 배너: "index.db 스키마 불일치 — 재구축이 필요합니다 [재구축]". 재구축 confirm에는 대상 문서 수·예상 호출 수(embed 청크 수는 미상이므로 "문서 n건, 요약 재사용")를 표시.
 
 **CLI** — `python -m llmsearch --config ... --rebuild [--yes]`: `create_app` 뒤 서버 기동 전에 `rebuild.reset_index` → 재수집을 **동기로** 실행(헤드리스)하고 소스별 결과를 로그 출력 후 정상 기동. `--yes`가 없으면 대상 문서 수·경고를 출력하고 확인 프롬프트. `rebuild.py`는 `web/app.py`를 import하지 않는다 — `SOURCES` 상수를 `llmsearch/sources.py`로 옮기고 `run_sync`·`_scheduled_sources`는 인자로 주입.
@@ -126,7 +127,7 @@
 | 결정 | 근거 |
 |---|---|
 | 재요약은 상태 항목 제거가 아닌 센티널 치환 | 제거하면 prior_map 소실 → 요약 md 중복 생성·분류 흔들림·삭제 감지 상실 (리뷰 C1) |
-| rebuild는 파일 삭제가 아닌 제자리 행 삭제 | 커넥션 유지로 경쟁 창·WAL 삭제 실패·클로저 수정·스냅샷 파일이 전부 소멸 (리뷰 I2) |
+| rebuild는 파일 삭제가 아닌 제자리 행 삭제 | 정상 경로에서 경쟁 창·WAL 삭제 실패·스냅샷 파일이 소멸 (리뷰 I2). 커넥션 state 조회 리팩터는 스키마 불일치 경로(M9가 실제로 타는 경로)에 여전히 필요하므로 M6a 선행 태스크로 수행 |
 | force_reindex는 삭제 판정 생략 | 미마운트 폴더 상태의 재구축이 요약 md를 지우는 사고 차단 (리뷰 C2) |
 | 스키마 불일치는 legacy 읽기로 매핑 회수 | M9 차원 변경이 이 경로를 타므로 전량 재요약은 상위 스펙 §3 위반 (리뷰 C3) |
 | 재수집은 백그라운드, 재요약은 동기 | 재구축은 수 시간 가능, 재요약 1건은 짧다 (리뷰 I10) |
