@@ -466,3 +466,23 @@ def test_vision_augment_boundary_200_chars():
     path = Path("test.pptx")
     _augment_with_vision(path, text, renderer, FakeSummarizer())
     assert len(renderer.calls) == 0  # 렌더러가 호출되지 않음
+
+
+def test_summary_rules_passed_to_summarizer(tmp_path: Path, patch_extract):
+    class Recording(FakeSummarizer):
+        def __init__(self):
+            self.kwargs = None
+
+        def summarize_and_classify(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return super().summarize_and_classify(*args, **kwargs)
+
+    docs = tmp_path / "docs"; docs.mkdir()
+    (docs / "a.pptx").write_bytes(b"x")
+    s = Recording()
+    local_docs.sync_local_docs(
+        folders=[docs], excludes=[], overrides=[], summarizer=s, summaries_dir=tmp_path / "summaries",
+        projects=["프로젝트A"], areas=[], glossary="", class_rules="", state={}, prior_map={},
+        summary_rules="실적 수치는 표로",
+    )
+    assert s.kwargs["summary_rules"] == "실적 수치는 표로"

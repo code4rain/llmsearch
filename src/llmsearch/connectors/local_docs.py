@@ -126,7 +126,7 @@ def sync_local_docs(
     summarizer: Summarizer, summaries_dir: Path,
     projects: list[str], areas: list[str], glossary: str, class_rules: str,
     state: dict, prior_map: dict[str, tuple[str, str]],
-    renderer: SlideRenderer | None = None,
+    renderer: SlideRenderer | None = None, summary_rules: str = "",
 ) -> SyncResult:
     prev: dict[str, list] = dict(state.get("files", {}))
     seen: dict[str, list] = {}
@@ -167,6 +167,7 @@ def sync_local_docs(
                         existing_resources=_existing_resources(summaries_dir),
                         prior_category=prior[0] if prior else None,
                         glossary=glossary, rules=class_rules,
+                        summary_rules=summary_rules,
                     )
                     category, body = result.category, result.markdown
                 else:

@@ -185,6 +185,7 @@ def run_sync(state: dict, source: str) -> dict:
                     summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
                     projects=cfg.projects, areas=cfg.areas,
                     glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
+                    summary_rules=rules_md.get("요약 규칙", ""),
                     state=prev, prior_map=prior_map,
                     renderer=_get_slide_renderer(state),
                 )
