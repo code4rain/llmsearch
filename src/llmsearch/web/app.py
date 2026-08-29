@@ -26,6 +26,7 @@ from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..rules import load_rules_md
+from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
 SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
@@ -127,6 +128,19 @@ def run_sync(state: dict, source: str) -> dict:
     entry = {"source": source, "at": datetime.now().isoformat(), "ok": True, "indexed": 0,
              "deleted": 0, "error": None}
     with state["sync_lock"]:  # 단일 sqlite3.Connection 공유 쓰기 직렬화 (스펙 §5 P0)
+        tracker: UsageTracker = state["usage"]
+        if not tracker.indexing_allowed():
+            # 스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지 — 검색·답변 경로는 이 게이트를
+            # 지나지 않으므로 계속 동작한다. 다음 날이 되면 카운터가 롤오버되어 자동 재개.
+            entry["ok"] = False
+            entry["error"] = (
+                f"일일 API 호출 상한({tracker.daily_limit}건) 도달 — 오늘 누적 "
+                f"{tracker.today_total()}건. 요약·인덱싱을 일시정지합니다 (검색·답변은 계속 가능)."
+            )
+            _logger.warning("%s 동기화 건너뜀: %s", source, entry["error"])
+            state["log"].insert(0, entry)
+            del state["log"][200:]
+            return entry
         try:
             prev = indexer.get_sync_state(conn, source)
             rules_md = load_rules_md(cfg.rules_md_path)
@@ -205,6 +219,12 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
             answer_rules=rules_md.get("답변 규칙", ""), glossary=rules_md.get("용어집", ""),
         )
 
+    # 사용량 카운팅 래퍼 (스펙 §10 P2) — 주입된 Fake 포함 모든 경로를 기록.
+    # 래퍼는 기록만 하고 차단하지 않는다 — 차단은 run_sync 진입 게이트 한 곳에서만.
+    tracker = UsageTracker(config.data_dir / "usage.json", config.daily_api_call_limit)
+    embedder = CountingEmbedder(embedder, tracker)
+    summarizer = CountingSummarizer(summarizer, tracker)
+
     conn = db.open_db(config.db_path)
     # 쓰기는 conn(run_sync 전용), 읽기는 read_conn — 동기화 쓰기 트랜잭션 중에도
     # /api/chat, /api/sources 같은 읽기 요청이 같은 커넥션을 공유하지 않게 분리한다.
@@ -214,7 +234,8 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
              "sync_lock": threading.Lock(), "outlook_client": outlook_client,
              "confluence_client": atlassian_client,
              "jira_client": atlassian_client,
-             "registry": Registry(config.data_dir / "atlassian.json")}
+             "registry": Registry(config.data_dir / "atlassian.json"),
+             "usage": tracker}
     if slide_renderer is not None:
         state["slide_renderer"] = slide_renderer
 
@@ -355,6 +376,7 @@ def create_app(config: Config, embedder=None, summarizer=None, answerer=None,
 
     @app.post("/api/chat")
     def chat(payload: dict):
+        state["usage"].record("answer")
         question = payload.get("question", "")
         history = payload.get("history", [])
 

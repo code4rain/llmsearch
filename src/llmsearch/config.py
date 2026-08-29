@@ -26,6 +26,7 @@ class Config:
     cal_future_days: int = 180
     confluence_base_url: str = ""
     jira_base_url: str = ""
+    daily_api_call_limit: int = 0  # 0 = 무제한 (스펙 §10 P2)
 
     @property
     def db_path(self) -> Path:
@@ -46,6 +47,7 @@ def load_config(path: Path) -> Config:
     rules = raw.get("rules", {})
     outlook = raw.get("outlook", {})
     atlassian = raw.get("atlassian", {})
+    limits = raw.get("limits", {})
     return Config(
         data_dir=Path(raw["data_dir"]),
         watch_folders=[Path(p) for p in raw.get("watch_folders", [])],
@@ -65,4 +67,5 @@ def load_config(path: Path) -> Config:
         cal_future_days=int(outlook.get("cal_future_days", 180)),
         confluence_base_url=str(atlassian.get("confluence_base_url", "")).rstrip("/"),
         jira_base_url=str(atlassian.get("jira_base_url", "")).rstrip("/"),
+        daily_api_call_limit=int(limits.get("daily_api_calls", 0)),
     )

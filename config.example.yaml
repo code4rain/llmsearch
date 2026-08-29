@@ -17,3 +17,5 @@ outlook:
 atlassian:
   confluence_base_url: ""   # 예: https://wiki.corp.com (사내 Server/DC)
   jira_base_url: ""         # 예: https://jira.corp.com
+limits:
+  daily_api_calls: 0   # 일일 API 호출 상한 (0 = 무제한). 도달 시 요약·인덱싱만 일시정지, 검색·답변은 유지

@@ -67,3 +67,19 @@ def test_outlook_config_defaults_and_load(tmp_path: Path):
     assert cfg.mail_since_days == 30
     assert cfg.mail_batch_size == 200      # 기본값
     assert cfg.cal_past_days == 90 and cfg.cal_future_days == 180
+
+
+def test_daily_api_call_limit_loaded(tmp_path):
+    from llmsearch.config import load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text("data_dir: /tmp/x\nlimits:\n  daily_api_calls: 500\n", encoding="utf-8")
+    assert load_config(p).daily_api_call_limit == 500
+
+
+def test_daily_api_call_limit_default_zero(tmp_path):
+    from llmsearch.config import load_config
+
+    p = tmp_path / "config.yaml"
+    p.write_text("data_dir: /tmp/x\n", encoding="utf-8")
+    assert load_config(p).daily_api_call_limit == 0
