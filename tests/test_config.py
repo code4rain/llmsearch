@@ -1,5 +1,9 @@
+import os
 from pathlib import Path
-from llmsearch.config import load_config
+
+import pytest
+
+from llmsearch.config import ConfigNotFound, llmsearch_home, load_config, load_env, resolve_config_path
 
 
 def test_load_config(tmp_path: Path):
@@ -104,3 +108,63 @@ def test_export_to_notes_loaded_and_default(tmp_path):
     p.write_text("data_dir: /tmp/x\nchat:\n", encoding="utf-8")
     assert load_config(p).export_to_notes is False
     assert Config(data_dir=tmp_path).export_to_notes is False
+
+
+def test_home_default_and_override(monkeypatch, tmp_path: Path):
+    monkeypatch.delenv("LLMSEARCH_HOME", raising=False)
+    assert llmsearch_home() == Path.home() / ".llmsearch"
+    monkeypatch.setenv("LLMSEARCH_HOME", str(tmp_path / "h"))
+    assert llmsearch_home() == tmp_path / "h"
+
+
+def test_resolve_priority_explicit_over_env_over_home(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("data_dir: /h\n", encoding="utf-8")
+    env_cfg = tmp_path / "env.yaml"
+    env_cfg.write_text("data_dir: /e\n", encoding="utf-8")
+    explicit = tmp_path / "x.yaml"
+    explicit.write_text("data_dir: /x\n", encoding="utf-8")
+    monkeypatch.setenv("LLMSEARCH_HOME", str(home))
+    monkeypatch.delenv("LLMSEARCH_CONFIG", raising=False)
+    assert resolve_config_path() == home / "config.yaml"
+    monkeypatch.setenv("LLMSEARCH_CONFIG", str(env_cfg))
+    assert resolve_config_path() == env_cfg
+    assert resolve_config_path(explicit) == explicit
+
+
+def test_resolve_missing_reports_path_and_install_hint(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("LLMSEARCH_HOME", str(tmp_path / "nohome"))
+    monkeypatch.delenv("LLMSEARCH_CONFIG", raising=False)
+    with pytest.raises(ConfigNotFound) as exc:
+        resolve_config_path()
+    msg = str(exc.value)
+    assert str(tmp_path / "nohome" / "config.yaml") in msg
+    assert "install.sh" in msg
+
+
+def test_resolve_explicit_missing_does_not_fall_back(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("data_dir: /h\n", encoding="utf-8")
+    monkeypatch.setenv("LLMSEARCH_HOME", str(home))
+    with pytest.raises(ConfigNotFound):
+        resolve_config_path(tmp_path / "missing.yaml")
+
+
+def test_load_env_order(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    home.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (home / ".env").write_text("LLMS_T_HOME_ONLY=h\nLLMS_T_BOTH=h\nLLMS_T_REAL=h\n", encoding="utf-8")
+    (cwd / ".env").write_text("LLMS_T_BOTH=c\n", encoding="utf-8")
+    for name in ("LLMS_T_HOME_ONLY", "LLMS_T_BOTH", "LLMS_T_REAL"):
+        monkeypatch.delenv(name, raising=False)  # 테스트 종료 시 dotenv가 넣은 값도 제거된다
+    monkeypatch.setenv("LLMS_T_REAL", "real")
+    monkeypatch.setenv("LLMSEARCH_HOME", str(home))
+    monkeypatch.chdir(cwd)
+    load_env()
+    assert os.environ["LLMS_T_HOME_ONLY"] == "h"   # HOME .env 채움
+    assert os.environ["LLMS_T_BOTH"] == "c"        # cwd가 HOME보다 우선
+    assert os.environ["LLMS_T_REAL"] == "real"     # 실제 환경변수 최우선
