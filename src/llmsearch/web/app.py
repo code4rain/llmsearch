@@ -42,6 +42,7 @@ WINDOWS_ONLY_SOURCES = ("outlook_mail", "outlook_cal")
 _WINDOWS_ONLY_MSG = (
     "Outlook 동기화는 Windows에서만 지원됩니다 (WSL은 개발·테스트용 — Fake 클라이언트 주입 시에만 동작)"
 )
+_SYNC_BUSY_MSG = "다른 프로세스가 동기화 중입니다 (GUI/CLI 동시 실행) — 동기화가 끝난 뒤 다시 시도하세요"
 RULES_TEMPLATE = "# 규칙 (rules.md)\n\n## 용어집\n\n## 분류 규칙\n\n## 요약 규칙\n\n## 답변 규칙\n"
 _RULES_MAX_BYTES = 256 * 1024  # rules.md 파일 크기 상한 — 사고성 대용량 저장 방지 (스펙 M6 §3)
 GOLDEN_TEMPLATE = (
@@ -283,6 +284,17 @@ def _scheduled_sources(state: dict) -> list[str]:
     return out
 
 
+def _remove_lock_file(data_dir: Path) -> bool:
+    """손상된 sync.lock.db(및 -wal/-shm)를 지운다. 삭제 실패는 호출부가 메시지로 알린다."""
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            (data_dir / f"sync.lock.db{suffix}").unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        _logger.warning("손상된 sync.lock.db 삭제 실패: %s", exc)
+        return False
+
+
 def run_sync(state: dict, source: str) -> dict:
     """커넥터 1개 동기화 실행. 실패는 소스별로 격리해 로그에 남긴다 (스펙 §5)."""
     cfg: Config = state["config"]
@@ -303,16 +315,36 @@ def run_sync(state: dict, source: str) -> dict:
         # 보수적 삭제 판정이 무너진다. Windows에는 fcntl이 없으므로 SQLite 자신의 파일 잠금을
         # 락으로 쓴다: 크로스 플랫폼이고, 프로세스가 죽으면 OS가 핸들을 닫아 락이 자동 해제된다
         # (stale lock 처리 불필요). data_dir은 위 conn 가드를 통과했으면 반드시 존재한다.
+        #
+        # 이 락의 범위는 run_sync 하나뿐이다 — 재구축(--rebuild)·resummarize·archive는 인덱스를
+        # 락 밖에서 건드린다. 이들은 CLI의 포트 프로브 + 단일 사용자 운영(같은 사람이 GUI에서
+        # 두 동작을 동시에 누르지 않는다)에 의존한다. 락을 재구축 경로까지 넓히는 것은 커넥션
+        # 교체·장시간 점유 위험이 커서 별도 과제로 남긴다 (docs/HANDOFF.md 후속).
         lock_conn = None
         try:
             lock_conn = sqlite3.connect(cfg.data_dir / "sync.lock.db", timeout=0)
             lock_conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError:
+        except sqlite3.Error as exc:
+            # OperationalError만 잡으면 손상된 잠금 파일(DatabaseError: file is not a database)이
+            # run_sync 밖으로 새어 /api/sync가 500이 되고 스케줄러가 죽는다. 반대로 모든
+            # OperationalError를 경합으로 보면 읽기전용·SMB data_dir("unable to open database
+            # file")까지 "다른 프로세스가 동기화 중"으로 오인한다 — 메시지로 분류한다.
             if lock_conn is not None:
                 lock_conn.close()
+            text = str(exc)
+            if "locked" in text:
+                entry["error"] = _SYNC_BUSY_MSG
+            elif "not a database" in text:
+                # 손상된 잠금 파일은 지우기만 한다 — 같은 호출 안에서 재시도하지 않는다
+                # (재시도하면 실제 경합과 손상을 구분 못 하는 재귀 경로가 생긴다).
+                removed = _remove_lock_file(cfg.data_dir)
+                entry["error"] = (f"동기화 잠금 파일 오류: {exc}"
+                                  + (" — 손상된 잠금 파일을 삭제했습니다, 다음 동기화에서 다시 생성됩니다"
+                                     if removed else " — 잠금 파일을 삭제하지 못했습니다, 수동으로 지워 주세요"))
+            else:
+                entry["error"] = f"동기화 잠금 파일 오류: {exc}"
             entry["ok"] = False
-            entry["error"] = "다른 프로세스가 동기화 중입니다 (GUI/CLI 동시 실행) — 잠시 후 다시 시도하세요"
-            _logger.info("%s 동기화 건너뜀(크로스 프로세스 락): %s", source, entry["error"])
+            _logger.info("%s 동기화 건너뜀(잠금 획득 실패): %s", source, text)
             state["log"].insert(0, entry)
             del state["log"][200:]
             return entry

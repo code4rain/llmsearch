@@ -1121,3 +1121,63 @@ def test_run_sync_releases_cross_process_lock_on_exception(tmp_path: Path, monke
 
     monkeypatch.undo()
     assert app_module.run_sync(state, "notes")["ok"] is True
+
+
+def _assert_lock_free(state) -> None:
+    """run_sync가 끝난 뒤 크로스 프로세스 락이 남아 있지 않은지 확인."""
+    probe = sqlite3.connect(state["config"].data_dir / "sync.lock.db", timeout=0)
+    probe.execute("BEGIN IMMEDIATE")  # 락이 남아 있으면 OperationalError
+    probe.rollback()
+    probe.close()
+
+
+def test_run_sync_recovers_from_corrupt_lock_file(tmp_path: Path):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    lock_path = state["config"].data_dir / "sync.lock.db"
+    lock_path.write_bytes(b"this is not a sqlite database")
+
+    entry = app_module.run_sync(state, "notes")  # 예외가 밖으로 나가면 /api/sync가 500
+    assert entry["ok"] is False
+    assert "잠금 파일" in entry["error"]
+    assert "다른 프로세스" not in entry["error"]
+    assert state["log"][0] is entry
+
+    entry2 = app_module.run_sync(state, "notes")  # 손상 파일 삭제 → 다음 시도에서 재생성
+    assert entry2["ok"] is True and entry2["indexed"] == 1
+
+
+def test_run_sync_lock_open_failure_is_not_reported_as_contention(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    real_connect = sqlite3.connect
+
+    def fake_connect(path, *args, **kwargs):
+        if str(path).endswith("sync.lock.db"):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(app_module.sqlite3, "connect", fake_connect)
+    entry = app_module.run_sync(state, "notes")
+    assert entry["ok"] is False
+    assert "다른 프로세스" not in entry["error"]  # 읽기전용·SMB data_dir을 경합으로 오인하지 않는다
+    assert "unable to open database file" in entry["error"]
+    assert state["log"][0] is entry
+
+
+def test_windows_only_early_out_releases_cross_process_lock(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    monkeypatch.setattr(app_module, "IS_WINDOWS", False)
+    state = client.app.state.llmsearch
+    entry = app_module.run_sync(state, "outlook_mail")
+    assert entry["ok"] is False and entry["error"] == _WINDOWS_ONLY_MSG
+    _assert_lock_free(state)
+
+
+def test_usage_limit_early_out_releases_cross_process_lock(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+    monkeypatch.setattr(state["usage"], "indexing_allowed", lambda: False)
+    entry = app_module.run_sync(state, "notes")
+    assert entry["ok"] is False and "상한" in entry["error"]
+    _assert_lock_free(state)

@@ -19,7 +19,7 @@
 | WSL 개발·테스트 지원 정리 | ✅ 머지 | Windows 전용 Outlook 소스(`IS_WINDOWS`/`_outlook_available`) 스케줄러 자동 제외·수동 동기화 안내 메시지·소스 탭 "Windows 전용" 표시, 환경별 README |
 | Claude 스킬화 | ✅ 머지 | 전역 설정(`~/.llmsearch`, resolver·load_env), `llmsearch` CLI(search/get/status/sync — GUI 함수 재사용, FTS 폴백, 서버 감지), `skills/llmsearch`(SKILL.md·래퍼·install.sh) — 스펙 `2026-08-31-claude-skill-design.md` |
 
-- 테스트 기준: **443 passed** (`./.venv/bin/pytest`)
+- 테스트 기준: **449 passed** (`./.venv/bin/pytest`)
 - E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가; WSL 지원 변경은 Fake 주입 경로만 건드려 E2E 시나리오 수 불변; Claude 스킬화(문서·CLI·install.sh만 변경, GUI 무변경)는 §2 절차대로 재실행해 80/80 재확인함)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
@@ -28,7 +28,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 443 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 449 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```
@@ -91,6 +91,7 @@ superpowers 플러그인이 없는 환경이면: 플랜을 태스크 순서대�
 - ComWorker submit 타임아웃: COM 모달 행 대비책이지만 STA 스레드가 어차피 wedged로 남아 실익 제한 — 보류.
 - 회사 일정 시스템 연동: 스펙 Out of Scope (커넥터 인터페이스로 확장 가능하게만 설계됨).
 - **local_docs 정상 동기화의 미존재 폴더 삭제 판정**: 감시 폴더(네트워크 드라이브 등)가 한 라운드 미마운트면 그 아래 문서가 전부 deleted로 판정되어 요약 md·복사본이 unlink된다 (M6b 최종 리뷰 지적, 선재 동작). CLAUDE.md "보수적 삭제"와 충돌 — 미존재 폴더의 prev sid를 `RETRY_SENTINEL`로 이월하는 소규모 픽스 후보 (M7 전 처리 권장). rebuild 경로는 precheck·force_reindex로 이미 보호됨.
+- **후속: rebuild 경로 cross-process 락 확장 검토** — `run_sync`만 `data_dir/sync.lock.db`(BEGIN IMMEDIATE)로 크로스 프로세스 상호배제를 건다. `--rebuild`/resummarize/archive는 락 밖에서 인덱스를 바꾸며, 현재는 CLI 포트 프로브 + 단일 사용자 운영에 의존한다 (재구축은 커넥션을 교체하고 오래 점유해 락 확장 위험이 이득보다 커서 이 브랜치에서는 보류).
 - 이연 Minor 잔여분은 각 마일스톤 최종 리뷰에서 전부 OK-TO-DEFER 판정 — 필요 시 git log의 리뷰 반영 커밋들 참조.
 
 ## 8. 함정·이력 (같은 실수 반복 금지)

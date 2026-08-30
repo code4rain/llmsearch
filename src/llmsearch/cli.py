@@ -24,6 +24,8 @@ from .usage import CountingEmbedder, UsageTracker
 from .models import SOURCES
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_SERVER_RUNNING, EXIT_SCHEMA = 0, 1, 2, 3, 4
+# web.app._SYNC_BUSY_MSG의 접두사 — 락 경합을 실패(1)가 아니라 exit 3으로 분류한다.
+_SYNC_BUSY_PREFIX = "다른 프로세스가 동기화 중"
 DEFAULT_PORT = 8642
 
 
@@ -240,7 +242,8 @@ def _error_cell(error) -> str:
     if not error:
         return ""
     first = str(error).splitlines()[0] if str(error).splitlines() else ""
-    return first[:200]
+    # 자른 뒤에 이스케이프한다 — 먼저 하면 200자 경계가 백슬래시와 | 사이를 갈라 깨진 셀이 된다
+    return first[:200].replace("|", "\\|")
 
 
 def cmd_sync(args) -> int:
@@ -273,7 +276,13 @@ def cmd_sync(args) -> int:
             body = [f"    {ln}" for ln in str(e["error"]).rstrip().splitlines()]
             md += ["", f"### {e['source']} error", ""] + body
     _emit(args, {"ok": ok, "entries": entries}, "\n".join(md))
-    return EXIT_OK if ok else EXIT_FAIL
+    if ok:
+        return EXIT_OK
+    if all(str(e["error"]).startswith(_SYNC_BUSY_PREFIX) for e in entries if not e["ok"]):
+        # 크로스 프로세스 락 경합 — 동기화가 깨진 게 아니라 "지금은 못 한다"이므로
+        # 서버 실행 중과 같은 exit 3으로 알린다 (스킬이 같은 안내를 하도록).
+        return EXIT_SERVER_RUNNING
+    return EXIT_FAIL
 
 
 # ---- parser / main --------------------------------------------------------
