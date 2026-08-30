@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
+from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 from typing import Callable
 
 from . import db, indexer, rebuild
+from . import search as search_mod
 from .config import Config, ConfigNotFound, load_config, load_env, resolve_config_path
-from .usage import UsageTracker
+from .usage import CountingEmbedder, UsageTracker
 from .web.app import SOURCES
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_SERVER_RUNNING, EXIT_SCHEMA = 0, 1, 2, 3, 4
@@ -82,6 +86,81 @@ def cmd_status(args) -> int:
     return EXIT_OK
 
 
+# ---- search ---------------------------------------------------------------
+
+def _parse_filters(args) -> dict:
+    """web.app._validate_filters와 같은 규칙 (소스명·YYYY-MM-DD 왕복·발신자는 메일 소스에서만)."""
+    out: dict = {"source_filter": None, "date_from": None, "date_to": None, "sender": None}
+    if args.source:
+        unknown = [s for s in args.source if s not in SOURCES]
+        if unknown:
+            raise CliError(EXIT_USAGE, f"알 수 없는 소스: {', '.join(unknown)} (가능: {', '.join(SOURCES)})")
+        out["source_filter"] = [s for s in SOURCES if s in args.source]
+    for key, value in (("date_from", args.date_from), ("date_to", args.date_to)):
+        if value:
+            try:
+                ok = date.fromisoformat(value).isoformat() == value
+            except ValueError:
+                ok = False
+            if not ok:
+                raise CliError(EXIT_USAGE, f"--{key.replace('date_', '')}는 YYYY-MM-DD 형식이어야 합니다: {value}")
+            out[key] = value
+    if args.sender:
+        sender = args.sender.strip()
+        if len(sender) > 200:
+            raise CliError(EXIT_USAGE, "--sender는 200자 이하여야 합니다")
+        if out["source_filter"] and "outlook_mail" not in out["source_filter"]:
+            raise CliError(EXIT_USAGE, "발신자 필터는 메일 소스에서만 동작합니다 — --source에 outlook_mail을 포함하거나 비우세요")
+        out["sender"] = sender
+    return out
+
+
+def _resolve_embedder(args, cfg: Config):
+    """(embedder|None, fts_only). 키가 없으면 FTS 전용으로 강등하고 stderr에 알린다."""
+    if args.fts_only:
+        return None, True
+    embedder = args._embedder
+    if embedder is None:
+        if not os.environ.get("GEMINI_API_KEY"):
+            print("경고: GEMINI_API_KEY 없음 — FTS 전용 검색 (GUI의 하이브리드 순위와 다름). "
+                  "~/.llmsearch/.env에 키를 넣으면 동일한 순위가 된다", file=sys.stderr)
+            return None, True
+        from .embeddings import GeminiEmbeddings  # 지연 import — 키 없는 환경에서 SDK를 건드리지 않는다
+        embedder = GeminiEmbeddings(model=cfg.embed_model)
+    tracker = UsageTracker(cfg.data_dir / "usage.json", cfg.daily_api_call_limit)
+    return CountingEmbedder(embedder, tracker), False  # GUI와 동일하게 사용량 기록
+
+
+def _hit_markdown(i: int, h: dict, excerpt: bool) -> str:
+    lines = [f"{i}. **{h['title']}** — {h['source_type']} · {h['updated_at'][:10]} · score {h['score']:.4f}",
+             f"   path: {h['url_or_path']}", f"   id: {h['source_id']}"]
+    if not h["content_indexed"]:
+        lines.append("   (본문 미인덱싱 — 메타데이터만)")
+    if h["snippet"]:
+        lines.append(f"   {h['snippet']}")
+    if excerpt:
+        lines += ["   > " + ln for ln in h["excerpt"].splitlines() if ln.strip()]
+    return "\n".join(lines)
+
+
+def cmd_search(args) -> int:
+    _, cfg = _load(args)
+    filters = _parse_filters(args)
+    embedder, fts_only = _resolve_embedder(args, cfg)
+    conn = _open_index(cfg)
+    try:
+        hits = search_mod.search(conn, embedder, args.query, k=args.k, **filters)
+    finally:
+        conn.close()
+    rows = [asdict(h) for h in hits]
+    payload = {"query": args.query, "fts_only": fts_only, "filters": filters, "hits": rows}
+    mode = "fts-only" if fts_only else "hybrid"
+    md = [f'## "{args.query}" — {len(rows)}건 ({mode})']
+    md += [_hit_markdown(i, h, args.excerpt) for i, h in enumerate(rows, 1)] or ["(히트 없음)"]
+    _emit(args, payload, "\n".join(md))
+    return EXIT_OK
+
+
 # ---- parser / main --------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +174,19 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="llmsearch", description="llmsearch 인덱스 CLI (Claude 스킬용)")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("status", parents=[common], help="인덱스·소스·사용량 상태").set_defaults(func=cmd_status)
+
+    s = sub.add_parser("search", parents=[common],
+                        help="하이브리드 검색 — 히트(출처·발췌)만 반환, 답변은 호출자가 작성")
+    s.add_argument("query")
+    s.add_argument("--source", action="append", default=[], help=f"소스 필터 (반복 가능): {', '.join(SOURCES)}")
+    s.add_argument("--from", dest="date_from", default=None, help="YYYY-MM-DD")
+    s.add_argument("--to", dest="date_to", default=None, help="YYYY-MM-DD")
+    s.add_argument("--sender", default=None, help="발신자 (outlook_mail)")
+    s.add_argument("-k", type=int, default=8)
+    s.add_argument("--fts-only", action="store_true", help="벡터 검색 생략 (키 없을 때 자동)")
+    s.add_argument("--excerpt", action="store_true", help="마크다운에 발췌(≤6000자) 포함")
+    s.set_defaults(func=cmd_search)
+
     return p
 
 

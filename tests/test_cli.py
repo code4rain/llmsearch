@@ -91,3 +91,85 @@ def test_schema_mismatch_exit_4(env, capsys):
     conn.close()
     code, _, err = _run(["status"], capsys)
     assert code == 4 and "재구축" in err
+
+
+def test_search_json_with_fake_embedder(env, capsys):
+    _index(env.data)
+    code, out, err = _run(["search", "프로젝트A 킥오프 회의록", "--json"], capsys, embedder=EMB)
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["fts_only"] is False and payload["query"] == "프로젝트A 킥오프 회의록"
+    hit = payload["hits"][0]
+    assert hit["source_id"] == "kickoff.md"
+    for key in ("source_type", "title", "url_or_path", "updated_at", "score", "snippet", "excerpt"):
+        assert key in hit
+    assert "FTS 전용" not in err
+
+
+def test_search_records_usage_like_gui(env, capsys):
+    _index(env.data)
+    _run(["search", "킥오프", "--json"], capsys, embedder=EMB)
+    assert (env.data / "usage.json").exists()  # CountingEmbedder 경로
+
+
+def test_search_markdown_has_source_id_and_path(env, capsys):
+    _index(env.data)
+    code, out, _ = _run(["search", "킥오프 회의록"], capsys, embedder=EMB)
+    assert code == 0
+    assert "프로젝트A 킥오프" in out and "id: kickoff.md" in out and "/n/kickoff.md" in out
+    assert "excerpt" not in out.lower()
+
+
+def test_search_excerpt_flag(env, capsys):
+    _index(env.data)
+    _, out, _ = _run(["search", "킥오프 회의록", "--excerpt"], capsys, embedder=EMB)
+    assert "> " in out and "일정과 담당자 결정" in out
+
+
+def test_search_without_key_falls_back_to_fts_with_warning(env, capsys):
+    _index(env.data)
+    code, out, err = _run(["search", "킥오프 회의록", "--json"], capsys)  # embedder 미주입 + 키 없음
+    assert code == 0 and json.loads(out)["fts_only"] is True
+    assert "FTS 전용" in err and "하이브리드" in err
+
+
+def test_search_fts_only_flag_skips_embedder(env, capsys):
+    _index(env.data)
+
+    class Boom:
+        def embed(self, texts):
+            raise AssertionError("호출되면 안 됨")
+
+    code, out, _ = _run(["search", "킥오프", "--fts-only", "--json"], capsys, embedder=Boom())
+    assert code == 0 and json.loads(out)["fts_only"] is True
+
+
+def test_search_filters_forwarded(env, capsys):
+    _index(env.data)
+    _, out, _ = _run(["search", "프로젝트A", "--source", "local_docs", "--json"], capsys, embedder=EMB)
+    hits = json.loads(out)["hits"]
+    assert hits and all(h["source_type"] == "local_docs" for h in hits)
+    _, out, _ = _run(["search", "회의", "--sender", "kim@corp.com", "--json"], capsys, embedder=EMB)
+    assert [h["source_id"] for h in json.loads(out)["hits"]] == ["m1"]
+    _, out, _ = _run(["search", "킥오프", "--from", "2027-01-01", "--json"], capsys, embedder=EMB)
+    assert json.loads(out)["hits"] == []
+
+
+def test_search_bad_source_or_date_exit_2(env, capsys):
+    _index(env.data)
+    code, _, err = _run(["search", "x", "--source", "bogus"], capsys, embedder=EMB)
+    assert code == 2 and "bogus" in err
+    code, _, err = _run(["search", "x", "--from", "2026/01/01"], capsys, embedder=EMB)
+    assert code == 2 and "YYYY-MM-DD" in err
+    code, _, err = _run(["search", "x", "--sender", "a@b", "--source", "notes"], capsys, embedder=EMB)
+    assert code == 2 and "outlook_mail" in err
+
+
+def test_search_no_hits_exit_0(env, capsys):
+    # 실동작 조정: search.search는 임베더가 주어지면 벡터 후보를 임계값 없이(전량 소규모
+    # 코퍼스에서는 사실상 전체 문서) 반환하므로 하이브리드 모드에서는 무관한 질의도 히트가
+    # 나온다. "히트 없음" 계약을 결정적으로 검증하려면 벡터 단계를 배제하는 --fts-only가
+    # 필요하다(별도 테스트인 test_search_fts_only_flag_skips_embedder가 그 플래그 자체를 검증).
+    _index(env.data)
+    code, out, _ = _run(["search", "존재하지않는zzz", "--fts-only", "--json"], capsys, embedder=EMB)
+    assert code == 0 and json.loads(out)["hits"] == []
