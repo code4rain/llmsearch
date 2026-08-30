@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import traceback
 from dataclasses import asdict
@@ -297,96 +298,118 @@ def run_sync(state: dict, source: str) -> dict:
             state["log"].insert(0, entry)
             del state["log"][200:]
             return entry
-        if source in WINDOWS_ONLY_SOURCES and not _outlook_available(state):
-            # WSL은 개발·테스트용 — win32com이 없어 COM 트레이스백만 쌓이므로 조용히 거절한다.
-            # 수동 동기화(/api/sync/outlook_*)도 이 게이트를 거친다 (스케줄러 필터와 별개).
+        # 크로스 프로세스 상호배제: GUI 스케줄러와 CLI `llmsearch sync`가 서로 다른 프로세스에서
+        # 동시에 돌면 sync_state(미스 카운터)를 각자 왕복 저장해 한쪽이 덮어써진다(lost update) —
+        # 보수적 삭제 판정이 무너진다. Windows에는 fcntl이 없으므로 SQLite 자신의 파일 잠금을
+        # 락으로 쓴다: 크로스 플랫폼이고, 프로세스가 죽으면 OS가 핸들을 닫아 락이 자동 해제된다
+        # (stale lock 처리 불필요). data_dir은 위 conn 가드를 통과했으면 반드시 존재한다.
+        lock_conn = None
+        try:
+            lock_conn = sqlite3.connect(cfg.data_dir / "sync.lock.db", timeout=0)
+            lock_conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            if lock_conn is not None:
+                lock_conn.close()
             entry["ok"] = False
-            entry["error"] = _WINDOWS_ONLY_MSG
-            _logger.info("%s 동기화 건너뜀(Windows 전용): %s", source, entry["error"])
-            state["log"].insert(0, entry)
-            del state["log"][200:]
-            return entry
-        tracker: UsageTracker = state["usage"]
-        if not tracker.indexing_allowed():
-            # 스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지 — 검색·답변 경로는 이 게이트를
-            # 지나지 않으므로 계속 동작한다. 다음 날이 되면 카운터가 롤오버되어 자동 재개.
-            entry["ok"] = False
-            entry["error"] = (
-                f"일일 API 호출 상한({tracker.daily_limit}건) 도달 — 오늘 누적 "
-                f"{tracker.today_total()}건. 요약·인덱싱을 일시정지합니다 (검색·답변은 계속 가능)."
-            )
-            _logger.warning("%s 동기화 건너뜀: %s", source, entry["error"])
+            entry["error"] = "다른 프로세스가 동기화 중입니다 (GUI/CLI 동시 실행) — 잠시 후 다시 시도하세요"
+            _logger.info("%s 동기화 건너뜀(크로스 프로세스 락): %s", source, entry["error"])
             state["log"].insert(0, entry)
             del state["log"][200:]
             return entry
         try:
-            prev = indexer.get_sync_state(conn, source)
-            rules_md = load_rules_md(cfg.rules_md_path)
-            if source == "notes":
-                folders = cfg.notes_folders + ([cfg.exports_dir] if cfg.export_to_notes else [])
-                result = sync_notes(folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
-            elif source == "local_docs":
-                prior_map = {
-                    sid: pm for sid in list(prev.get("files", {}))
-                    if (pm := indexer.get_para_map(conn, sid))
-                }
-                result = sync_local_docs(
-                    folders=cfg.watch_folders, excludes=cfg.exclude, overrides=cfg.para_overrides,
-                    summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
-                    projects=cfg.projects, areas=cfg.areas,
-                    glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
-                    summary_rules=rules_md.get("요약 규칙", ""),
-                    state=prev, prior_map=prior_map,
-                    renderer=_get_slide_renderer(state),
-                    force_reindex=bool(state.get("force_reindex_local_docs")),
+            if source in WINDOWS_ONLY_SOURCES and not _outlook_available(state):
+                # WSL은 개발·테스트용 — win32com이 없어 COM 트레이스백만 쌓이므로 조용히 거절한다.
+                # 수동 동기화(/api/sync/outlook_*)도 이 게이트를 거친다 (스케줄러 필터와 별개).
+                entry["ok"] = False
+                entry["error"] = _WINDOWS_ONLY_MSG
+                _logger.info("%s 동기화 건너뜀(Windows 전용): %s", source, entry["error"])
+                state["log"].insert(0, entry)
+                del state["log"][200:]
+                return entry
+            tracker: UsageTracker = state["usage"]
+            if not tracker.indexing_allowed():
+                # 스펙 §10: 상한 도달 시 요약·인덱싱만 일시정지 — 검색·답변 경로는 이 게이트를
+                # 지나지 않으므로 계속 동작한다. 다음 날이 되면 카운터가 롤오버되어 자동 재개.
+                entry["ok"] = False
+                entry["error"] = (
+                    f"일일 API 호출 상한({tracker.daily_limit}건) 도달 — 오늘 누적 "
+                    f"{tracker.today_total()}건. 요약·인덱싱을 일시정지합니다 (검색·답변은 계속 가능)."
                 )
-            elif source == "outlook_mail":
-                client = _get_outlook_client(state)
-                result = sync_outlook_mail(
-                    client, cfg.mail_folders, cfg.mail_since_days, cfg.exclude,
-                    prev, batch_size=cfg.mail_batch_size,
-                )
-            elif source == "outlook_cal":
-                client = _get_outlook_client(state)
-                result = sync_outlook_cal(client, cfg.cal_past_days, cfg.cal_future_days, prev)
-            elif source == "confluence":
-                client = _get_atlassian_client(state, "confluence")
-                result = sync_confluence(client, state["registry"].confluence_page_ids(),
-                                         prev, cfg.data_dir / "confluence")
-            else:  # jira
-                client = _get_atlassian_client(state, "jira")
-                result = sync_jira(client, state["registry"].jira_keys(),
-                                   prev, cfg.data_dir / "jira")
-            entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
-            entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
-            for doc in result.documents:
-                if "summary_path" in doc.extra:
-                    indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
-            indexer.set_sync_state(conn, source, result.state)
-            if source == "local_docs" and state.get("force_reindex_local_docs"):
-                # 플래그는 커넥터가 정상 반환한 뒤에만 소비 — 마커도 이 시점에만 삭제 (스펙 M6 §6).
-                # 영속(마커 삭제 + commit)이 먼저 — 그 뒤에야 인메모리 플래그를 내린다. 순서가
-                # 반대면 커밋 전에 프로세스가 죽었을 때 마커는 남는데 플래그만 꺼진 상태가 된다.
-                rebuild.clear_marker(conn)
-                conn.commit()
-                state["force_reindex_local_docs"] = False
-        except httpx.HTTPStatusError as exc:
-            conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
-            entry["ok"] = False
-            if exc.response.status_code == 401 and source in ("confluence", "jira"):
-                # 실패한 서비스의 클라이언트만 리셋 — 다음 동기화 때 diagnose()가 다시 돈다
-                # (스펙 §7.2 P0, 앱 재시작 없이 복구). 다른 서비스 세션은 그대로 유지.
-                state[f"{source}_client"] = None
-                entry["error"] = _AUTH_EXPIRED_MSG
-                _logger.warning("Atlassian 401 — %s 클라이언트 캐시 리셋: %s", source, _AUTH_EXPIRED_MSG)
-            else:
+                _logger.warning("%s 동기화 건너뜀: %s", source, entry["error"])
+                state["log"].insert(0, entry)
+                del state["log"][200:]
+                return entry
+            try:
+                prev = indexer.get_sync_state(conn, source)
+                rules_md = load_rules_md(cfg.rules_md_path)
+                if source == "notes":
+                    folders = cfg.notes_folders + ([cfg.exports_dir] if cfg.export_to_notes else [])
+                    result = sync_notes(folders, cfg.exclude, prev, extra_files=[cfg.rules_md_path])
+                elif source == "local_docs":
+                    prior_map = {
+                        sid: pm for sid in list(prev.get("files", {}))
+                        if (pm := indexer.get_para_map(conn, sid))
+                    }
+                    result = sync_local_docs(
+                        folders=cfg.watch_folders, excludes=cfg.exclude, overrides=cfg.para_overrides,
+                        summarizer=state["summarizer"], summaries_dir=cfg.summaries_dir,
+                        projects=cfg.projects, areas=cfg.areas,
+                        glossary=rules_md.get("용어집", ""), class_rules=rules_md.get("분류 규칙", ""),
+                        summary_rules=rules_md.get("요약 규칙", ""),
+                        state=prev, prior_map=prior_map,
+                        renderer=_get_slide_renderer(state),
+                        force_reindex=bool(state.get("force_reindex_local_docs")),
+                    )
+                elif source == "outlook_mail":
+                    client = _get_outlook_client(state)
+                    result = sync_outlook_mail(
+                        client, cfg.mail_folders, cfg.mail_since_days, cfg.exclude,
+                        prev, batch_size=cfg.mail_batch_size,
+                    )
+                elif source == "outlook_cal":
+                    client = _get_outlook_client(state)
+                    result = sync_outlook_cal(client, cfg.cal_past_days, cfg.cal_future_days, prev)
+                elif source == "confluence":
+                    client = _get_atlassian_client(state, "confluence")
+                    result = sync_confluence(client, state["registry"].confluence_page_ids(),
+                                             prev, cfg.data_dir / "confluence")
+                else:  # jira
+                    client = _get_atlassian_client(state, "jira")
+                    result = sync_jira(client, state["registry"].jira_keys(),
+                                       prev, cfg.data_dir / "jira")
+                entry["indexed"] = indexer.index_documents(conn, result.documents, state["embedder"])
+                entry["deleted"] = indexer.delete_documents(conn, source, result.deleted_ids)
+                for doc in result.documents:
+                    if "summary_path" in doc.extra:
+                        indexer.set_para_map(conn, doc.source_id, doc.extra["para_path"], doc.extra["summary_path"])
+                indexer.set_sync_state(conn, source, result.state)
+                if source == "local_docs" and state.get("force_reindex_local_docs"):
+                    # 플래그는 커넥터가 정상 반환한 뒤에만 소비 — 마커도 이 시점에만 삭제 (스펙 M6 §6).
+                    # 영속(마커 삭제 + commit)이 먼저 — 그 뒤에야 인메모리 플래그를 내린다. 순서가
+                    # 반대면 커밋 전에 프로세스가 죽었을 때 마커는 남는데 플래그만 꺼진 상태가 된다.
+                    rebuild.clear_marker(conn)
+                    conn.commit()
+                    state["force_reindex_local_docs"] = False
+            except httpx.HTTPStatusError as exc:
+                conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
+                entry["ok"] = False
+                if exc.response.status_code == 401 and source in ("confluence", "jira"):
+                    # 실패한 서비스의 클라이언트만 리셋 — 다음 동기화 때 diagnose()가 다시 돈다
+                    # (스펙 §7.2 P0, 앱 재시작 없이 복구). 다른 서비스 세션은 그대로 유지.
+                    state[f"{source}_client"] = None
+                    entry["error"] = _AUTH_EXPIRED_MSG
+                    _logger.warning("Atlassian 401 — %s 클라이언트 캐시 리셋: %s", source, _AUTH_EXPIRED_MSG)
+                else:
+                    entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
+            except Exception as exc:
+                conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
+                entry["ok"] = False
                 entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
-        except Exception as exc:
-            conn.rollback()  # 실패한 트랜잭션의 부분 반영 방지 — 다음 동기화가 깨끗한 상태에서 시작
-            entry["ok"] = False
-            entry["error"] = f"{exc}\n{traceback.format_exc(limit=3)}"
-        state["log"].insert(0, entry)
-        del state["log"][200:]
+            state["log"].insert(0, entry)
+            del state["log"][200:]
+        finally:
+            lock_conn.rollback()  # 쓴 것이 없으므로 롤백으로 트랜잭션만 닫아 락을 해제한다
+            lock_conn.close()
     return entry
 
 

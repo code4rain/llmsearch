@@ -1064,3 +1064,60 @@ def test_static_index_html_shows_windows_only_label():
     html = html_path.read_text(encoding="utf-8")
     assert "Windows 전용" in html
     assert "s.unsupported" in html
+
+
+# ---- 크로스 프로세스 동기화 상호배제 (data_dir/sync.lock.db) ----------------
+
+def _app_sharing_data_dir(tmp_path: Path) -> TestClient:
+    """make_app과 같은 data_dir·notes 폴더를 쓰는 별도 앱/state (= 다른 프로세스 흉내)."""
+    cfg = Config(data_dir=tmp_path / "data", notes_folders=[tmp_path / "notes"],
+                 projects=["프로젝트A"])
+    app = create_app(cfg, embedder=FakeEmbeddings(), summarizer=FakeSummarizer(),
+                     answerer=FakeAnswerer(), enable_scheduler=False)
+    return TestClient(app, base_url="http://127.0.0.1")
+
+
+def test_run_sync_refused_while_other_process_holds_lock(tmp_path: Path):
+    client = make_app(tmp_path)
+    other = _app_sharing_data_dir(tmp_path)
+    state = other.app.state.llmsearch
+    lock_path = state["config"].data_dir / "sync.lock.db"
+
+    holder = sqlite3.connect(lock_path, timeout=0)  # 다른 프로세스가 잡고 있는 상황
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        entry = app_module.run_sync(state, "notes")
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert entry["ok"] is False
+    assert "다른 프로세스" in entry["error"]
+    assert entry["indexed"] == 0 and entry["deleted"] == 0
+    assert state["log"][0] is entry
+    rows = {s["source"]: s for s in client.get("/api/sources").json()}
+    assert rows["notes"]["doc_count"] == 0  # 인덱스 무변화
+
+    entry2 = app_module.run_sync(state, "notes")  # 해제 뒤에는 성공
+    assert entry2["ok"] is True and entry2["indexed"] == 1
+
+
+def test_run_sync_releases_cross_process_lock_on_exception(tmp_path: Path, monkeypatch):
+    client = make_app(tmp_path)
+    state = client.app.state.llmsearch
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(app_module, "sync_notes", boom)
+    entry = app_module.run_sync(state, "notes")
+    assert entry["ok"] is False and "boom" in entry["error"]
+
+    lock_path = state["config"].data_dir / "sync.lock.db"
+    probe = sqlite3.connect(lock_path, timeout=0)
+    probe.execute("BEGIN IMMEDIATE")  # 예외 뒤에도 락이 남아 있으면 여기서 OperationalError
+    probe.rollback()
+    probe.close()
+
+    monkeypatch.undo()
+    assert app_module.run_sync(state, "notes")["ok"] is True
