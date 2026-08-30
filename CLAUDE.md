@@ -7,6 +7,7 @@
 - Test: `./.venv/bin/pytest` (WSL 실행 가능, API 키 불필요 — 전부 Fake/Mock)
 - Run: `./.venv/bin/python -m llmsearch` (실사용은 Windows Python — COM 필요)
 - E2E: `docs/HANDOFF.md`의 Playwright 절 참조
+- CLI/스킬: `./.venv/bin/llmsearch {search|get|status|sync}` — 설치 `skills/llmsearch/scripts/install.sh` (전역 설정 `~/.llmsearch/`)
 
 ## 📐 Architecture & Standards
 - Python 3.12 · FastAPI(127.0.0.1 고정) · SQLite(FTS5+sqlite-vec/numpy 폴백) · 요약=Gemini, 답변=Claude(`claude-opus-5`), 임베딩=Gemini 768차원 MRL+L2 재정규화

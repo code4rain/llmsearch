@@ -180,3 +180,17 @@ def test_hit_positional_constructor_compat():
 
     h = Hit("notes", "a.md", "제목", "/n/a.md", "2026-08-01", True, 1.0, "본문")
     assert h.snippet == ""
+
+
+def test_fts_only_when_embedder_none(tmp_path: Path):
+    conn = setup_index(tmp_path)
+    hits = search.search(conn, None, "킥오프 회의록")
+    assert hits and hits[0].source_id == "kickoff.md"
+    # 필터·감쇠 경로도 동일하게 동작
+    hits = search.search(conn, None, "프로젝트A", source_filter=["local_docs"])
+    assert hits and all(h.source_type == "local_docs" for h in hits)
+
+
+def test_fts_only_no_match_returns_empty(tmp_path: Path):
+    conn = setup_index(tmp_path)
+    assert search.search(conn, None, "존재하지않는단어zzz") == []

@@ -220,3 +220,41 @@ def test_recent_days_window_and_order(tmp_path: Path):
     assert t.recent_days(7) == [((today - timedelta(days=6)).isoformat(), 3), (today.isoformat(), 4)]
     assert t.recent_days(1) == [(today.isoformat(), 4)]
     assert UsageTracker(tmp_path / "none.json").recent_days(7) == []
+
+
+def test_record_merges_counts_written_by_another_process(tmp_path: Path):
+    """같은 usage.json을 공유하는 두 인스턴스(GUI + CLI)의 카운트가 서로를 덮어쓰지 않는다."""
+    path = tmp_path / "usage.json"
+    a = UsageTracker(path)
+    b = UsageTracker(path)
+    a.record("embed")   # 파일: 1
+    b.record("embed")   # b는 자기 메모리(0)+1이지만 디스크(1)와 병합 → 2여야 한다
+    a.record("embed")   # a도 디스크(2)와 병합 → 3
+    today = date.today().isoformat()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert sum(saved[today].values()) == 3
+
+
+def test_record_merge_takes_max_per_kind(tmp_path: Path):
+    """병합은 (날짜, 종류)별 max — 다른 인스턴스가 앞서 있으면 그 값을 따른다."""
+    path = tmp_path / "usage.json"
+    t = UsageTracker(path)
+    t.record("embed", 2)
+    today = date.today().isoformat()
+    path.write_text(json.dumps({today: {"embed": 10, "summary": 4}}), encoding="utf-8")
+    t.record("embed")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved[today] == {"embed": 11, "summary": 4}
+    assert t.today_total() == 15
+
+
+def test_record_tolerates_corrupt_file_at_record_time(tmp_path: Path):
+    """기록 시점에 파일이 손상돼 있어도 죽지 않고 증분이 반영된다."""
+    path = tmp_path / "usage.json"
+    t = UsageTracker(path)
+    t.record("embed")
+    path.write_text("{broken", encoding="utf-8")
+    t.record("embed")
+    today = date.today().isoformat()
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved[today]["embed"] == 2

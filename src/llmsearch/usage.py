@@ -5,9 +5,10 @@
 웹 계층의 run_sync 진입 게이트이고, 트래커와 카운팅 래퍼 자신은 절대 차단하지 않는다.
 그래야 검색(쿼리 임베딩)·채팅 답변이 상한 도달 후에도 계속 동작한다 (스펙 §10:
 "상한 도달 시 요약·인덱싱만 일시정지, 검색은 유지").
-단일 앱 인스턴스를 전제한다 — 기동 시 1회 로드 후 매 record()마다 전체 dict를 덮어써서
-저장하므로, 동일 파일을 공유하는 다중 프로세스 인스턴스나 실행 중 수동 편집은 카운트가
-유실될 수 있다.
+기록 시점마다 파일을 다시 읽어 (날짜, 종류)별 max로 병합한 뒤 증분을 적용하므로, 같은
+usage.json을 공유하는 다중 프로세스(장수 GUI + 단발 CLI)에서도 서로의 카운트를 덮어쓰지
+않는다. 병합은 파일 락 없이 read-modify-write이므로 프로세스가 정확히 동시에 기록하면
+증분 1건이 유실될 수 있다 — 예산 감시용 카운터로는 허용 가능한 오차다.
 """
 from __future__ import annotations
 
@@ -35,16 +36,20 @@ class UsageTracker:
         # chat(FastAPI 스레드풀)과 run_sync(스케줄러/수동 동기화 스레드)가 동시에 기록한다 —
         # sync_lock은 run_sync 쪽만 잡으므로 트래커가 자체 락으로 dict 변이·파일 쓰기를 직렬화.
         self._lock = threading.Lock()
-        self._data: dict[str, dict[str, int]] = {}
-        if path.exists():
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(loaded, dict) or not all(isinstance(v, dict) for v in loaded.values()):
-                    raise ValueError("usage.json 형태가 잘못됨: dict-of-dicts 필요")
-                self._data = loaded
-            except (ValueError, OSError, UnicodeDecodeError):
-                logger.warning("usage.json 파싱 실패 — 카운터를 새로 시작합니다: %s", path)
-                self._data = {}
+        self._data: dict[str, dict[str, int]] = self._read_file()
+
+    def _read_file(self) -> dict[str, dict[str, int]]:
+        """디스크의 usage.json — 없거나 손상됐으면 빈 dict (경고만 남기고 진행)."""
+        if not self.path.exists():
+            return {}
+        try:
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict) or not all(isinstance(v, dict) for v in loaded.values()):
+                raise ValueError("usage.json 형태가 잘못됨: dict-of-dicts 필요")
+            return loaded
+        except (ValueError, OSError, UnicodeDecodeError):
+            logger.warning("usage.json 파싱 실패 — 카운터를 새로 시작합니다: %s", self.path)
+            return {}
 
     def _today(self) -> str:
         return date.today().isoformat()
@@ -55,6 +60,15 @@ class UsageTracker:
         if count < 1:
             raise ValueError(f"count는 1 이상이어야 함: {count}")
         with self._lock:
+            # 다른 프로세스(GUI ↔ CLI)가 그 사이에 기록했을 수 있다 — 파일을 다시 읽어
+            # (날짜, 종류)별 max로 병합한 뒤 증분을 얹는다. max를 쓰는 이유는 어느 쪽도
+            # 상대의 증분 횟수를 알 수 없기 때문 — 앞선 값을 채택해 과소집계를 막는다.
+            on_disk = self._read_file()
+            for day, kinds in on_disk.items():
+                mine = self._data.setdefault(day, {})
+                for kind_name, value in kinds.items():
+                    if isinstance(value, int) and value > mine.get(kind_name, 0):
+                        mine[kind_name] = value
             today = self._today()
             day_data = self._data.setdefault(today, {})
             day_data[kind] = day_data.get(kind, 0) + count

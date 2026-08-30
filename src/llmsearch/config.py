@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
+from dotenv import find_dotenv, load_dotenv
 
 
 @dataclass
@@ -76,3 +78,40 @@ def load_config(path: Path) -> Config:
         daily_api_call_limit=int(limits.get("daily_api_calls", 0)),
         export_to_notes=bool(chat.get("export_to_notes", False)),
     )
+
+
+class ConfigNotFound(FileNotFoundError):
+    """설정 파일이 없음 — 메시지에 찾은 경로와 설치 안내를 담는다 (스킬 스펙 §3)."""
+
+
+def llmsearch_home() -> Path:
+    """전역 기준 디렉터리 — `$LLMSEARCH_HOME` 또는 `~/.llmsearch`."""
+    return Path(os.environ.get("LLMSEARCH_HOME") or (Path.home() / ".llmsearch"))
+
+
+def resolve_config_path(explicit: Path | None = None) -> Path:
+    """설정 경로 결정: 인자 > $LLMSEARCH_CONFIG > $LLMSEARCH_HOME/config.yaml.
+
+    '지정된 첫 후보'를 쓴다 — 존재하는 것을 찾아 내려가지 않는다(어느 설정이 읽혔는지 항상 결정적).
+    """
+    if explicit is not None:
+        path = Path(explicit)
+    elif os.environ.get("LLMSEARCH_CONFIG"):
+        path = Path(os.environ["LLMSEARCH_CONFIG"])
+    else:
+        path = llmsearch_home() / "config.yaml"
+    if not path.exists():
+        raise ConfigNotFound(
+            f"설정 파일이 없습니다: {path}\n"
+            "  --config PATH 또는 LLMSEARCH_CONFIG로 지정하거나, "
+            "skills/llmsearch/scripts/install.sh 로 ~/.llmsearch/config.yaml을 만드세요."
+        )
+    return path
+
+
+def load_env() -> None:
+    """`.env` 로드: 실제 환경변수 > cwd(상위 포함) .env > $LLMSEARCH_HOME/.env (override=False)."""
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(found)
+    load_dotenv(llmsearch_home() / ".env")

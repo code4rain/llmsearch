@@ -16,6 +16,9 @@ dependencies = [
     "markdownify>=0.13",
 ]
 
+[project.scripts]
+llmsearch = "llmsearch.cli:main"
+
 [project.optional-dependencies]
 vec = ["sqlite-vec>=0.1"]
 win = ["pywin32>=306"]

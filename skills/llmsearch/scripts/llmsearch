@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# llmsearch 스킬 래퍼 — 인터프리터를 찾아 `python -m llmsearch.cli`에 인자를 그대로 넘긴다.
+# 인터프리터 우선순위: $LLMSEARCH_PYTHON > $LLMSEARCH_HOME/env 의 LLMSEARCH_PYTHON= > python3
+# env 파일은 source하지 않는다 — KEY=VALUE 한 줄만 읽는다 (임의 코드 실행 방지).
+set -euo pipefail
+HOME_DIR="${LLMSEARCH_HOME:-${HOME:?HOME 또는 LLMSEARCH_HOME 환경변수가 필요합니다}/.llmsearch}"
+PY="${LLMSEARCH_PYTHON:-}"
+if [ -z "$PY" ] && [ -f "$HOME_DIR/env" ]; then
+  PY="$(sed -n 's/^LLMSEARCH_PYTHON=//p' "$HOME_DIR/env" | head -n1 | tr -d '\r')"
+fi
+PY="${PY:-python3}"
+exec "$PY" -m llmsearch.cli "$@"

@@ -473,7 +473,8 @@ def test_main_parses_rebuild_flags(monkeypatch, tmp_path: Path):
     calls = {}
     monkeypatch.setattr(m, "load_config", lambda p: Config(data_dir=tmp_path / "data"))
     monkeypatch.setattr(m, "create_app", lambda cfg: type("A", (), {"state": type("S", (), {"llmsearch": {"x": 1}})()})())
-    monkeypatch.setattr(m, "load_dotenv", lambda *a, **k: None)  # 실 .env가 os.environ에 새지 않게
+    monkeypatch.setattr(m, "load_env", lambda: None)  # 실 .env가 os.environ에 새지 않게
+    monkeypatch.setattr(m, "resolve_config_path", lambda explicit: explicit)
     monkeypatch.setattr(m, "run_cli", lambda state, run_sync, sources, yes, force: calls.update(yes=yes, force=force, state=state) or 0)
     monkeypatch.setattr(m, "_scheduled_sources", lambda state: ["notes"])
     monkeypatch.setattr(m.uvicorn, "run", lambda *a, **k: calls.update(served=True))
