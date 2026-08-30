@@ -386,8 +386,25 @@ def test_sync_multiline_error_kept_out_of_table(env, capsys):
     row = next(ln for ln in out.splitlines() if ln.startswith("| notes |"))
     assert "boom" in row and row.endswith(" |")  # 표 셀은 한 줄 — 개행이 행을 깨지 않는다
     assert "Traceback" not in row
-    assert "### notes error" in out and "Traceback (most recent call last):" in out
+    assert "### notes error" in out
     assert out.index("### notes error") > out.index(row)  # 전문은 표 뒤
+    # 전문은 백틱 fence가 아니라 4칸 들여쓰기 블록 — 모든 줄이 들여써진다
+    assert "    Traceback (most recent call last):" in out
+    assert "    boom" in out
+    assert "```" not in out
+
+
+def test_sync_error_containing_code_fence_does_not_break_out(env, capsys):
+    """오류 본문에 ``` 줄이 있어도 마크다운 블록이 조기 종료되지 않는다."""
+    err_text = "boom\n```\nrm -rf /\n```\nend"
+    code, out, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory_error(err_text),
+                        server_alive=lambda p: False)
+    assert code == 1
+    assert "### notes error" in out
+    body = out[out.index("### notes error"):].splitlines()[1:]
+    assert not any(ln == "```" for ln in body)  # fence 조기 종료 없음
+    for ln in ("boom", "```", "rm -rf /", "end"):
+        assert f"    {ln}" in out  # 원문은 들여쓰기 블록으로 보존
 
 
 def test_sync_long_error_truncated_in_table(env, capsys):

@@ -268,7 +268,10 @@ def cmd_sync(args) -> int:
            f"{_error_cell(e['error'])} |" for e in entries]
     for e in entries:
         if e["error"]:
-            md += ["", f"### {e['source']} error", "```", str(e["error"]).rstrip(), "```"]
+            # 백틱 fence 대신 4칸 들여쓰기 블록 — 오류 본문에 ``` 줄이 섞여 있어도
+            # 블록이 조기 종료되지 않는다 (원격 문서 제목·응답이 그대로 실릴 수 있다).
+            body = [f"    {ln}" for ln in str(e["error"]).rstrip().splitlines()]
+            md += ["", f"### {e['source']} error", ""] + body
     _emit(args, {"ok": ok, "entries": entries}, "\n".join(md))
     return EXIT_OK if ok else EXIT_FAIL
 
