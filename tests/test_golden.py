@@ -76,7 +76,8 @@ def test_main_default_golden_path_and_missing_file(tmp_path: Path, monkeypatch, 
 	import llmsearch.eval.golden as g
 	from llmsearch.config import Config
 
-	monkeypatch.setattr(g, "load_dotenv", lambda *a, **k: None)
+	monkeypatch.setattr(g, "load_env", lambda: None)
+	monkeypatch.setattr(g, "resolve_config_path", lambda explicit: explicit)
 	monkeypatch.setattr(g, "load_config", lambda p: Config(data_dir=tmp_path / "data"))
 	monkeypatch.setattr("sys.argv", ["golden", "--config", "c.yaml"])
 	import pytest

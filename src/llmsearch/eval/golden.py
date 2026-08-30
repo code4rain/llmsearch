@@ -6,10 +6,9 @@ import sys
 from pathlib import Path
 
 import yaml
-from dotenv import load_dotenv
 
 from .. import db, search
-from ..config import load_config
+from ..config import ConfigNotFound, load_config, load_env, resolve_config_path
 
 
 def _matches(expected: str, sid: str) -> bool:
@@ -59,12 +58,16 @@ def evaluate(conn, embedder, cases: list[dict]) -> dict:
 
 
 def main():
-	load_dotenv()
+	load_env()
 	parser = argparse.ArgumentParser()
-	parser.add_argument("--config", type=Path, required=True)
+	parser.add_argument("--config", type=Path, default=None)
 	parser.add_argument("--golden", type=Path, default=None)
 	args = parser.parse_args()
-	cfg = load_config(args.config)
+	try:
+		cfg = load_config(resolve_config_path(args.config))
+	except ConfigNotFound as exc:
+		print(str(exc))
+		return 2
 	golden_path = args.golden or (cfg.data_dir / "golden.yaml")
 	if not golden_path.exists():
 		print(f"golden.yaml이 없습니다: {golden_path}")

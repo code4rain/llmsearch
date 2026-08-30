@@ -168,3 +168,16 @@ def test_load_env_order(monkeypatch, tmp_path: Path):
     assert os.environ["LLMS_T_HOME_ONLY"] == "h"   # HOME .env 채움
     assert os.environ["LLMS_T_BOTH"] == "c"        # cwd가 HOME보다 우선
     assert os.environ["LLMS_T_REAL"] == "real"     # 실제 환경변수 최우선
+
+
+def test_main_config_optional_uses_resolver(monkeypatch, tmp_path: Path, capsys):
+    """`python -m llmsearch`가 --config 없이 전역 설정을 쓰고, 없으면 exit 2로 안내."""
+    import llmsearch.__main__ as entry
+    monkeypatch.setenv("LLMSEARCH_HOME", str(tmp_path / "nohome"))
+    monkeypatch.delenv("LLMSEARCH_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("sys.argv", ["llmsearch"])
+    with pytest.raises(SystemExit) as exc:
+        entry.main()
+    assert exc.value.code == 2
+    assert "설정 파일이 없습니다" in capsys.readouterr().err
