@@ -24,6 +24,18 @@
 ## 실행
 `python -m llmsearch --config config.yaml` → http://127.0.0.1:8642
 
+## Claude 스킬로 쓰기
+
+어느 디렉터리의 Claude Code 세션에서든 인덱스를 검색해 출처와 함께 답하게 한다. 답변은 세션이 쓰고, 검색·문서 조회·상태·동기화는 결정적 CLI가 수행한다.
+
+1. `skills/llmsearch/scripts/install.sh` — `~/.llmsearch/{config.yaml,.env,env}` 초기화(있으면 보존) + `~/.claude/skills/llmsearch` 링크
+2. `~/.llmsearch/config.yaml`의 `data_dir` 등을 실제 값으로, `~/.llmsearch/.env`에 `GEMINI_API_KEY`를 기입 (키가 없으면 키워드(FTS) 검색만 수행)
+3. `skills/llmsearch/scripts/llmsearch status`로 확인
+
+설정 우선순위: `--config` > `LLMSEARCH_CONFIG` > `~/.llmsearch/config.yaml` (`LLMSEARCH_HOME`로 이동 가능). 서버(`python -m llmsearch`)도 같은 규칙을 쓰므로 `--config`를 생략할 수 있다.
+
+CLI: `llmsearch search "질의" [--source S] [--from D] [--to D] [--sender X] [-k N] [--excerpt] [--json]` · `get SOURCE_TYPE ID` · `status` · `sync SOURCE|all`(서버 실행 중이면 거부). exit: 0 성공 / 1 실패 / 2 설정·인자 / 3 서버 실행 중 / 4 스키마 불일치.
+
 ## 평가
 `golden.yaml`에 `[{question, expect_source_id}]` 작성 후:
 `python -m llmsearch.eval.golden --config config.yaml --golden golden.yaml`

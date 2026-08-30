@@ -1,7 +1,7 @@
 # llmsearch 작업 인수인계 지시서
 
 > 이 repo를 clone한 뒤 다른 Claude 세션에서 작업을 이어가기 위한 문서.
-> 마지막 갱신: 2026-08-30 (WSL 개발·테스트 지원 정리 머지 완료 — 다음: M9 로컬 임베딩 스파이크)
+> 마지막 갱신: 2026-08-31 (Claude 스킬화 머지 완료 — 다음: M9 로컬 임베딩 스파이크)
 
 ## 1. 현재 상태
 
@@ -17,9 +17,10 @@
 | M7 검색 품질·평가 | ✅ 머지 | 채팅 필터(선검색 강제·툴 기본값·Claude 고지), 툴 스키마 현행화, 출처 발췌, 골든 평가 GUI |
 | M8 채팅 UX | ✅ 머지 | 세션 저장/복원(chats.db)·내보내기(export_to_notes)·출처 미리보기 |
 | WSL 개발·테스트 지원 정리 | ✅ 머지 | Windows 전용 Outlook 소스(`IS_WINDOWS`/`_outlook_available`) 스케줄러 자동 제외·수동 동기화 안내 메시지·소스 탭 "Windows 전용" 표시, 환경별 README |
+| Claude 스킬화 | ✅ 머지 | 전역 설정(`~/.llmsearch`, resolver·load_env), `llmsearch` CLI(search/get/status/sync — GUI 함수 재사용, FTS 폴백, 서버 감지), `skills/llmsearch`(SKILL.md·래퍼·install.sh) — 스펙 `2026-08-31-claude-skill-design.md` |
 
-- 테스트 기준: **376 passed** (`./.venv/bin/pytest`)
-- E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가; WSL 지원 변경은 Fake 주입 경로만 건드려 E2E 시나리오 수 불변)
+- 테스트 기준: **426 passed** (`./.venv/bin/pytest`)
+- E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가; WSL 지원 변경은 Fake 주입 경로만 건드려 E2E 시나리오 수 불변; Claude 스킬화(문서·CLI·install.sh만 변경, GUI 무변경)는 §2 절차대로 재실행해 80/80 재확인함)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
 ## 2. 환경 셋업 (clone 직후)
@@ -27,7 +28,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 376 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 426 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```
