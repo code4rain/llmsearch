@@ -67,7 +67,7 @@ def _filter_clause(
 
 def search(
     conn: sqlite3.Connection,
-    embedder: EmbeddingProvider,
+    embedder: EmbeddingProvider | None,
     query: str,
     source_filter: list[str] | None = None,
     date_from: str | None = None,
@@ -75,12 +75,6 @@ def search(
     sender: str | None = None,
     k: int = 12,
 ) -> list[Hit]:
-    if query not in _QUERY_CACHE:
-        if len(_QUERY_CACHE) > 512:
-            _QUERY_CACHE.clear()
-        _QUERY_CACHE[query] = embedder.embed([query])[0]
-    qvec = _QUERY_CACHE[query]
-
     date_to_bound = date_to
     if date_to and len(date_to) == 10:  # bare YYYY-MM-DD → 해당 날짜 자정까지 포함
         date_to_bound = date_to + "T23:59:59"
@@ -88,22 +82,30 @@ def search(
     where_sql, filter_params = _filter_clause(source_filter, date_from, date_to_bound, sender)
     has_filter = bool(where_sql)
 
-    # 구조 필터는 후보 검색(retrieval) 단계에서부터 적용한다 — 필터링을 상위-k 컷 이후로
-    # 미루면(post-filter) 필터에 맞는 문서가 top-CANDIDATES 밖으로 밀려나 있을 때
-    # 결과가 통째로 사라진다 (스펙 §8 P0).
-    if has_filter:
-        # sqlite-vec vec0은 임의의 JOIN 필터를 신뢰성 있게 지원하지 않으므로,
-        # k*10(상한 300)만큼 넉넉히 벡터 후보를 뽑은 뒤 허용 chunk_id 집합으로 걸러낸다.
-        allowed_rows = conn.execute(
-            f"SELECT c.id FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE 1=1{where_sql}",
-            filter_params,
-        ).fetchall()
-        allowed_chunk_ids = {r[0] for r in allowed_rows}
-        overfetch = min(max(k * 10, CANDIDATES), 300)
-        vec_candidates = search_embeddings(conn, qvec, overfetch)
-        vec_hits = [(cid, dist) for cid, dist in vec_candidates if cid in allowed_chunk_ids][:CANDIDATES]
+    if embedder is None:
+        vec_hits: list[tuple[int, float]] = []  # FTS 전용 (CLI 키 없음 폴백) — 순위는 GUI 하이브리드와 다르다
     else:
-        vec_hits = search_embeddings(conn, qvec, CANDIDATES)      # [(chunk_id, dist)]
+        if query not in _QUERY_CACHE:
+            if len(_QUERY_CACHE) > 512:
+                _QUERY_CACHE.clear()
+            _QUERY_CACHE[query] = embedder.embed([query])[0]
+        qvec = _QUERY_CACHE[query]
+        # 구조 필터는 후보 검색(retrieval) 단계에서부터 적용한다 — 필터링을 상위-k 컷 이후로
+        # 미루면(post-filter) 필터에 맞는 문서가 top-CANDIDATES 밖으로 밀려나 있을 때
+        # 결과가 통째로 사라진다 (스펙 §8 P0).
+        if has_filter:
+            # sqlite-vec vec0은 임의의 JOIN 필터를 신뢰성 있게 지원하지 않으므로,
+            # k*10(상한 300)만큼 넉넉히 벡터 후보를 뽑은 뒤 허용 chunk_id 집합으로 걸러낸다.
+            allowed_rows = conn.execute(
+                f"SELECT c.id FROM chunks c JOIN documents d ON d.id = c.doc_id WHERE 1=1{where_sql}",
+                filter_params,
+            ).fetchall()
+            allowed_chunk_ids = {r[0] for r in allowed_rows}
+            overfetch = min(max(k * 10, CANDIDATES), 300)
+            vec_candidates = search_embeddings(conn, qvec, overfetch)
+            vec_hits = [(cid, dist) for cid, dist in vec_candidates if cid in allowed_chunk_ids][:CANDIDATES]
+        else:
+            vec_hits = search_embeddings(conn, qvec, CANDIDATES)      # [(chunk_id, dist)]
 
     fts_rows = conn.execute(
         f"""SELECT c.id FROM chunks_fts
