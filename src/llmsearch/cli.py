@@ -191,6 +191,52 @@ def cmd_get(args) -> int:
     return EXIT_OK
 
 
+# ---- sync -------------------------------------------------------------
+
+class _UnusedAnswerer:
+    """create_app의 answerer 자리 — sync는 답변자를 쓰지 않으므로 Anthropic 클라이언트를 만들지 않는다."""
+
+
+def _default_server_alive(port: int) -> bool:
+    import httpx  # 지연 import
+    try:
+        return httpx.get(f"http://127.0.0.1:{port}/api/status", timeout=0.5).status_code == 200
+    except httpx.HTTPError:
+        return False
+
+
+def _default_app_factory(cfg: Config) -> dict:
+    if not os.environ.get("GEMINI_API_KEY"):
+        raise CliError(EXIT_USAGE, "동기화에는 GEMINI_API_KEY가 필요합니다 (~/.llmsearch/.env)")
+    from .web.app import create_app  # 지연 import — GUI와 동일한 상태 구성(사용량 게이트·Windows 게이트 포함)
+    return create_app(cfg, answerer=_UnusedAnswerer(), enable_scheduler=False).state.llmsearch
+
+
+def cmd_sync(args) -> int:
+    _, cfg = _load(args)
+    alive = args._server_alive or _default_server_alive
+    if alive(args.port):
+        raise CliError(EXIT_SERVER_RUNNING,
+                       f"llmsearch 서버가 127.0.0.1:{args.port}에서 실행 중 — 이중 동기화를 막기 위해 거부합니다. "
+                       f"GUI 소스 탭 또는 POST /api/sync/{args.source}를 사용하세요")
+    factory = args._app_factory or _default_app_factory
+    state = factory(cfg)
+    if state.get("schema_mismatch"):
+        raise CliError(EXIT_SCHEMA, str(state["schema_mismatch"]))
+    if "_run_sync" in state:  # 테스트 주입 경로
+        run_sync, scheduled = state["_run_sync"], (lambda st: st["_scheduled"])
+    else:
+        from .web.app import _scheduled_sources as scheduled, run_sync
+    sources = scheduled(state) if args.source == "all" else [args.source]
+    entries = [run_sync(state, s) for s in sources]
+    ok = all(e["ok"] for e in entries)
+    md = ["| source | ok | indexed | deleted | error |", "|---|---|---|---|---|"]
+    md += [f"| {e['source']} | {'yes' if e['ok'] else 'no'} | {e['indexed']} | {e['deleted']} | {e['error'] or ''} |"
+           for e in entries]
+    _emit(args, {"ok": ok, "entries": entries}, "\n".join(md))
+    return EXIT_OK if ok else EXIT_FAIL
+
+
 # ---- parser / main --------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -222,6 +268,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("source_id")
     g.add_argument("--max-chars", type=int, default=20000)
     g.set_defaults(func=cmd_get)
+
+    y = sub.add_parser("sync", parents=[common],
+                        help="소스 동기화 (GUI run_sync와 동일 경로) — 서버 실행 중이면 거부")
+    y.add_argument("source", choices=(*SOURCES, "all"))
+    y.add_argument("--port", type=int, default=DEFAULT_PORT, help="서버 감지 포트")
+    y.set_defaults(func=cmd_sync)
 
     return p
 

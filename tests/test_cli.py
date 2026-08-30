@@ -196,3 +196,62 @@ def test_get_missing_exit_1(env, capsys):
     _index(env.data)
     code, _, err = _run(["get", "notes", "nope.md"], capsys)
     assert code == 1 and "nope.md" in err
+
+
+def _fake_factory(calls, ok=True, mismatch=None):
+    def factory(cfg):
+        state = {"schema_mismatch": mismatch, "registry": None}
+
+        def run_sync(st, source):
+            calls.append(source)
+            return {"source": source, "at": "t", "ok": ok, "indexed": 3, "deleted": 0,
+                    "error": None if ok else "boom"}
+        state["_run_sync"] = run_sync
+        state["_scheduled"] = ["notes", "local_docs"]
+        return state
+    return factory
+
+
+def test_sync_refused_when_server_running(env, capsys):
+    calls = []
+    code, _, err = _run(["sync", "notes"], capsys, app_factory=_fake_factory(calls),
+                        server_alive=lambda port: True)
+    assert code == 3 and "8642" in err and "/api/sync" in err and calls == []
+
+
+def test_sync_runs_run_sync_and_prints_entry(env, capsys):
+    calls = []
+    code, out, _ = _run(["sync", "notes", "--json"], capsys, app_factory=_fake_factory(calls),
+                        server_alive=lambda port: False)
+    assert code == 0 and calls == ["notes"]
+    assert json.loads(out)["entries"][0]["indexed"] == 3
+
+
+def test_sync_all_uses_scheduled_sources(env, capsys):
+    calls = []
+    code, _, _ = _run(["sync", "all"], capsys, app_factory=_fake_factory(calls), server_alive=lambda p: False)
+    assert code == 0 and calls == ["notes", "local_docs"]
+
+
+def test_sync_failure_exit_1(env, capsys):
+    code, out, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory([], ok=False),
+                        server_alive=lambda p: False)
+    assert code == 1 and "boom" in out
+
+
+def test_sync_schema_mismatch_exit_4(env, capsys):
+    code, _, err = _run(["sync", "notes"], capsys, app_factory=_fake_factory([], mismatch="schema v9 != v1"),
+                        server_alive=lambda p: False)
+    assert code == 4 and "schema v9" in err
+
+
+def test_sync_custom_port_passed_to_probe(env, capsys):
+    seen = []
+    _run(["sync", "notes", "--port", "9999"], capsys, app_factory=_fake_factory([]),
+         server_alive=lambda p: seen.append(p) or False)
+    assert seen == [9999]
+
+
+def test_sync_bad_source_exit_2(env, capsys):
+    code, _, _ = _run(["sync", "bogus"], capsys, app_factory=_fake_factory([]), server_alive=lambda p: False)
+    assert code == 2
