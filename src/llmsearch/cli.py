@@ -144,6 +144,8 @@ def _hit_markdown(i: int, h: dict, excerpt: bool) -> str:
 
 
 def cmd_search(args) -> int:
+    if args.k < 1:
+        raise CliError(EXIT_USAGE, "-k는 1 이상이어야 합니다")
     _, cfg = _load(args)
     filters = _parse_filters(args)
     embedder, fts_only = _resolve_embedder(args, cfg)
@@ -164,6 +166,8 @@ def cmd_search(args) -> int:
 # ---- get --------------------------------------------------------------
 
 def cmd_get(args) -> int:
+    if args.max_chars < 1:
+        raise CliError(EXIT_USAGE, "--max-chars는 1 이상이어야 합니다")
     _, cfg = _load(args)
     conn = _open_index(cfg)
     try:

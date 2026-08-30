@@ -255,3 +255,79 @@ def test_sync_custom_port_passed_to_probe(env, capsys):
 def test_sync_bad_source_exit_2(env, capsys):
     code, _, _ = _run(["sync", "bogus"], capsys, app_factory=_fake_factory([]), server_alive=lambda p: False)
     assert code == 2
+
+
+# ---- fix round 1: bounds validation (-k, --max-chars) ----------------------
+
+def test_search_k_zero_exit_2(env, capsys):
+    _index(env.data)
+    code, _, err = _run(["search", "킥오프", "-k", "0", "--json"], capsys, embedder=EMB)
+    assert code == 2 and "-k" in err
+
+
+def test_get_max_chars_zero_exit_2(env, capsys):
+    _index(env.data)
+    code, _, err = _run(["get", "notes", "kickoff.md", "--max-chars", "0"], capsys)
+    assert code == 2 and "--max-chars" in err
+
+
+# ---- fix round 1: default sync wiring (server-alive probe, app factory, ---
+# ---- and the non-test `_scheduled_sources`/`run_sync` import path) --------
+
+def test_default_app_factory_requires_gemini_key(env):
+    from llmsearch.config import load_config
+    cfg = load_config(env.cfg)  # GEMINI_API_KEY 없음 (env 픽스처가 delenv)
+    with pytest.raises(cli.CliError) as exc_info:
+        cli._default_app_factory(cfg)
+    assert exc_info.value.code == cli.EXIT_USAGE
+
+
+def test_default_server_alive_probes_status_endpoint(env, monkeypatch):
+    import httpx
+
+    class FakeResp:
+        status_code = 200
+
+    seen = []
+
+    def fake_get_ok(url, timeout=None):
+        seen.append(url)
+        return FakeResp()
+
+    monkeypatch.setattr(httpx, "get", fake_get_ok)
+    assert cli._default_server_alive(8642) is True
+    assert seen == ["http://127.0.0.1:8642/api/status"]
+
+    def fake_get_refused(url, timeout=None):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "get", fake_get_refused)
+    assert cli._default_server_alive(8642) is False
+
+
+def test_sync_default_wiring_uses_web_app_functions(env, capsys, monkeypatch):
+    """factory가 반환한 state에 `_run_sync`가 없으면(테스트 백도어 미사용) cmd_sync는
+    `.web.app`의 실제 `run_sync`/`_scheduled_sources`를 지연 import해 쓴다."""
+    from llmsearch.web import app as web_app
+
+    calls = []
+
+    def fake_run_sync(state, source):
+        calls.append(source)
+        return {"source": source, "at": "t", "ok": True, "indexed": 5, "deleted": 1, "error": None}
+
+    def fake_scheduled(state):
+        return ["notes", "confluence"]
+
+    monkeypatch.setattr(web_app, "run_sync", fake_run_sync)
+    monkeypatch.setattr(web_app, "_scheduled_sources", fake_scheduled)
+
+    def factory(cfg):
+        return {"schema_mismatch": None}  # `_run_sync`/`_scheduled` 키 없음 — 백도어 미사용 확인
+
+    code, out, _ = _run(["sync", "notes", "--json"], capsys, app_factory=factory, server_alive=lambda p: False)
+    assert code == 0 and calls == ["notes"]
+    assert json.loads(out)["entries"][0]["indexed"] == 5
+
+    code, _, _ = _run(["sync", "all", "--json"], capsys, app_factory=factory, server_alive=lambda p: False)
+    assert code == 0 and calls == ["notes", "notes", "confluence"]
