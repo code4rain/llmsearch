@@ -7,12 +7,17 @@
 set -euo pipefail
 SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$SKILL_DIR/../.." && pwd)"
-HOME_DIR="${LLMSEARCH_HOME:-$HOME/.llmsearch}"
-SKILLS_ROOT="${CLAUDE_SKILLS_DIR:-$HOME/.claude/skills}"
+HOME_DIR="${LLMSEARCH_HOME:-${HOME:?HOME 또는 LLMSEARCH_HOME 환경변수가 필요합니다}/.llmsearch}"
+SKILLS_ROOT="${CLAUDE_SKILLS_DIR:-${HOME:?HOME 또는 LLMSEARCH_HOME 환경변수가 필요합니다}/.claude/skills}"
 PY="$REPO/.venv/bin/python"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --python) PY="$2"; shift 2 ;;
+    --python)
+      if [ $# -lt 2 ]; then
+        echo "--python 뒤에 경로가 필요합니다" >&2
+        exit 2
+      fi
+      PY="$2"; shift 2 ;;
     *) echo "알 수 없는 인자: $1 (사용: install.sh [--python PATH])" >&2; exit 2 ;;
   esac
 done
