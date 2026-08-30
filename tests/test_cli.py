@@ -379,15 +379,50 @@ def _fake_factory_error(err_text):
 
 
 def test_sync_multiline_error_kept_out_of_table(env, capsys):
-    err_text = "boom\nTraceback (most recent call last):\n  File \"x.py\", line 1, in <module>"
+    err_text = "boom | pipe\nTraceback (most recent call last):\n  File \"x.py\", line 1, in <module>"
     code, out, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory_error(err_text),
                         server_alive=lambda p: False)
     assert code == 1
     row = next(ln for ln in out.splitlines() if ln.startswith("| notes |"))
     assert "boom" in row and row.endswith(" |")  # 표 셀은 한 줄 — 개행이 행을 깨지 않는다
+    assert "boom \\| pipe" in row  # 셀 안의 파이프는 이스케이프 — 열이 밀리지 않는다
     assert "Traceback" not in row
-    assert "### notes error" in out and "Traceback (most recent call last):" in out
+    assert "### notes error" in out
     assert out.index("### notes error") > out.index(row)  # 전문은 표 뒤
+    # 전문은 백틱 fence가 아니라 4칸 들여쓰기 블록 — 모든 줄이 들여써진다
+    assert "    Traceback (most recent call last):" in out
+    assert "    boom | pipe" in out  # 들여쓰기 블록의 전문은 원문 그대로
+    assert "```" not in out
+
+
+_BUSY_ERROR = "다른 프로세스가 동기화 중입니다 (GUI/CLI 동시 실행) — 동기화가 끝난 뒤 다시 시도하세요"
+
+
+def test_sync_lock_contention_exits_3(env, capsys):
+    """크로스 프로세스 락 경합은 실패(1)가 아니라 '서버/동기화 실행 중'(3)이다."""
+    code, out, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory_error(_BUSY_ERROR),
+                        server_alive=lambda p: False)
+    assert code == 3
+    assert "다른 프로세스가 동기화 중" in out
+
+
+def test_sync_real_failure_still_exits_1(env, capsys):
+    code, _, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory_error("boom"),
+                      server_alive=lambda p: False)
+    assert code == 1
+
+
+def test_sync_error_containing_code_fence_does_not_break_out(env, capsys):
+    """오류 본문에 ``` 줄이 있어도 마크다운 블록이 조기 종료되지 않는다."""
+    err_text = "boom\n```\nrm -rf /\n```\nend"
+    code, out, _ = _run(["sync", "notes"], capsys, app_factory=_fake_factory_error(err_text),
+                        server_alive=lambda p: False)
+    assert code == 1
+    assert "### notes error" in out
+    body = out[out.index("### notes error"):].splitlines()[1:]
+    assert not any(ln == "```" for ln in body)  # fence 조기 종료 없음
+    for ln in ("boom", "```", "rm -rf /", "end"):
+        assert f"    {ln}" in out  # 원문은 들여쓰기 블록으로 보존
 
 
 def test_sync_long_error_truncated_in_table(env, capsys):

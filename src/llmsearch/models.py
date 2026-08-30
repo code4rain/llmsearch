@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+# 인덱싱 소스 목록 — GUI(web.app)·CLI가 함께 쓰는 단일 정의.
+# leaf 모듈에 두어야 CLI가 SOURCES 하나 때문에 FastAPI를 import하지 않는다.
+SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
+
 
 @dataclass
 class Document:
