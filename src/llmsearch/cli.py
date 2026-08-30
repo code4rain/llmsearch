@@ -21,7 +21,7 @@ from . import db, indexer, rebuild
 from . import search as search_mod
 from .config import Config, ConfigNotFound, load_config, load_env, resolve_config_path
 from .usage import CountingEmbedder, UsageTracker
-from .web.app import SOURCES
+from .models import SOURCES
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_SERVER_RUNNING, EXIT_SCHEMA = 0, 1, 2, 3, 4
 DEFAULT_PORT = 8642

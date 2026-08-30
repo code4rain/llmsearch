@@ -31,12 +31,12 @@ from ..connectors.notes import sync_notes
 from ..connectors.outlook_cal import sync_outlook_cal
 from ..connectors.outlook_mail import backlog_hint, sync_outlook_mail
 from ..eval.golden import evaluate as golden_evaluate, parse_golden
+from ..models import SOURCES  # re-export — 기존 `from .web.app import SOURCES` 호출부 유지
 from ..rules import load_rules_md, parse_rules_md
 from ..summarize import _sanitize_segment
 from ..usage import CountingEmbedder, CountingSummarizer, UsageTracker
 
 STATIC_DIR = Path(__file__).parent / "static"
-SOURCES = ("notes", "local_docs", "outlook_mail", "outlook_cal", "confluence", "jira")
 IS_WINDOWS = os.name == "nt"
 WINDOWS_ONLY_SOURCES = ("outlook_mail", "outlook_cal")
 _WINDOWS_ONLY_MSG = (
