@@ -46,3 +46,48 @@ def test_wrapper_end_to_end_with_real_interpreter(tmp_path: Path):
     env["LLMSEARCH_PYTHON"] = sys.executable
     r = subprocess.run([str(WRAPPER), "status"], env=env, capture_output=True, text=True, cwd=tmp_path)
     assert r.returncode == 2 and "install.sh" in r.stderr
+
+
+INSTALL = SKILL / "scripts" / "install.sh"
+
+
+def _install_env(tmp_path: Path) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("LLMSEARCH_PYTHON", "LLMSEARCH_CONFIG")}
+    env["LLMSEARCH_HOME"] = str(tmp_path / "home")
+    env["CLAUDE_SKILLS_DIR"] = str(tmp_path / "skills")
+    return env
+
+
+def test_install_creates_home_and_link_idempotent(tmp_path: Path):
+    env = _install_env(tmp_path)
+    for _ in range(2):  # 두 번 실행해도 같은 결과
+        r = subprocess.run([str(INSTALL), "--python", sys.executable], env=env, capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+    home = tmp_path / "home"
+    assert (home / "config.yaml").read_text(encoding="utf-8") == (ROOT / "config.example.yaml").read_text(encoding="utf-8")
+    assert (home / ".env").read_text(encoding="utf-8") == (ROOT / ".env.example").read_text(encoding="utf-8")
+    assert (home / "env").read_text(encoding="utf-8") == f"LLMSEARCH_PYTHON={sys.executable}\n"
+    link = tmp_path / "skills" / "llmsearch"
+    assert link.is_symlink() and link.resolve() == SKILL.resolve()
+
+
+def test_install_keeps_existing_config(tmp_path: Path):
+    env = _install_env(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("data_dir: /keep\n", encoding="utf-8")
+    subprocess.run([str(INSTALL), "--python", sys.executable], env=env, capture_output=True, text=True, check=True)
+    assert (home / "config.yaml").read_text(encoding="utf-8") == "data_dir: /keep\n"
+
+
+def test_install_refuses_real_directory_at_link(tmp_path: Path):
+    env = _install_env(tmp_path)
+    (tmp_path / "skills" / "llmsearch").mkdir(parents=True)
+    r = subprocess.run([str(INSTALL), "--python", sys.executable], env=env, capture_output=True, text=True)
+    assert r.returncode == 1 and "심볼릭 링크가 아닌" in r.stderr
+
+
+def test_install_warns_missing_python(tmp_path: Path):
+    env = _install_env(tmp_path)
+    r = subprocess.run([str(INSTALL), "--python", str(tmp_path / "nope")], env=env, capture_output=True, text=True)
+    assert r.returncode == 0 and "인터프리터" in r.stderr
