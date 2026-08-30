@@ -1,0 +1,456 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "llmsearch Runtime Architecture",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/code4rain/llmsearch",
+      "revision": "41a4d16629dea51c04361183ea0343fcc35efa48"
+    },
+    "views": [
+      {
+        "id": "chat-path",
+        "label": "Chat request path",
+        "focus": [
+          "browser",
+          "api",
+          "chats",
+          "answerer",
+          "claude",
+          "search",
+          "gemini",
+          "indexdb"
+        ],
+        "note": "POST /api/chat → Claude with a search tool → hybrid retrieval → SSE answer with [n] citations."
+      },
+      {
+        "id": "sync-path",
+        "label": "Sync pipeline",
+        "focus": [
+          "sources",
+          "connectors",
+          "sync",
+          "gemini",
+          "indexdb"
+        ],
+        "note": "Scheduler or manual sync pulls one source, summarizes/embeds, and writes index.db under sync_lock."
+      },
+      {
+        "id": "boundaries",
+        "label": "Trust boundaries",
+        "focus": [
+          "browser",
+          "api",
+          "claude",
+          "gemini",
+          "sources"
+        ],
+        "note": "Loopback-only server; API keys live only in .env; Outlook COM is Windows-only."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "frontend",
+      "label": "Browser UI",
+      "sublabel": "static/index.html",
+      "pos": [
+        40,
+        150
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/web/static/index.html",
+          "label": "single-page UI"
+        }
+      ]
+    },
+    {
+      "id": "api",
+      "type": "backend",
+      "label": "FastAPI app",
+      "sublabel": "uvicorn 127.0.0.1:8642",
+      "pos": [
+        300,
+        150
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "TrustedHost + local-origin",
+      "sources": [
+        {
+          "path": "src/llmsearch/web/app.py",
+          "line": 393,
+          "label": "create_app"
+        },
+        {
+          "path": "src/llmsearch/web/app.py",
+          "line": 882,
+          "label": "POST /api/chat"
+        }
+      ]
+    },
+    {
+      "id": "answerer",
+      "type": "backend",
+      "label": "ClaudeAnswerer",
+      "sublabel": "llm.py · stream + search tool",
+      "pos": [
+        560,
+        150
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/llm.py",
+          "line": 71,
+          "label": "ClaudeAnswerer"
+        },
+        {
+          "path": "src/llmsearch/llm.py",
+          "line": 102,
+          "label": "answer_stream"
+        }
+      ]
+    },
+    {
+      "id": "search",
+      "type": "backend",
+      "label": "Hybrid search",
+      "sublabel": "search.py · RRF k=60",
+      "pos": [
+        820,
+        150
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/search.py",
+          "line": 68,
+          "label": "search()"
+        }
+      ]
+    },
+    {
+      "id": "indexdb",
+      "type": "database",
+      "label": "index.db",
+      "sublabel": "SQLite FTS5 + sqlite-vec",
+      "pos": [
+        820,
+        260
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "numpy fallback",
+      "sources": [
+        {
+          "path": "src/llmsearch/db.py",
+          "line": 24,
+          "label": "schema"
+        },
+        {
+          "path": "src/llmsearch/db.py",
+          "line": 140,
+          "label": "search_embeddings"
+        }
+      ]
+    },
+    {
+      "id": "claude",
+      "type": "external",
+      "label": "Anthropic API",
+      "sublabel": "claude-opus-5",
+      "pos": [
+        560,
+        40
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "brand": "anthropic"
+    },
+    {
+      "id": "gemini",
+      "type": "external",
+      "label": "Gemini API",
+      "sublabel": "embed 768 MRL · summarize",
+      "pos": [
+        820,
+        40
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/embeddings.py",
+          "line": 36,
+          "label": "GeminiEmbeddings"
+        },
+        {
+          "path": "src/llmsearch/summarize.py",
+          "line": 186,
+          "label": "GeminiSummarizer"
+        }
+      ]
+    },
+    {
+      "id": "chats",
+      "type": "database",
+      "label": "chats.db",
+      "sublabel": "ChatStore sessions",
+      "pos": [
+        300,
+        260
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/chats.py",
+          "line": 55,
+          "label": "ChatStore"
+        }
+      ]
+    },
+    {
+      "id": "sync",
+      "type": "backend",
+      "label": "run_sync + scheduler",
+      "sublabel": "sync_lock · indexer.py",
+      "pos": [
+        820,
+        370
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "tag": "daily API cap gate",
+      "sources": [
+        {
+          "path": "src/llmsearch/web/app.py",
+          "line": 285,
+          "label": "run_sync"
+        },
+        {
+          "path": "src/llmsearch/web/app.py",
+          "line": 470,
+          "label": "scheduler_loop"
+        },
+        {
+          "path": "src/llmsearch/indexer.py",
+          "line": 21,
+          "label": "index_documents"
+        }
+      ]
+    },
+    {
+      "id": "connectors",
+      "type": "backend",
+      "label": "Connectors",
+      "sublabel": "6 sync_* modules",
+      "pos": [
+        300,
+        370
+      ],
+      "size": [
+        130,
+        60
+      ],
+      "sources": [
+        {
+          "path": "src/llmsearch/connectors/local_docs.py",
+          "line": 147,
+          "label": "sync_local_docs"
+        },
+        {
+          "path": "src/llmsearch/connectors/outlook_mail.py",
+          "line": 53,
+          "label": "sync_outlook_mail"
+        },
+        {
+          "path": "src/llmsearch/connectors/confluence.py",
+          "line": 95,
+          "label": "sync_confluence"
+        }
+      ]
+    },
+    {
+      "id": "sources",
+      "type": "external",
+      "label": "Source systems",
+      "sublabel": "FS · Outlook COM · Atlassian",
+      "pos": [
+        40,
+        370
+      ],
+      "size": [
+        150,
+        60
+      ],
+      "tag": "Outlook: Windows only",
+      "sources": [
+        {
+          "path": "src/llmsearch/outlook/com_worker.py",
+          "line": 36,
+          "label": "ComWorker STA"
+        },
+        {
+          "path": "src/llmsearch/atlassian/http_client.py",
+          "label": "HttpAtlassianClient"
+        }
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Local process · loopback only (127.0.0.1)",
+      "wraps": [
+        "api",
+        "answerer",
+        "search",
+        "indexdb",
+        "chats",
+        "sync",
+        "connectors"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "External LLM APIs · keys from .env only",
+      "wraps": [
+        "claude",
+        "gemini"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "ui-to-api",
+      "from": "browser",
+      "to": "api",
+      "label": "POST /api/chat (SSE)",
+      "variant": "emphasis"
+    },
+    {
+      "id": "api-to-answerer",
+      "from": "api",
+      "to": "answerer",
+      "label": "answer_stream",
+      "variant": "emphasis"
+    },
+    {
+      "id": "answerer-to-search",
+      "from": "answerer",
+      "to": "search",
+      "label": "search tool ≤3 rounds",
+      "variant": "emphasis"
+    },
+    {
+      "id": "search-to-db",
+      "from": "search",
+      "to": "indexdb",
+      "label": "FTS5 + vec top-30 each",
+      "variant": "emphasis",
+      "labelDy": 32
+    },
+    {
+      "id": "answerer-to-claude",
+      "from": "answerer",
+      "to": "claude",
+      "label": "messages.stream",
+      "variant": "security"
+    },
+    {
+      "id": "search-to-gemini",
+      "from": "search",
+      "to": "gemini",
+      "label": "embed query"
+    },
+    {
+      "id": "api-to-chats",
+      "from": "api",
+      "to": "chats",
+      "label": "history + save turn",
+      "labelDy": 32
+    },
+    {
+      "id": "sync-to-db",
+      "from": "sync",
+      "to": "indexdb",
+      "label": "index / delete / sync_state"
+    },
+    {
+      "id": "sync-to-gemini",
+      "from": "sync",
+      "to": "gemini",
+      "label": "embed · summarize",
+      "fromSide": "right",
+      "toSide": "right",
+      "labelSegment": 1,
+      "labelDy": 118
+    },
+    {
+      "id": "connectors-to-sync",
+      "from": "connectors",
+      "to": "sync",
+      "label": "SyncResult"
+    },
+    {
+      "id": "sources-to-connectors",
+      "from": "sources",
+      "to": "connectors",
+      "label": "COM / HTTP / FS",
+      "variant": "dashed"
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Chat request path",
+      "items": [
+        "local_origin_only → _require_db → _validate_filters; history rebuilt from chats.db; Claude may call the search tool ≤3 more rounds",
+        "Retrieval: vec 30 + FTS5 30 → RRF k=60 → 3 chunks/doc; recency ≤+30%, Archives/ ×0.5; SSE text · sources · saved · done"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "Sync & cost control",
+      "items": [
+        "scheduler_loop every 30 min → run_sync per source under sync_lock; gates: DB · Windows-only · daily budget; delete after 3 misses + safe sweep",
+        "CountingEmbedder / CountingSummarizer → usage.json daily counters; cap blocks indexing only"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Trust boundaries",
+      "items": [
+        "127.0.0.1 bind + TrustedHost + local_origin_only CSRF guard (fail-closed); /api/open only opens registered targets; secrets only via .env",
+        "All integrations are Protocol + Fake (LLM, embeddings, summarizer, Outlook, Atlassian, slides); COM via one STA ComWorker"
+      ]
+    }
+  ]
+}

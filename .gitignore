@@ -8,3 +8,5 @@ __pycache__/
 config.yaml
 golden.yaml
 .e2e-data/
+*.deb
+docs/diagrams/*.visual-check.*
