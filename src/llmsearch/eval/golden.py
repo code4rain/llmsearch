@@ -67,7 +67,7 @@ def main():
 		cfg = load_config(resolve_config_path(args.config))
 	except ConfigNotFound as exc:
 		print(str(exc))
-		return 2
+		sys.exit(2)
 	golden_path = args.golden or (cfg.data_dir / "golden.yaml")
 	if not golden_path.exists():
 		print(f"golden.yaml이 없습니다: {golden_path}")

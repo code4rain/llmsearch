@@ -87,3 +87,19 @@ def test_main_default_golden_path_and_missing_file(tmp_path: Path, monkeypatch, 
 	assert ei.value.code == 1 and "golden.yaml이 없습니다" in out
 	assert str(tmp_path / "data" / "golden.yaml") in out   # --golden 미지정 시 data_dir 기본값
 	assert not (tmp_path / "data" / "index.db").exists()   # 가드가 open_db·임베더 생성보다 앞
+
+
+def test_main_exits_2_on_config_not_found(tmp_path: Path, monkeypatch, capsys):
+	"""설정 파일을 못 찾으면 return이 아니라 sys.exit(2) — 언랩된 __main__에서도 종료코드가 새지 않는다."""
+	import pytest
+
+	import llmsearch.eval.golden as g
+
+	monkeypatch.setenv("LLMSEARCH_HOME", str(tmp_path / "nohome"))
+	monkeypatch.delenv("LLMSEARCH_CONFIG", raising=False)
+	monkeypatch.chdir(tmp_path)
+	monkeypatch.setattr("sys.argv", ["golden"])
+	with pytest.raises(SystemExit) as ei:
+		g.main()
+	assert ei.value.code == 2
+	assert "설정 파일이 없습니다" in capsys.readouterr().out
