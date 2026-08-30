@@ -161,6 +161,36 @@ def cmd_search(args) -> int:
     return EXIT_OK
 
 
+# ---- get --------------------------------------------------------------
+
+def cmd_get(args) -> int:
+    _, cfg = _load(args)
+    conn = _open_index(cfg)
+    try:
+        row = conn.execute(
+            "SELECT id, title, url_or_path, updated_at, content_indexed, para_path, extra_json "
+            "FROM documents WHERE source_type=? AND source_id=?", (args.source_type, args.source_id)).fetchone()
+        if row is None:
+            raise CliError(EXIT_FAIL, f"문서 없음: {args.source_type}/{args.source_id}")
+        doc_id, title, url, updated, cidx, para, extra = row
+        chunks = conn.execute("SELECT text FROM chunks WHERE doc_id=? ORDER BY seq", (doc_id,)).fetchall()
+    finally:
+        conn.close()
+    full = "\n".join(t for (t,) in chunks)
+    truncated = len(full) > args.max_chars
+    text = full[: args.max_chars]
+    payload = {"source_type": args.source_type, "source_id": args.source_id, "title": title,
+               "url_or_path": url, "updated_at": updated, "content_indexed": bool(cidx),
+               "para_path": para, "extra": json.loads(extra), "text": text,
+               "truncated": truncated, "total_chars": len(full)}
+    md = [f"# {title}", f"- source: {args.source_type} · id: {args.source_id}", f"- path: {url}",
+          f"- updated: {updated}" + (f" · para: {para}" if para else ""), "", text]
+    if truncated:
+        md.append(f"\n[... {len(full)}자 중 {args.max_chars}자 표시 — --max-chars로 늘리세요]")
+    _emit(args, payload, "\n".join(md))
+    return EXIT_OK
+
+
 # ---- parser / main --------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -186,6 +216,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--fts-only", action="store_true", help="벡터 검색 생략 (키 없을 때 자동)")
     s.add_argument("--excerpt", action="store_true", help="마크다운에 발췌(≤6000자) 포함")
     s.set_defaults(func=cmd_search)
+
+    g = sub.add_parser("get", parents=[common], help="문서 전문 (search 결과의 source_type/id)")
+    g.add_argument("source_type", choices=SOURCES)
+    g.add_argument("source_id")
+    g.add_argument("--max-chars", type=int, default=20000)
+    g.set_defaults(func=cmd_get)
 
     return p
 

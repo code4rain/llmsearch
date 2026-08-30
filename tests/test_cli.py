@@ -173,3 +173,26 @@ def test_search_no_hits_exit_0(env, capsys):
     _index(env.data)
     code, out, _ = _run(["search", "존재하지않는zzz", "--fts-only", "--json"], capsys, embedder=EMB)
     assert code == 0 and json.loads(out)["hits"] == []
+
+
+def test_get_full_text_json(env, capsys):
+    _index(env.data)
+    code, out, _ = _run(["get", "notes", "kickoff.md", "--json"], capsys)
+    assert code == 0
+    p = json.loads(out)
+    assert p["title"] == "프로젝트A 킥오프" and p["url_or_path"] == "/n/kickoff.md"
+    assert "일정과 담당자 결정" in p["text"] and p["truncated"] is False
+    assert p["para_path"] == "Projects/프로젝트A"
+
+
+def test_get_markdown_and_truncation(env, capsys):
+    _index(env.data)
+    code, out, _ = _run(["get", "notes", "kickoff.md", "--max-chars", "10"], capsys)
+    assert code == 0 and "프로젝트A 킥오프" in out and "--max-chars" in out
+    assert len(json.loads(_run(["get", "notes", "kickoff.md", "--max-chars", "10", "--json"], capsys)[1])["text"]) == 10
+
+
+def test_get_missing_exit_1(env, capsys):
+    _index(env.data)
+    code, _, err = _run(["get", "notes", "nope.md"], capsys)
+    assert code == 1 and "nope.md" in err
