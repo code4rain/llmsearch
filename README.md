@@ -34,7 +34,7 @@
 
 설정 우선순위: `--config` > `LLMSEARCH_CONFIG` > `~/.llmsearch/config.yaml` (`LLMSEARCH_HOME`로 이동 가능). 서버(`python -m llmsearch`)도 같은 규칙을 쓰므로 `--config`를 생략할 수 있다.
 
-CLI: `llmsearch search "질의" [--source S] [--from D] [--to D] [--sender X] [-k N] [--excerpt] [--json]` · `get SOURCE_TYPE ID` · `status` · `sync SOURCE|all`(서버 실행 중이면 거부). exit: 0 성공 / 1 실패 / 2 설정·인자 / 3 서버 실행 중 / 4 스키마 불일치.
+CLI: `llmsearch search "질의" [--source S] [--from D] [--to D] [--sender X] [-k N] [--excerpt] [--json]` · `get SOURCE_TYPE ID [--max-chars N]` · `status` · `sync SOURCE|all [--port N]`(서버 실행 중이면 거부 — GUI가 기본 8642가 아닌 포트면 같은 `--port`를 넘겨야 감지된다). exit: 0 성공 / 1 실패 / 2 설정·인자 / 3 서버 실행 중 / 4 스키마 불일치.
 
 ## 평가
 `golden.yaml`에 `[{question, expect_source_id}]` 작성 후:

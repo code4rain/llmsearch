@@ -19,7 +19,7 @@
 | WSL 개발·테스트 지원 정리 | ✅ 머지 | Windows 전용 Outlook 소스(`IS_WINDOWS`/`_outlook_available`) 스케줄러 자동 제외·수동 동기화 안내 메시지·소스 탭 "Windows 전용" 표시, 환경별 README |
 | Claude 스킬화 | ✅ 머지 | 전역 설정(`~/.llmsearch`, resolver·load_env), `llmsearch` CLI(search/get/status/sync — GUI 함수 재사용, FTS 폴백, 서버 감지), `skills/llmsearch`(SKILL.md·래퍼·install.sh) — 스펙 `2026-08-31-claude-skill-design.md` |
 
-- 테스트 기준: **426 passed** (`./.venv/bin/pytest`)
+- 테스트 기준: **438 passed** (`./.venv/bin/pytest`)
 - E2E: **80/80** (`tools/e2e/verify.py` — 9.11단계(M7 골든 평가 GUI) `골든 미스 표시` 체크와 10단계 사이에 M8 세션 자동 생성·복원(새로고침)·미리보기·내보내기 시나리오 7건 추가; WSL 지원 변경은 Fake 주입 경로만 건드려 E2E 시나리오 수 불변; Claude 스킬화(문서·CLI·install.sh만 변경, GUI 무변경)는 §2 절차대로 재실행해 80/80 재확인함)
 - SDD 진행 원장(.superpowers/)과 워크트리는 **gitignore라 clone에 없다** — 상태는 이 문서가 기준
 
@@ -28,7 +28,7 @@
 ```bash
 python3 -m venv .venv
 ./.venv/bin/pip install -e . pytest
-./.venv/bin/pytest          # 426 passed 확인 (WSL 가능, API 키 불필요)
+./.venv/bin/pytest          # 438 passed 확인 (WSL 가능, API 키 불필요)
 cp config.example.yaml config.yaml   # gitignore 대상 — 로컬 경로 채우기
 cp .env.example .env                 # API 키·자격증명 (gitignore 대상)
 ```

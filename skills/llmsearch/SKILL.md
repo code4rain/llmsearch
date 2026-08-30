@@ -14,9 +14,11 @@ description: 사용자의 회사 문서·개인 노트·Outlook 메일/일정·C
 | `search "질의" [--source S]... [--from D] [--to D] [--sender X] [-k N] [--excerpt]` | 하이브리드 검색. 히트: 제목·소스·날짜·`path`·`id`·snippet |
 | `get SOURCE_TYPE SOURCE_ID [--max-chars N]` | 문서 전문 (search의 `id`) |
 | `status` | 설정·인덱스·소스별 문서 수·오늘 API 사용량 |
-| `sync SOURCE\|all` | 동기화 — **사용자가 명시 요청할 때만** |
+| `sync SOURCE\|all [--port N]` | 동기화 — **사용자가 명시 요청할 때만** |
 
 소스: `notes local_docs outlook_mail outlook_cal confluence jira`
+
+GUI 서버가 기본 8642가 아닌 포트로 떠 있으면 반드시 같은 `--port`를 넘겨야 이중 동기화 가드가 동작한다.
 
 ## 규칙
 
